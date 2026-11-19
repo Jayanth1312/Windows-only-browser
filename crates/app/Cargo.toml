@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ui = { path = "../ui" }
+engine = { path = "../engine" }
+storage = { path = "../storage" }
+windows = { workspace = true }
+windows-core = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
