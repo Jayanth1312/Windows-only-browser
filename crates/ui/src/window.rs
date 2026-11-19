@@ -19,14 +19,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_DBLCLKS,
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, MSG, SWP_FRAMECHANGED,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    SW_SHOW, WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
     WM_PAINT, WM_SIZE, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_OVERLAPPEDWINDOW,
 };
 
 use crate::frame::{enable_modern_frame, handle_nccalcsize, handle_nchittest};
-use crate::sidebar::{CaptionButton, SidebarRenderer};
+use crate::sidebar::{CaptionButton, SidebarClickTarget, SidebarRenderer, TabItemView};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -36,6 +36,17 @@ pub enum UiError {
     Windows(#[from] windows::core::Error),
     #[error("Window creation failed")]
     WindowCreationFailed,
+}
+
+#[derive(Debug, Clone)]
+pub enum SidebarAction {
+    NavBack,
+    NavForward,
+    NavReload,
+    NavNewTab,
+    ToggleSidebar,
+    SelectTab(usize),
+    CloseTab(usize),
 }
 
 pub struct WindowConfig {
@@ -58,14 +69,20 @@ impl Default for WindowConfig {
     }
 }
 
-pub type ResizeCallback = Box<dyn Fn(RECT, RECT)>;
+pub type ResizeCallback = Rc<dyn Fn(RECT, RECT)>;
+pub type ActionCallback = Rc<dyn Fn(SidebarAction)>;
+pub type CustomMsgHandler = Rc<dyn Fn(u32, WPARAM, LPARAM)>;
 
 struct WindowState {
     config: WindowConfig,
     sidebar: SidebarRenderer,
+    sidebar_visible: bool,
+    tabs: Vec<TabItemView>,
     on_resize: Option<ResizeCallback>,
-    hovered_button: CaptionButton,
-    pressed_button: CaptionButton,
+    on_action: Option<ActionCallback>,
+    on_custom_msg: Option<CustomMsgHandler>,
+    hovered_target: SidebarClickTarget,
+    pressed_target: SidebarClickTarget,
     is_tracking_mouse: bool,
 }
 
@@ -76,7 +93,6 @@ pub struct BrowserWindow {
 
 impl BrowserWindow {
     pub fn new(config: WindowConfig) -> Result<Self, UiError> {
-        // Set per-monitor V2 DPI awareness
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -98,9 +114,13 @@ impl BrowserWindow {
             let state = Rc::new(RefCell::new(WindowState {
                 config,
                 sidebar: SidebarRenderer::new(),
+                sidebar_visible: true,
+                tabs: Vec::new(),
                 on_resize: None,
-                hovered_button: CaptionButton::None,
-                pressed_button: CaptionButton::None,
+                on_action: None,
+                on_custom_msg: None,
+                hovered_target: SidebarClickTarget::None,
+                pressed_target: SidebarClickTarget::None,
                 is_tracking_mouse: false,
             }));
 
@@ -137,9 +157,43 @@ impl BrowserWindow {
     where
         F: Fn(RECT, RECT) + 'static,
     {
-        self.state.borrow_mut().on_resize = Some(Box::new(callback));
-        // Trigger initial resize calculation
+        self.state.borrow_mut().on_resize = Some(Rc::new(callback));
         self.trigger_resize();
+    }
+
+    pub fn set_action_callback<F>(&self, callback: F)
+    where
+        F: Fn(SidebarAction) + 'static,
+    {
+        self.state.borrow_mut().on_action = Some(Rc::new(callback));
+    }
+
+    pub fn set_custom_msg_handler<F>(&self, handler: F)
+    where
+        F: Fn(u32, WPARAM, LPARAM) + 'static,
+    {
+        self.state.borrow_mut().on_custom_msg = Some(Rc::new(handler));
+    }
+
+    pub fn update_tabs(&self, tabs: Vec<TabItemView>) {
+        self.state.borrow_mut().tabs = tabs;
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    pub fn is_sidebar_visible(&self) -> bool {
+        self.state.borrow().sidebar_visible
+    }
+
+    pub fn set_sidebar_visible(&self, visible: bool) {
+        self.state.borrow_mut().sidebar_visible = visible;
+        self.trigger_resize();
+    }
+
+    pub fn toggle_sidebar(&self) {
+        let new_vis = !self.state.borrow().sidebar_visible;
+        self.set_sidebar_visible(new_vis);
     }
 
     pub fn get_layout_rects(&self) -> (RECT, RECT) {
@@ -150,36 +204,59 @@ impl BrowserWindow {
 
         let width = client_rect.right - client_rect.left;
         let height = client_rect.bottom - client_rect.top;
-
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        let sidebar_width = (self.state.borrow().config.sidebar_width as f32 * (dpi as f32 / 96.0)).round() as i32;
+        let scale = dpi as f32 / 96.0;
 
-        let content_width = (width - sidebar_width).max(0);
+        let sidebar_visible = self.state.borrow().sidebar_visible;
 
-        let content_rect = RECT {
-            left: 0,
-            top: 0,
-            right: content_width,
-            bottom: height,
-        };
+        if sidebar_visible {
+            let sidebar_width = (self.state.borrow().config.sidebar_width as f32 * scale).round() as i32;
+            let content_width = (width - sidebar_width).max(0);
 
-        let sidebar_rect = RECT {
-            left: content_width,
-            top: 0,
-            right: width,
-            bottom: height,
-        };
+            let content_rect = RECT {
+                left: 0,
+                top: 0,
+                right: content_width,
+                bottom: height,
+            };
 
-        (content_rect, sidebar_rect)
+            let sidebar_rect = RECT {
+                left: content_width,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+
+            (content_rect, sidebar_rect)
+        } else {
+            let content_rect = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+
+            let btn_width = (46.0 * scale).round() as i32;
+            let btn_height = (32.0 * scale).round() as i32;
+            let sidebar_rect = RECT {
+                left: width - (btn_width * 4),
+                top: 0,
+                right: width,
+                bottom: btn_height,
+            };
+
+            (content_rect, sidebar_rect)
+        }
     }
 
     pub fn trigger_resize(&self) {
         let (content_rect, sidebar_rect) = self.get_layout_rects();
-        if let Some(ref cb) = self.state.borrow().on_resize {
+        let cb = self.state.borrow().on_resize.clone();
+        if let Some(cb) = cb {
             cb(content_rect, sidebar_rect);
         }
         unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), Some(&sidebar_rect), false);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
@@ -238,19 +315,16 @@ unsafe extern "system" fn wndproc(
             }
         }
         WM_NCHITTEST => {
-            let (sidebar_w, caption_h) = {
+            let (sidebar_w, caption_h, sidebar_vis) = {
                 let b = state.borrow();
                 let dpi = GetDpiForWindow(hwnd);
                 let sw = (b.config.sidebar_width as f32 * (dpi as f32 / 96.0)).round() as i32;
                 let ch = (b.config.caption_height as f32 * (dpi as f32 / 96.0)).round() as i32;
-                (sw, ch)
+                (sw, ch, b.sidebar_visible)
             };
-            return handle_nchittest(hwnd, lparam, sidebar_w, caption_h);
+            return handle_nchittest(hwnd, lparam, sidebar_w, caption_h, sidebar_vis);
         }
-        WM_ERASEBKGND => {
-            // Return 1 to eliminate background erasing flicker
-            return LRESULT(1);
-        }
+        WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -261,26 +335,46 @@ unsafe extern "system" fn wndproc(
             let height = client_rect.bottom - client_rect.top;
 
             let dpi = GetDpiForWindow(hwnd);
-            let (sidebar_w, caption_h) = {
+            let scale = dpi as f32 / 96.0;
+
+            let (sidebar_vis, tabs, hovered, pressed) = {
                 let b = state.borrow();
-                let sw = (b.config.sidebar_width as f32 * (dpi as f32 / 96.0)).round() as i32;
-                let ch = (b.config.caption_height as f32 * (dpi as f32 / 96.0)).round() as i32;
-                (sw, ch)
+                (
+                    b.sidebar_visible,
+                    b.tabs.clone(),
+                    b.hovered_target.clone(),
+                    b.pressed_target.clone(),
+                )
             };
 
-            let sidebar_rect = RECT {
-                left: (width - sidebar_w).max(0),
-                top: 0,
-                right: width,
-                bottom: height,
+            let sidebar_rect = if sidebar_vis {
+                let sidebar_w = (state.borrow().config.sidebar_width as f32 * scale).round() as i32;
+                RECT {
+                    left: (width - sidebar_w).max(0),
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                }
+            } else {
+                let btn_w = (46.0 * scale).round() as i32;
+                let btn_h = (32.0 * scale).round() as i32;
+                RECT {
+                    left: width - (btn_w * 4),
+                    top: 0,
+                    right: width,
+                    bottom: btn_h,
+                }
             };
 
-            let (hovered, pressed) = {
-                let b = state.borrow();
-                (b.hovered_button, b.pressed_button)
-            };
-
-            state.borrow().sidebar.render(hwnd, hdc, sidebar_rect, caption_h, hovered, pressed);
+            state.borrow().sidebar.render(
+                hwnd,
+                hdc,
+                sidebar_rect,
+                sidebar_vis,
+                &tabs,
+                &hovered,
+                &pressed,
+            );
 
             let _ = EndPaint(hwnd, &ps);
             return LRESULT(0);
@@ -304,26 +398,31 @@ unsafe extern "system" fn wndproc(
                 state.borrow_mut().is_tracking_mouse = true;
             }
 
-            let hovered = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
-            let old_hovered = state.borrow().hovered_button;
-            if hovered != old_hovered {
-                state.borrow_mut().hovered_button = hovered;
-                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
-                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+            let (sidebar_vis, tabs_len) = {
+                let b = state.borrow();
+                (b.sidebar_visible, b.tabs.len())
+            };
+
+            let target = state
+                .borrow()
+                .sidebar
+                .hit_test(hwnd, x, y, client_width, sidebar_vis, tabs_len);
+
+            let old_target = state.borrow().hovered_target.clone();
+            if target != old_target {
+                state.borrow_mut().hovered_target = target;
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             return LRESULT(0);
         }
         WM_MOUSELEAVE => {
             state.borrow_mut().is_tracking_mouse = false;
-            let old_hovered = state.borrow().hovered_button;
-            let old_pressed = state.borrow().pressed_button;
-            if old_hovered != CaptionButton::None || old_pressed != CaptionButton::None {
-                state.borrow_mut().hovered_button = CaptionButton::None;
-                state.borrow_mut().pressed_button = CaptionButton::None;
-                let mut client_rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client_rect);
-                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_rect.right);
-                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+            let old_hov = state.borrow().hovered_target.clone();
+            let old_pre = state.borrow().pressed_target.clone();
+            if old_hov != SidebarClickTarget::None || old_pre != SidebarClickTarget::None {
+                state.borrow_mut().hovered_target = SidebarClickTarget::None;
+                state.borrow_mut().pressed_target = SidebarClickTarget::None;
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             return LRESULT(0);
         }
@@ -335,12 +434,20 @@ unsafe extern "system" fn wndproc(
             let _ = GetClientRect(hwnd, &mut client_rect);
             let client_width = client_rect.right;
 
-            let btn = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
-            if btn != CaptionButton::None {
-                state.borrow_mut().pressed_button = btn;
+            let (sidebar_vis, tabs_len) = {
+                let b = state.borrow();
+                (b.sidebar_visible, b.tabs.len())
+            };
+
+            let target = state
+                .borrow()
+                .sidebar
+                .hit_test(hwnd, x, y, client_width, sidebar_vis, tabs_len);
+
+            if target != SidebarClickTarget::None {
+                state.borrow_mut().pressed_target = target;
                 let _ = SetCapture(hwnd);
-                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
-                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
         }
@@ -352,31 +459,75 @@ unsafe extern "system" fn wndproc(
             let _ = GetClientRect(hwnd, &mut client_rect);
             let client_width = client_rect.right;
 
-            let pressed = state.borrow().pressed_button;
-            if pressed != CaptionButton::None {
+            let pressed = state.borrow().pressed_target.clone();
+            if pressed != SidebarClickTarget::None {
                 let _ = ReleaseCapture();
-                state.borrow_mut().pressed_button = CaptionButton::None;
+                state.borrow_mut().pressed_target = SidebarClickTarget::None;
 
-                let released_btn = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
-                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
-                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+                let (sidebar_vis, tabs_len) = {
+                    let b = state.borrow();
+                    (b.sidebar_visible, b.tabs.len())
+                };
 
-                if pressed == released_btn {
+                let released = state
+                    .borrow()
+                    .sidebar
+                    .hit_test(hwnd, x, y, client_width, sidebar_vis, tabs_len);
+
+                let _ = InvalidateRect(Some(hwnd), None, false);
+
+                if pressed == released {
+                    let on_action = state.borrow().on_action.clone();
                     match pressed {
-                        CaptionButton::Minimize => {
+                        SidebarClickTarget::Caption(CaptionButton::Minimize) => {
                             let _ = ShowWindow(hwnd, SW_MINIMIZE);
                         }
-                        CaptionButton::Maximize => {
+                        SidebarClickTarget::Caption(CaptionButton::Maximize) => {
                             if IsZoomed(hwnd).as_bool() {
                                 let _ = ShowWindow(hwnd, SW_RESTORE);
                             } else {
                                 let _ = ShowWindow(hwnd, SW_MAXIMIZE);
                             }
                         }
-                        CaptionButton::Close => {
+                        SidebarClickTarget::Caption(CaptionButton::Close) => {
                             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
-                        CaptionButton::None => {}
+                        SidebarClickTarget::ToggleSidebar => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::ToggleSidebar);
+                            }
+                        }
+                        SidebarClickTarget::NavBack => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::NavBack);
+                            }
+                        }
+                        SidebarClickTarget::NavForward => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::NavForward);
+                            }
+                        }
+                        SidebarClickTarget::NavReload => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::NavReload);
+                            }
+                        }
+                        SidebarClickTarget::NavNewTab => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::NavNewTab);
+                            }
+                        }
+                        SidebarClickTarget::SelectTab(idx) => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::SelectTab(idx));
+                            }
+                        }
+                        SidebarClickTarget::CloseTab(idx) => {
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::CloseTab(idx));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 return LRESULT(0);
@@ -389,34 +540,35 @@ unsafe extern "system" fn wndproc(
             let height = client_rect.bottom - client_rect.top;
 
             let dpi = GetDpiForWindow(hwnd);
-            let sidebar_w = {
-                let b = state.borrow();
-                (b.config.sidebar_width as f32 * (dpi as f32 / 96.0)).round() as i32
+            let scale = dpi as f32 / 96.0;
+
+            let sidebar_vis = state.borrow().sidebar_visible;
+
+            let (content_rect, sidebar_rect) = if sidebar_vis {
+                let sidebar_w = (state.borrow().config.sidebar_width as f32 * scale).round() as i32;
+                let content_width = (width - sidebar_w).max(0);
+                (
+                    RECT { left: 0, top: 0, right: content_width, bottom: height },
+                    RECT { left: content_width, top: 0, right: width, bottom: height },
+                )
+            } else {
+                let btn_w = (46.0 * scale).round() as i32;
+                let btn_h = (32.0 * scale).round() as i32;
+                (
+                    RECT { left: 0, top: 0, right: width, bottom: height },
+                    RECT { left: width - (btn_w * 4), top: 0, right: width, bottom: btn_h },
+                )
             };
 
-            let content_width = (width - sidebar_w).max(0);
-            let content_rect = RECT {
-                left: 0,
-                top: 0,
-                right: content_width,
-                bottom: height,
-            };
-            let sidebar_rect = RECT {
-                left: content_width,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
-
-            if let Some(ref cb) = state.borrow().on_resize {
+            let on_resize = state.borrow().on_resize.clone();
+            if let Some(cb) = on_resize {
                 cb(content_rect, sidebar_rect);
             }
 
-            let _ = InvalidateRect(Some(hwnd), Some(&sidebar_rect), false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             return LRESULT(0);
         }
         WM_DPICHANGED => {
-            // Suggested new window rect is in lparam
             let suggested_rect = &*(lparam.0 as *const RECT);
             let _ = SetWindowPos(
                 hwnd,
@@ -427,6 +579,44 @@ unsafe extern "system" fn wndproc(
                 suggested_rect.bottom - suggested_rect.top,
                 SWP_NOZORDER | SWP_FRAMECHANGED,
             );
+            return LRESULT(0);
+        }
+        WM_KEYDOWN => {
+            let ctrl = (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32,
+            ) as u16
+                & 0x8000)
+                != 0;
+            if ctrl {
+                let on_action = state.borrow().on_action.clone();
+                match wparam.0 as u32 {
+                    0x54 => { // 'T' -> New Tab / Command Bar
+                        if let Some(cb) = on_action {
+                            cb(SidebarAction::NavNewTab);
+                        }
+                        return LRESULT(0);
+                    }
+                    0x53 => { // 'S' -> Toggle Sidebar
+                        if let Some(cb) = on_action {
+                            cb(SidebarAction::ToggleSidebar);
+                        }
+                        return LRESULT(0);
+                    }
+                    0x52 => { // 'R' -> Reload
+                        if let Some(cb) = on_action {
+                            cb(SidebarAction::NavReload);
+                        }
+                        return LRESULT(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        msg if msg >= WM_APP => {
+            let handler = state.borrow().on_custom_msg.clone();
+            if let Some(handler) = handler {
+                handler(msg, wparam, lparam);
+            }
             return LRESULT(0);
         }
         WM_DESTROY => {

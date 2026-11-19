@@ -56,7 +56,6 @@ pub fn handle_nccalcsize(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<L
 
     unsafe {
         if IsZoomed(hwnd).as_bool() {
-            // When maximized, adjust rect to monitor work area so borders don't spill over
             let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -69,7 +68,6 @@ pub fn handle_nccalcsize(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<L
         }
     }
 
-    // Returning 0 indicates that the client area covers the entire window rectangle
     Some(LRESULT(0))
 }
 
@@ -78,8 +76,8 @@ pub fn handle_nchittest(
     lparam: LPARAM,
     sidebar_width: i32,
     caption_height: i32,
+    sidebar_visible: bool,
 ) -> LRESULT {
-    // Screen coordinates of the cursor
     let x = (lparam.0 & 0xffff) as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
 
@@ -114,7 +112,6 @@ pub fn handle_nchittest(
             return LRESULT(HTBOTTOMRIGHT as isize);
         }
 
-        // Check edges
         if x < rect.left + border {
             return LRESULT(HTLEFT as isize);
         }
@@ -129,24 +126,25 @@ pub fn handle_nchittest(
         }
     }
 
-    // Window controls at top-right:
-    // IMPORTANT: Return HTCLIENT so DefWindowProc NEVER draws classic non-client 3D buttons.
-    // Mouse events will be cleanly handled in the client area with WinUI-3 styling.
+    // Window controls at top-right
     let btn_width = (46.0 * (dpi as f32 / 96.0)).round() as i32;
     let btn_height = (32.0 * (dpi as f32 / 96.0)).round() as i32;
-    let buttons_left = rect.right - (btn_width * 3);
+    let btn_count = if sidebar_visible { 3 } else { 4 };
+    let buttons_left = rect.right - (btn_width * btn_count);
 
     if x >= buttons_left && x < rect.right && y >= rect.top && y < rect.top + btn_height {
         return LRESULT(HTCLIENT as isize);
     }
 
     // Draggable caption area within sidebar top
-    let sidebar_left = rect.right - sidebar_width;
-    if x >= sidebar_left && y < rect.top + caption_height {
-        return LRESULT(HTCAPTION as isize);
+    if sidebar_visible {
+        let sidebar_left = rect.right - sidebar_width;
+        if x >= sidebar_left && y < rect.top + caption_height {
+            return LRESULT(HTCAPTION as isize);
+        }
     }
 
-    // Top edge drag strip (thin 6px strip above content)
+    // Thin top drag strip above content
     if y < rect.top + 6 {
         return LRESULT(HTCAPTION as isize);
     }
