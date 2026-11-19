@@ -10,18 +10,25 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, MSG, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOW, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    GetWindowLongPtrW, IsZoomed, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_DBLCLKS,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, MSG, SWP_FRAMECHANGED,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCHITTEST,
+    WM_PAINT, WM_SIZE, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_OVERLAPPEDWINDOW,
 };
 
 use crate::frame::{enable_modern_frame, handle_nccalcsize, handle_nchittest};
-use crate::sidebar::SidebarRenderer;
+use crate::sidebar::{CaptionButton, SidebarRenderer};
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 #[derive(Error, Debug)]
 pub enum UiError {
@@ -57,6 +64,9 @@ struct WindowState {
     config: WindowConfig,
     sidebar: SidebarRenderer,
     on_resize: Option<ResizeCallback>,
+    hovered_button: CaptionButton,
+    pressed_button: CaptionButton,
+    is_tracking_mouse: bool,
 }
 
 pub struct BrowserWindow {
@@ -89,6 +99,9 @@ impl BrowserWindow {
                 config,
                 sidebar: SidebarRenderer::new(),
                 on_resize: None,
+                hovered_button: CaptionButton::None,
+                pressed_button: CaptionButton::None,
+                is_tracking_mouse: false,
             }));
 
             let raw_state = Rc::into_raw(state.clone()) as *mut _;
@@ -262,10 +275,112 @@ unsafe extern "system" fn wndproc(
                 bottom: height,
             };
 
-            state.borrow().sidebar.render(hwnd, hdc, sidebar_rect, caption_h);
+            let (hovered, pressed) = {
+                let b = state.borrow();
+                (b.hovered_button, b.pressed_button)
+            };
+
+            state.borrow().sidebar.render(hwnd, hdc, sidebar_rect, caption_h, hovered, pressed);
 
             let _ = EndPaint(hwnd, &ps);
             return LRESULT(0);
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+
+            let mut client_rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client_rect);
+            let client_width = client_rect.right;
+
+            if !state.borrow().is_tracking_mouse {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+                state.borrow_mut().is_tracking_mouse = true;
+            }
+
+            let hovered = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
+            let old_hovered = state.borrow().hovered_button;
+            if hovered != old_hovered {
+                state.borrow_mut().hovered_button = hovered;
+                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
+                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+            }
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            state.borrow_mut().is_tracking_mouse = false;
+            let old_hovered = state.borrow().hovered_button;
+            let old_pressed = state.borrow().pressed_button;
+            if old_hovered != CaptionButton::None || old_pressed != CaptionButton::None {
+                state.borrow_mut().hovered_button = CaptionButton::None;
+                state.borrow_mut().pressed_button = CaptionButton::None;
+                let mut client_rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client_rect);
+                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_rect.right);
+                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+            }
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+
+            let mut client_rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client_rect);
+            let client_width = client_rect.right;
+
+            let btn = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
+            if btn != CaptionButton::None {
+                state.borrow_mut().pressed_button = btn;
+                let _ = SetCapture(hwnd);
+                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
+                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+                return LRESULT(0);
+            }
+        }
+        WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+
+            let mut client_rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client_rect);
+            let client_width = client_rect.right;
+
+            let pressed = state.borrow().pressed_button;
+            if pressed != CaptionButton::None {
+                let _ = ReleaseCapture();
+                state.borrow_mut().pressed_button = CaptionButton::None;
+
+                let released_btn = state.borrow().sidebar.hit_test_button(hwnd, x, y, client_width);
+                let buttons_rect = state.borrow().sidebar.get_caption_buttons_rect(hwnd, client_width);
+                let _ = InvalidateRect(Some(hwnd), Some(&buttons_rect), false);
+
+                if pressed == released_btn {
+                    match pressed {
+                        CaptionButton::Minimize => {
+                            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                        }
+                        CaptionButton::Maximize => {
+                            if IsZoomed(hwnd).as_bool() {
+                                let _ = ShowWindow(hwnd, SW_RESTORE);
+                            } else {
+                                let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                            }
+                        }
+                        CaptionButton::Close => {
+                            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                        CaptionButton::None => {}
+                    }
+                }
+                return LRESULT(0);
+            }
         }
         WM_SIZE => {
             let mut client_rect = RECT::default();

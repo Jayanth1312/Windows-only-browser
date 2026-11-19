@@ -10,8 +10,7 @@ use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsZoomed, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
-    HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT,
-    HTTOPRIGHT, NCCALCSIZE_PARAMS,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS,
 };
 
 // DWM attribute constants for Windows 11
@@ -100,7 +99,7 @@ pub fn handle_nchittest(
         (8.0 * (dpi as f32 / 96.0)).round() as i32
     };
 
-    // Check corners for resizing
+    // Check corners and borders for resizing (only when not maximized)
     if !is_maximized {
         if x < rect.left + border && y < rect.top + border {
             return LRESULT(HTTOPLEFT as isize);
@@ -130,29 +129,21 @@ pub fn handle_nchittest(
         }
     }
 
-    // Sidebar region on the right
+    // Window controls at top-right:
+    // IMPORTANT: Return HTCLIENT so DefWindowProc NEVER draws classic non-client 3D buttons.
+    // Mouse events will be cleanly handled in the client area with WinUI-3 styling.
+    let btn_width = (46.0 * (dpi as f32 / 96.0)).round() as i32;
+    let btn_height = (32.0 * (dpi as f32 / 96.0)).round() as i32;
+    let buttons_left = rect.right - (btn_width * 3);
+
+    if x >= buttons_left && x < rect.right && y >= rect.top && y < rect.top + btn_height {
+        return LRESULT(HTCLIENT as isize);
+    }
+
+    // Draggable caption area within sidebar top
     let sidebar_left = rect.right - sidebar_width;
-    if x >= sidebar_left {
-        let btn_width = (46.0 * (dpi as f32 / 96.0)).round() as i32;
-        let btn_height = (32.0 * (dpi as f32 / 96.0)).round() as i32;
-
-        // Window controls at top-right
-        if y >= rect.top && y < rect.top + btn_height {
-            if x >= rect.right - btn_width {
-                return LRESULT(HTCLOSE as isize);
-            }
-            if x >= rect.right - (btn_width * 2) {
-                return LRESULT(HTMAXBUTTON as isize);
-            }
-            if x >= rect.right - (btn_width * 3) {
-                return LRESULT(HTMINBUTTON as isize);
-            }
-        }
-
-        // Draggable caption area within sidebar top
-        if y < rect.top + caption_height {
-            return LRESULT(HTCAPTION as isize);
-        }
+    if x >= sidebar_left && y < rect.top + caption_height {
+        return LRESULT(HTCAPTION as isize);
     }
 
     // Top edge drag strip (thin 6px strip above content)
