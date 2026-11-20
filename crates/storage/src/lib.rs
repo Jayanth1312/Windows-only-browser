@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::Storage;
+pub use db::{HistoryEntry, SavedTab, Storage, StorageError};

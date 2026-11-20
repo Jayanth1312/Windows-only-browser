@@ -1,0 +1,15 @@
+/* YouTube-only cosmetic hiding. Page ads only. Player internals untouched. */
+#masthead-ad,
+#player-ads,
+ytd-ad-slot-renderer,
+ytd-in-feed-ad-layout-renderer,
+ytd-display-ad-renderer,
+ytd-promoted-sparkles-web-renderer,
+ytd-promoted-video-renderer,
+ytd-banner-promo-renderer,
+ytd-statement-banner-renderer,
+ytd-companion-slot-renderer,
+ytd-action-companion-ad-renderer,
+.ytd-merch-shelf-renderer {
+  display: none !important;
+}

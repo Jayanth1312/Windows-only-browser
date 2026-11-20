@@ -1,4 +1,4 @@
-use windows::core::BOOL;
+use windows::core::{w, BOOL, PCSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWINDOWATTRIBUTE,
@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -16,9 +17,44 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // DWM attribute constants for Windows 11
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(20);
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(33);
+pub const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(34);
 pub const DWMWCP_ROUND: u32 = 2;
 
+pub fn enable_process_dark_mode() {
+    unsafe {
+        if let Ok(uxtheme) = LoadLibraryW(w!("uxtheme.dll")) {
+            // Ordinal 135: SetPreferredAppMode (2 = ForceDark)
+            let set_preferred_app_mode: Option<unsafe extern "system" fn(i32) -> i32> =
+                std::mem::transmute(GetProcAddress(uxtheme, PCSTR(135 as *const u8)));
+            if let Some(set_mode) = set_preferred_app_mode {
+                set_mode(2);
+            }
+            // Ordinal 136: FlushMenuThemes
+            let flush_menu_themes: Option<unsafe extern "system" fn()> =
+                std::mem::transmute(GetProcAddress(uxtheme, PCSTR(136 as *const u8)));
+            if let Some(flush) = flush_menu_themes {
+                flush();
+            }
+        }
+    }
+}
+
+pub fn allow_dark_mode_for_window(hwnd: HWND) {
+    unsafe {
+        if let Ok(uxtheme) = LoadLibraryW(w!("uxtheme.dll")) {
+            // Ordinal 133: AllowDarkModeForWindow
+            let allow_dark_mode: Option<unsafe extern "system" fn(HWND, BOOL) -> BOOL> =
+                std::mem::transmute(GetProcAddress(uxtheme, PCSTR(133 as *const u8)));
+            if let Some(allow) = allow_dark_mode {
+                let _ = allow(hwnd, BOOL(1));
+            }
+        }
+    }
+}
+
 pub fn enable_modern_frame(hwnd: HWND) {
+    enable_process_dark_mode();
+    allow_dark_mode_for_window(hwnd);
     unsafe {
         // 1. Enable immersive dark mode
         let dark_mode = BOOL(1);
@@ -77,7 +113,12 @@ pub fn handle_nchittest(
     sidebar_width: i32,
     caption_height: i32,
     sidebar_visible: bool,
+    is_interactive_widget: bool,
 ) -> LRESULT {
+    if is_interactive_widget {
+        return LRESULT(HTCLIENT as isize);
+    }
+
     let x = (lparam.0 & 0xffff) as i16 as i32;
     let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
 
@@ -126,17 +167,7 @@ pub fn handle_nchittest(
         }
     }
 
-    // Window controls at top-right
-    let btn_width = (46.0 * (dpi as f32 / 96.0)).round() as i32;
-    let btn_height = (32.0 * (dpi as f32 / 96.0)).round() as i32;
-    let btn_count = if sidebar_visible { 3 } else { 4 };
-    let buttons_left = rect.right - (btn_width * btn_count);
-
-    if x >= buttons_left && x < rect.right && y >= rect.top && y < rect.top + btn_height {
-        return LRESULT(HTCLIENT as isize);
-    }
-
-    // Draggable caption area within sidebar top
+    // Draggable caption area when sidebar is open
     if sidebar_visible {
         let sidebar_left = rect.right - sidebar_width;
         if x >= sidebar_left && y < rect.top + caption_height {
@@ -144,8 +175,9 @@ pub fn handle_nchittest(
         }
     }
 
-    // Thin top drag strip above content
-    if y < rect.top + 6 {
+    // Thin top drag strip above content to allow moving / double-click maximizing the window
+    let drag_h = border + (6.0 * (dpi as f32 / 96.0)).round() as i32;
+    if y < rect.top + drag_h {
         return LRESULT(HTCAPTION as isize);
     }
 
