@@ -56,6 +56,8 @@ impl Storage {
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -16000;
 
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,

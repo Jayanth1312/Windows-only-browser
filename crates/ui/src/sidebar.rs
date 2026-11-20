@@ -319,6 +319,204 @@ pub fn friendly_title_for_url(url: &str) -> String {
     }
 }
 
+pub fn extract_palette_from_favicon(fav: &FaviconData) -> Option<[COLORREF; 4]> {
+    if fav.rgba.len() < 4 || fav.width == 0 || fav.height == 0 {
+        return None;
+    }
+
+    let total_pixels = (fav.width * fav.height) as usize;
+    let step = (total_pixels / 512).max(1);
+
+    struct ColorCluster {
+        r: f32,
+        g: f32,
+        b: f32,
+        count: usize,
+    }
+
+    let mut clusters: Vec<ColorCluster> = Vec::with_capacity(8);
+
+    for i in (0..total_pixels).step_by(step) {
+        let idx = i * 4;
+        if idx + 3 >= fav.rgba.len() {
+            break;
+        }
+        let a = fav.rgba[idx + 3];
+        if a < 100 {
+            continue;
+        }
+
+        let r = fav.rgba[idx];
+        let g = fav.rgba[idx + 1];
+        let b = fav.rgba[idx + 2];
+
+        let max_val = r.max(g).max(b);
+        let min_val = r.min(g).min(b);
+        let chroma = max_val - min_val;
+
+        // Skip near-monochrome pixels (pure white, gray, pure dark) to isolate vibrant colors
+        if chroma < 24 {
+            continue;
+        }
+
+        let rf = r as f32;
+        let gf = g as f32;
+        let bf = b as f32;
+
+        let mut nearest_idx = None;
+        let mut min_dist_sq = 55.0 * 55.0;
+
+        for (ci, cluster) in clusters.iter().enumerate() {
+            let dr = cluster.r - rf;
+            let dg = cluster.g - gf;
+            let db = cluster.b - bf;
+            let dist_sq = dr * dr + dg * dg + db * db;
+            if dist_sq < min_dist_sq {
+                min_dist_sq = dist_sq;
+                nearest_idx = Some(ci);
+            }
+        }
+
+        if let Some(ci) = nearest_idx {
+            let c = &mut clusters[ci];
+            let n = c.count as f32;
+            c.r = (c.r * n + rf) / (n + 1.0);
+            c.g = (c.g * n + gf) / (n + 1.0);
+            c.b = (c.b * n + bf) / (n + 1.0);
+            c.count += 1;
+        } else if clusters.len() < 8 {
+            clusters.push(ColorCluster {
+                r: rf,
+                g: gf,
+                b: bf,
+                count: 1,
+            });
+        }
+    }
+
+    if clusters.is_empty() {
+        return None;
+    }
+
+    clusters.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let to_col = |c: &ColorCluster| rgb(c.r.round() as u8, c.g.round() as u8, c.b.round() as u8);
+
+    match clusters.len() {
+        1 => {
+            let c = to_col(&clusters[0]);
+            Some([c, c, c, c])
+        }
+        2 => {
+            let c0 = to_col(&clusters[0]);
+            let c1 = to_col(&clusters[1]);
+            Some([c0, c1, c0, c1])
+        }
+        3 => {
+            let c0 = to_col(&clusters[0]);
+            let c1 = to_col(&clusters[1]);
+            let c2 = to_col(&clusters[2]);
+            Some([c0, c1, c2, c0])
+        }
+        _ => {
+            let c0 = to_col(&clusters[0]);
+            let c1 = to_col(&clusters[1]);
+            let c2 = to_col(&clusters[2]);
+            let c3 = to_col(&clusters[3]);
+            Some([c0, c1, c2, c3])
+        }
+    }
+}
+
+pub fn get_pinned_tab_palette(item: &TabItem) -> [COLORREF; 4] {
+    let domain = domain_of(&item.url);
+    let u = item.url.to_lowercase();
+    let t = item.title.to_lowercase();
+
+    // 1. Google (Red -> Blue -> Green -> Yellow clockwise perimeter matching Zen Browser)
+    if domain.contains("google.") || domain == "google" || u.contains("google.com") || t.contains("google") {
+        return [
+            rgb(234, 67, 53),  // Red (Top)
+            rgb(66, 133, 244), // Blue (Right)
+            rgb(52, 168, 83),  // Green (Bottom)
+            rgb(251, 188, 5),  // Yellow (Left)
+        ];
+    }
+
+    // 2. YouTube (Dominant vibrant red matching Zen Browser)
+    if domain.contains("youtube.com") || domain.contains("youtu.be") || u.contains("youtube.com") || t.contains("youtube") {
+        let yt_red = rgb(255, 0, 0);
+        return [yt_red, yt_red, yt_red, yt_red];
+    }
+
+    // 3. Reddit (Vibrant Reddit Orange)
+    if domain.contains("reddit.com") || u.contains("reddit.com") || t.contains("reddit") {
+        let reddit_orange = rgb(255, 69, 0);
+        return [reddit_orange, rgb(255, 110, 30), reddit_orange, rgb(255, 140, 0)];
+    }
+
+    // 4. Twitter / X (Twitter Electric Blue)
+    if domain.contains("twitter.com") || domain.contains("x.com") || u.contains("x.com") || t.contains("twitter") {
+        let tw_blue = rgb(29, 155, 240);
+        return [tw_blue, tw_blue, tw_blue, tw_blue];
+    }
+
+    // 5. Discord (Discord Blurple)
+    if domain.contains("discord.com") || domain.contains("discord.gg") || u.contains("discord.com") {
+        let disc_blurple = rgb(88, 101, 242);
+        return [disc_blurple, rgb(114, 137, 218), disc_blurple, rgb(71, 82, 196)];
+    }
+
+    // 6. Spotify (Spotify Electric Green)
+    if domain.contains("spotify.com") || u.contains("spotify.com") {
+        let spot_green = rgb(30, 215, 96);
+        return [spot_green, spot_green, spot_green, spot_green];
+    }
+
+    // 7. GitHub (Vibrant Electric Purple & Cyan Gradient)
+    if domain.contains("github.com") || u.contains("github.com") {
+        return [
+            rgb(137, 87, 229), // Electric Purple
+            rgb(88, 166, 255), // Cyan Blue
+            rgb(63, 185, 80),  // Green
+            rgb(188, 140, 255),// Violet
+        ];
+    }
+
+    // 8. Instagram (Vibrant sunset gradient)
+    if domain.contains("instagram.com") || u.contains("instagram.com") {
+        return [
+            rgb(225, 48, 108), // Magenta
+            rgb(131, 58, 180), // Purple
+            rgb(253, 29, 29),  // Red
+            rgb(247, 119, 55), // Orange
+        ];
+    }
+
+    // 9. Twitch (Twitch Purple)
+    if domain.contains("twitch.tv") || u.contains("twitch.tv") {
+        let tw_purp = rgb(145, 71, 255);
+        return [tw_purp, tw_purp, tw_purp, tw_purp];
+    }
+
+    // 10. Netflix (Netflix Red)
+    if domain.contains("netflix.com") || u.contains("netflix.com") {
+        let nf_red = rgb(229, 9, 20);
+        return [nf_red, nf_red, nf_red, nf_red];
+    }
+
+    // 11. Dynamic Favicon extraction for any arbitrary site
+    if let Some(ref fav) = item.favicon {
+        if let Some(palette) = extract_palette_from_favicon(fav) {
+            return palette;
+        }
+    }
+
+    // 12. Fallback to tab accent color
+    let acc = if item.accent.0 != 0 { item.accent } else { accent_for_url(&item.url) };
+    [acc, acc, acc, acc]
+}
+
 /// Modern look = translucent white overlays on a single dark base.
 #[derive(Clone)]
 pub struct Theme {
@@ -752,6 +950,9 @@ impl SidebarRenderer {
             }
 
             // ── Pinned rectangular tiles with authentic website favicons ──
+            let tile_rad = px(8.0);
+            let border_w = (1.5 * s).round().max(1.0);
+
             for (i, r) in l.pinned.iter().enumerate() {
                 let is_active = st.active == Some(ActiveTab::Pinned(i));
                 let is_hover = st.hovered == SidebarHit::Pinned(i);
@@ -759,9 +960,9 @@ impl SidebarRenderer {
 
                 let a = if is_active {
                     if is_hover {
-                        (t.active_a - 0.035).max(0.06)
+                        (t.active_a + 0.035).min(0.20)
                     } else {
-                        t.active_a
+                        (t.active_a + 0.02).min(0.18)
                     }
                 } else if is_loaded {
                     if is_hover {
@@ -778,26 +979,36 @@ impl SidebarRenderer {
                     }
                 };
 
-                cv.fill_round(r, px(7.0), t.white, a);
                 if is_active {
-                    cv.stroke_round(r, px(7.0), t.accent, 0.85, 1.0);
+                    let palette = get_pinned_tab_palette(&st.pinned[i]);
+                    // 1. Soft ambient glow radiating outward matching Zen Browser
+                    cv.glow_round_gradient(r, tile_rad, &palette, 0.35, (3.5 * s).round());
+                    // 2. Elevated tile background
+                    cv.fill_round(r, tile_rad, t.white, a);
+                    // 3. Subtle accent tint wash inside the tile body matching the border colors
+                    cv.fill_round_gradient(r, tile_rad, &palette, 0.08);
+                    // 4. Refined crisp gradient border
+                    cv.stroke_round_gradient(r, tile_rad, &palette, 0.95, border_w);
                 } else if is_loaded {
-                    cv.stroke_round(r, px(7.0), t.white, t.stroke_a, 1.0);
+                    cv.fill_round(r, tile_rad, t.white, a);
+                    cv.stroke_round(r, tile_rad, t.white, t.stroke_a, 1.0);
                 } else {
-                    cv.stroke_round(r, px(7.0), t.white, 0.03, 1.0);
+                    cv.fill_round(r, tile_rad, t.white, a);
+                    cv.stroke_round(r, tile_rad, t.white, 0.03, 1.0);
                 }
-                let fav = px(13.0);
+
+                let fav = px(18.0);
                 let cx = (r.left + r.right) / 2;
                 let cy = (r.top + r.bottom) / 2;
                 let fav_rect = rc(cx - fav / 2, cy - fav / 2, cx + fav / 2, cy + fav / 2);
-                draw_webapp_icon(&cv, &fav_rect, &st.pinned[i], px(7.0), px);
+                draw_webapp_icon(&cv, &fav_rect, &st.pinned[i], tile_rad, px);
             }
 
             // Floating tooltip pill when a pinned tile is hovered (Image 2)
             if let SidebarHit::Pinned(hover_idx) = st.hovered {
                 if let Some(pitem) = st.pinned.get(hover_idx) {
                     if let Some(tile_r) = l.pinned.get(hover_idx) {
-                        SelectObject(mem_dc, ui_semi.into());
+                        SelectObject(mem_dc, ui.into());
                         let tw = text_w(mem_dc, &pitem.title);
                         let pill_w = tw + px(16.0);
                         let pill_h = px(22.0);
@@ -1202,6 +1413,186 @@ impl Canvas {
         }
     }
 
+    pub fn stroke_round_gradient(
+        &self,
+        r: &RECT,
+        radius: i32,
+        palette: &[COLORREF; 4],
+        a: f32,
+        width: f32,
+    ) {
+        if a <= 0.0 || width <= 0.0 {
+            return;
+        }
+        self.sync();
+        let g = RoundGeom::new(r, radius);
+        let (cx, cy) = g.center();
+
+        let pad = (width + 2.0).ceil() as i32;
+        let y_min = r.top - pad;
+        let y_max = r.bottom + pad;
+        let x_min = r.left - pad;
+        let x_max = r.right + pad;
+
+        let c_same = palette[0] == palette[1] && palette[1] == palette[2] && palette[2] == palette[3];
+
+        for y in y_min..y_max {
+            for x in x_min..x_max {
+                let d = g.dist(x, y);
+                let outer = (0.5 - d).clamp(0.0, 1.0);
+                let inner = (0.5 - (d + width)).clamp(0.0, 1.0);
+                let ring = (outer - inner).max(0.0);
+                if ring <= 0.0 {
+                    continue;
+                }
+
+                let col = if c_same {
+                    palette[0]
+                } else {
+                    let angle = (y as f32 + 0.5 - cy).atan2(x as f32 + 0.5 - cx);
+                    let norm = (angle + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+                    let seg = norm * 4.0;
+                    let (c1, c2, t) = if seg < 1.0 {
+                        (palette[0], palette[1], seg)
+                    } else if seg < 2.0 {
+                        (palette[1], palette[2], seg - 1.0)
+                    } else if seg < 3.0 {
+                        (palette[2], palette[3], seg - 2.0)
+                    } else {
+                        (palette[3], palette[0], (seg - 3.0).min(1.0))
+                    };
+
+                    let (r1, g1, b1) = (c1.0 & 0xff, (c1.0 >> 8) & 0xff, (c1.0 >> 16) & 0xff);
+                    let (r2, g2, b2) = (c2.0 & 0xff, (c2.0 >> 8) & 0xff, (c2.0 >> 16) & 0xff);
+                    let cr = (r1 as f32 + (r2 as f32 - r1 as f32) * t).round() as u8;
+                    let cg = (g1 as f32 + (g2 as f32 - g1 as f32) * t).round() as u8;
+                    let cb = (b1 as f32 + (b2 as f32 - b1 as f32) * t).round() as u8;
+                    rgb(cr, cg, cb)
+                };
+
+                self.blend(x, y, col, a * ring);
+            }
+        }
+    }
+
+    pub fn glow_round_gradient(
+        &self,
+        r: &RECT,
+        radius: i32,
+        palette: &[COLORREF; 4],
+        max_alpha: f32,
+        glow_spread: f32,
+    ) {
+        if glow_spread <= 0.0 || max_alpha <= 0.0 {
+            return;
+        }
+        self.sync();
+        let g = RoundGeom::new(r, radius);
+        let (cx, cy) = g.center();
+
+        let pad = (glow_spread + 2.0).ceil() as i32;
+        let y_min = r.top - pad;
+        let y_max = r.bottom + pad;
+        let x_min = r.left - pad;
+        let x_max = r.right + pad;
+
+        let c_same = palette[0] == palette[1] && palette[1] == palette[2] && palette[2] == palette[3];
+
+        for y in y_min..y_max {
+            for x in x_min..x_max {
+                let d = g.dist(x, y);
+                if d < -2.0 || d > glow_spread {
+                    continue;
+                }
+
+                let cov = if d <= 0.0 {
+                    1.0
+                } else {
+                    let t = 1.0 - (d / glow_spread);
+                    t * t
+                };
+
+                let col = if c_same {
+                    palette[0]
+                } else {
+                    let angle = (y as f32 + 0.5 - cy).atan2(x as f32 + 0.5 - cx);
+                    let norm = (angle + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+                    let seg = norm * 4.0;
+                    let (c1, c2, t) = if seg < 1.0 {
+                        (palette[0], palette[1], seg)
+                    } else if seg < 2.0 {
+                        (palette[1], palette[2], seg - 1.0)
+                    } else if seg < 3.0 {
+                        (palette[2], palette[3], seg - 2.0)
+                    } else {
+                        (palette[3], palette[0], (seg - 3.0).min(1.0))
+                    };
+
+                    let (r1, g1, b1) = (c1.0 & 0xff, (c1.0 >> 8) & 0xff, (c1.0 >> 16) & 0xff);
+                    let (r2, g2, b2) = (c2.0 & 0xff, (c2.0 >> 8) & 0xff, (c2.0 >> 16) & 0xff);
+                    let cr = (r1 as f32 + (r2 as f32 - r1 as f32) * t).round() as u8;
+                    let cg = (g1 as f32 + (g2 as f32 - g1 as f32) * t).round() as u8;
+                    let cb = (b1 as f32 + (b2 as f32 - b1 as f32) * t).round() as u8;
+                    rgb(cr, cg, cb)
+                };
+
+                self.blend(x, y, col, max_alpha * cov);
+            }
+        }
+    }
+
+    pub fn fill_round_gradient(
+        &self,
+        r: &RECT,
+        radius: i32,
+        palette: &[COLORREF; 4],
+        a: f32,
+    ) {
+        if a <= 0.0 {
+            return;
+        }
+        self.sync();
+        let g = RoundGeom::new(r, radius);
+        let (cx, cy) = g.center();
+
+        let c_same = palette[0] == palette[1] && palette[1] == palette[2] && palette[2] == palette[3];
+
+        for y in (r.top - 1)..(r.bottom + 1) {
+            for x in (r.left - 1)..(r.right + 1) {
+                let cov = (0.5 - g.dist(x, y)).clamp(0.0, 1.0);
+                if cov <= 0.0 {
+                    continue;
+                }
+
+                let col = if c_same {
+                    palette[0]
+                } else {
+                    let angle = (y as f32 + 0.5 - cy).atan2(x as f32 + 0.5 - cx);
+                    let norm = (angle + std::f32::consts::FRAC_PI_2).rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
+                    let seg = norm * 4.0;
+                    let (c1, c2, t) = if seg < 1.0 {
+                        (palette[0], palette[1], seg)
+                    } else if seg < 2.0 {
+                        (palette[1], palette[2], seg - 1.0)
+                    } else if seg < 3.0 {
+                        (palette[2], palette[3], seg - 2.0)
+                    } else {
+                        (palette[3], palette[0], (seg - 3.0).min(1.0))
+                    };
+
+                    let (r1, g1, b1) = (c1.0 & 0xff, (c1.0 >> 8) & 0xff, (c1.0 >> 16) & 0xff);
+                    let (r2, g2, b2) = (c2.0 & 0xff, (c2.0 >> 8) & 0xff, (c2.0 >> 16) & 0xff);
+                    let cr = (r1 as f32 + (r2 as f32 - r1 as f32) * t).round() as u8;
+                    let cg = (g1 as f32 + (g2 as f32 - g1 as f32) * t).round() as u8;
+                    let cb = (b1 as f32 + (b2 as f32 - b1 as f32) * t).round() as u8;
+                    rgb(cr, cg, cb)
+                };
+
+                self.blend(x, y, col, a * cov);
+            }
+        }
+    }
+
     pub fn draw_image_scaled(&self, r: &RECT, img_rgba: &[u8], img_w: u32, img_h: u32) {
         self.draw_image_scaled_custom(r, img_rgba, img_w, img_h, 1.0, false);
     }
@@ -1432,6 +1823,11 @@ impl RoundGeom {
             hy,
             rad: (radius as f32).min(hx).min(hy),
         }
+    }
+
+    #[inline]
+    pub fn center(&self) -> (f32, f32) {
+        (self.cx, self.cy)
     }
 
     #[inline]

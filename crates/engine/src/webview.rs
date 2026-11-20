@@ -1,16 +1,19 @@
+use std::cell::{Cell, RefCell};
 use std::path::Path;
+use std::rc::Rc;
 use std::string::FromUtf16Error;
 use std::sync::mpsc;
 use thiserror::Error;
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    ContainsFullScreenElementChangedEventHandler,
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     FaviconChangedEventHandler, GetFaviconCompletedHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
     ProfileAddBrowserExtensionCompletedHandler, SourceChangedEventHandler,
-    WebMessageReceivedEventHandler,
+    TrySuspendCompletedHandler, WebMessageReceivedEventHandler,
 };
 use windows::core::{HSTRING, Interface, PCWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, RECT};
@@ -62,6 +65,8 @@ pub fn init_com() -> Result<(), EngineError> {
 
 pub struct WebViewEngine {
     environment: ICoreWebView2Environment,
+    spare_controller: Rc<RefCell<Option<(ICoreWebView2Controller, ICoreWebView2)>>>,
+    is_prewarming: Rc<Cell<bool>>,
 }
 
 pub struct WebViewController {
@@ -102,9 +107,9 @@ const MODERN_SCROLLBAR_CSS_SCRIPT: &str = r#"
         }
     `;
     function inject() {
-        if (document.getElementById('__arc_modern_scrollbar__')) return;
+        if (document.getElementById('__browser_modern_scrollbar__')) return;
         const style = document.createElement('style');
-        style.id = '__arc_modern_scrollbar__';
+        style.id = '__browser_modern_scrollbar__';
         style.textContent = css;
         if (document.head) {
             document.head.appendChild(style);
@@ -139,9 +144,9 @@ const COSMETIC_ADBLOCK_CSS_SCRIPT: &str = r#"
         }
     `;
     function inject() {
-        if (document.getElementById('__arc_adblock_cosmetic__')) return;
+        if (document.getElementById('__browser_adblock_cosmetic__')) return;
         const style = document.createElement('style');
-        style.id = '__arc_adblock_cosmetic__';
+        style.id = '__browser_adblock_cosmetic__';
         style.textContent = css;
         if (document.head) {
             document.head.appendChild(style);
@@ -160,26 +165,484 @@ const COSMETIC_ADBLOCK_CSS_SCRIPT: &str = r#"
 const YT_HIDE_INTERRUPTIONS_SCRIPT: &str = r#"
 (() => {
     if (!location.hostname.endsWith('youtube.com')) return;
-    let timer = null;
-    function sweep() {
-        timer = null;
+
+    // 1. Defuse internal YouTube interruption & anti-adblock config flags
+    try {
+        if (window.yt && window.yt.config_) {
+            window.yt.config_.EXPERIENCE_INTERRUPTIONS_MODE = false;
+            if (window.yt.config_.EXPERIMENT_FLAGS) {
+                window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_rsp_cl = false;
+                window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_reg_app = false;
+            }
+            if (window.yt.config_.openPopupConfig && window.yt.config_.openPopupConfig.supportedPopups) {
+                window.yt.config_.openPopupConfig.supportedPopups.adBlockMessageViewModel = false;
+            }
+        }
+    } catch(e) {}
+
+    // 2. Inject anti-interruption styles immediately
+    function injectStyles() {
+        if (document.getElementById('__browser_yt_anti_interruption__')) return;
+        const style = document.createElement('style');
+        style.id = '__browser_yt_anti_interruption__';
+        style.textContent = `
+            ytd-enforcement-message-view-model,
+            tp-yt-paper-dialog:has(ytd-enforcement-message-view-model),
+            tp-yt-paper-toast:has(a[href*="3037019"]),
+            tp-yt-paper-toast:has(a[href*="check_ad_blockers"]),
+            ytd-notification-action-renderer:has(a[href*="3037019"]),
+            ytd-notification-action-renderer:has(a[href*="check_ad_blockers"]),
+            tp-yt-iron-overlay-backdrop {
+                display: none !important;
+                visibility: hidden !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+            }
+        `;
+        if (document.head) {
+            document.head.appendChild(style);
+        } else if (document.documentElement) {
+            document.documentElement.appendChild(style);
+        }
+    }
+    injectStyles();
+
+    // 3. Active dismissal and playback continuation sweep
+    function dismissInterruption() {
+        let interrupted = false;
+
+        // Auto-click any dismiss buttons if rendered
+        const dismissButtons = document.querySelectorAll(
+            'ytd-enforcement-message-view-model #dismiss-button, tp-yt-paper-toast #action-button'
+        );
+        for (const btn of dismissButtons) {
+            try { btn.click(); interrupted = true; } catch(e) {}
+        }
+
+        // Remove enforcement elements and interruption toasts from DOM
+        const popups = document.querySelectorAll(
+            'ytd-enforcement-message-view-model, tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), tp-yt-paper-toast:has(a[href*="3037019"])'
+        );
+        for (const p of popups) {
+            try { p.remove(); interrupted = true; } catch(e) {}
+        }
+
+        // Check popup container text
         const pc = document.querySelector('ytd-popup-container');
-        if (!pc || !pc.textContent || !pc.textContent.includes('Experiencing interruptions')) return;
-        for (const el of pc.children) {
-            if (el.textContent && el.textContent.includes('Experiencing interruptions')) {
-                el.style.setProperty('display', 'none', 'important');
+        if (pc && pc.textContent && pc.textContent.includes('Experiencing interruptions')) {
+            for (const el of pc.querySelectorAll('yt-notification-action-renderer, tp-yt-paper-toast, tp-yt-paper-dialog')) {
+                if (el.textContent && el.textContent.includes('Experiencing interruptions')) {
+                    try { el.remove(); interrupted = true; } catch(e) {}
+                }
+            }
+        }
+
+        // Clear backdrop overlay that traps mouse clicks
+        const backdrops = document.querySelectorAll('tp-yt-iron-overlay-backdrop');
+        for (const b of backdrops) {
+            try { b.remove(); } catch(e) {}
+        }
+
+        // Unlock scrollbars if locked
+        if (document.body && document.body.style.overflow === 'hidden') {
+            document.body.style.overflow = '';
+        }
+
+        // Resume video playback if YouTube paused it due to the interruption
+        if (interrupted) {
+            const video = document.querySelector('video');
+            if (video && video.paused) {
+                video.play().catch(() => {});
             }
         }
     }
-    function start() {
-        new MutationObserver(() => {
-            if (!timer) timer = setTimeout(sweep, 400);
-        }).observe(document.documentElement, { childList: true, subtree: true });
+
+    // Run sweep on mutations with debounce
+    let sweepTimer = null;
+    function scheduleSweep() {
+        if (!sweepTimer) {
+            sweepTimer = setTimeout(() => {
+                sweepTimer = null;
+                dismissInterruption();
+            }, 100);
+        }
     }
-    if (document.documentElement) start();
-    else document.addEventListener('DOMContentLoaded', start);
+
+    const observer = new MutationObserver(scheduleSweep);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            injectStyles();
+            dismissInterruption();
+        });
+    } else {
+        dismissInterruption();
+    }
 })();
 "#;
+
+const PAGE_META_OBSERVER_SCRIPT: &str = r#"
+(() => {
+    let curTitle = '';
+    let curUrl = '';
+
+    function reportMeta() {
+        try {
+            const t = document.title || '';
+            const u = location.href || '';
+            if (t !== curTitle || u !== curUrl) {
+                curTitle = t;
+                curUrl = u;
+                if (window.chrome && window.chrome.webview) {
+                    window.chrome.webview.postMessage("meta:" + t + "|||" + u);
+                }
+            }
+        } catch(e) {}
+    }
+
+    function hookTitle() {
+        const titleEl = document.querySelector('title');
+        if (titleEl) {
+            const obs = new MutationObserver(() => reportMeta());
+            obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
+        }
+        reportMeta();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', hookTitle);
+    } else {
+        hookTitle();
+    }
+
+    window.addEventListener('popstate', () => {
+        setTimeout(reportMeta, 50);
+        setTimeout(reportMeta, 300);
+    });
+
+    window.addEventListener('yt-navigate-finish', () => {
+        setTimeout(reportMeta, 50);
+        setTimeout(reportMeta, 300);
+    });
+
+    document.addEventListener('yt-page-data-updated', () => {
+        setTimeout(reportMeta, 50);
+        setTimeout(reportMeta, 300);
+    });
+
+    // Fallback periodic sync without monkey-patching native history APIs
+    setInterval(reportMeta, 500);
+})();
+"#;
+
+const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
+(function() {
+    if (window.__zenSearchPopupInjected) return;
+    window.__zenSearchPopupInjected = true;
+
+    let host = null;
+    let pill = null;
+    let currentSelectedText = '';
+    let isVisible = false;
+
+    function initPopup() {
+        if (host) return;
+        host = document.createElement('div');
+        host.id = 'zen-search-popup-host';
+        host.style.cssText = 'all: initial !important; position: absolute !important; top: 0 !important; left: 0 !important; z-index: 2147483647 !important; pointer-events: none !important;';
+
+        const shadow = host.attachShadow({ mode: 'closed' });
+
+        const style = document.createElement('style');
+        style.textContent = `
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            .zen-search-pill {
+                position: fixed;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                background: #23262f;
+                color: #ffffff;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                font-size: 13px;
+                font-weight: 400;
+                line-height: 1;
+                padding: 7px 14px 7px 11px;
+                border-radius: 7px;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2);
+                cursor: pointer;
+                pointer-events: auto;
+                user-select: none;
+                -webkit-user-select: none;
+                opacity: 0;
+                visibility: hidden;
+                transform: translate(-50%, -75%) scale(0.92);
+                transition: opacity 0.14s cubic-bezier(0.16, 1, 0.3, 1), transform 0.14s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.14s, background 0.1s ease;
+                white-space: nowrap;
+                z-index: 2147483647;
+            }
+            .zen-search-pill.visible {
+                opacity: 1;
+                visibility: visible;
+                transform: translate(-50%, -100%) scale(1);
+            }
+            .zen-search-pill.bottom-placed.visible {
+                opacity: 1;
+                visibility: visible;
+                transform: translate(-50%, 0%) scale(1);
+            }
+            .zen-search-pill:hover {
+                background: #313543;
+                border-color: rgba(255, 255, 255, 0.26);
+                box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55), 0 2px 5px rgba(0, 0, 0, 0.3);
+            }
+            .zen-search-pill:active {
+                transform: translate(-50%, -100%) scale(0.97);
+                background: #1c1e26;
+            }
+            .zen-search-pill.bottom-placed:active {
+                transform: translate(-50%, 0%) scale(0.97);
+            }
+            .zen-search-icon {
+                width: 13px;
+                height: 13px;
+                margin-right: 7px;
+                flex-shrink: 0;
+                stroke: currentColor;
+                stroke-width: 2.2;
+                fill: none;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+                opacity: 0.9;
+            }
+            .zen-search-text {
+                letter-spacing: 0.1px;
+            }
+        `;
+
+        pill = document.createElement('div');
+        pill.className = 'zen-search-pill';
+        pill.innerHTML = `
+            <svg class="zen-search-icon" viewBox="0 0 24 24">
+                <circle cx="11" cy="11" r="7"></circle>
+                <line x1="21" y1="21" x2="16.5" y2="16.5"></line>
+            </svg>
+            <span class="zen-search-text">Search</span>
+        `;
+
+        shadow.appendChild(style);
+        shadow.appendChild(pill);
+
+        pill.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        pill.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        pill.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (currentSelectedText && window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage("search:" + encodeURIComponent(currentSelectedText));
+            }
+            hide();
+        });
+    }
+
+    function ensureAttached() {
+        initPopup();
+        if (document.documentElement && !document.documentElement.contains(host)) {
+            document.documentElement.appendChild(host);
+        }
+    }
+
+    function hide() {
+        if (!isVisible || !pill) return;
+        isVisible = false;
+        pill.classList.remove('visible', 'bottom-placed');
+        currentSelectedText = '';
+    }
+
+    function showForRect(rect, text) {
+        ensureAttached();
+        currentSelectedText = text;
+
+        let centerX = rect.left + rect.width / 2;
+        centerX = Math.max(55, Math.min(window.innerWidth - 55, centerX));
+
+        const spaceAbove = rect.top;
+        let topY = 0;
+        let isBottom = false;
+
+        if (spaceAbove >= 44) {
+            topY = rect.top - 8;
+            isBottom = false;
+        } else {
+            topY = rect.bottom + 8;
+            isBottom = true;
+        }
+
+        pill.style.left = Math.round(centerX) + 'px';
+        pill.style.top = Math.round(topY) + 'px';
+
+        if (isBottom) {
+            pill.classList.add('bottom-placed');
+        } else {
+            pill.classList.remove('bottom-placed');
+        }
+
+        pill.classList.add('visible');
+        isVisible = true;
+    }
+
+    function checkSelection() {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+            hide();
+            return;
+        }
+
+        const raw = sel.toString();
+        const text = raw.replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 500) {
+            hide();
+            return;
+        }
+
+        try {
+            const range = sel.getRangeAt(0);
+            const rect = range.getBoundingClientRect();
+            if (rect.width <= 0 && rect.height <= 0) {
+                hide();
+                return;
+            }
+            showForRect(rect, text);
+        } catch(e) {
+            hide();
+        }
+    }
+
+    document.addEventListener('mouseup', (e) => {
+        if (host && (e.target === host || host.contains(e.target))) return;
+        setTimeout(checkSelection, 20);
+    }, true);
+
+    document.addEventListener('keyup', (e) => {
+        if (e.key === 'Shift' || e.key.startsWith('Arrow') || (e.ctrlKey && e.key.toLowerCase() === 'a')) {
+            setTimeout(checkSelection, 20);
+        } else if (e.key === 'Escape') {
+            hide();
+        }
+    }, true);
+
+    document.addEventListener('mousedown', (e) => {
+        if (host && (e.target === host || host.contains(e.target))) return;
+        hide();
+    }, true);
+
+    document.addEventListener('contextmenu', hide, true);
+    window.addEventListener('scroll', hide, { passive: true });
+    window.addEventListener('resize', hide, { passive: true });
+})();
+"#;
+
+fn inject_default_scripts(webview: &ICoreWebView2) {
+    // Inject modern minimal overlay scrollbar script into all documents
+    {
+        let script_hstring = HSTRING::from(MODERN_SCROLLBAR_CSS_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
+    // Inject instant cosmetic ad-blocking CSS script into all documents
+    {
+        let script_hstring = HSTRING::from(COSMETIC_ADBLOCK_CSS_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
+    // Hide YouTube's "Experiencing interruptions?" popup
+    {
+        let script_hstring = HSTRING::from(YT_HIDE_INTERRUPTIONS_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
+    // Inject SPA and dynamic title observer script (e.g. YouTube video changes)
+    {
+        let script_hstring = HSTRING::from(PAGE_META_OBSERVER_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
+    // Inject text selection search popup script into all documents
+    {
+        let script_hstring = HSTRING::from(SELECTION_SEARCH_POPUP_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+}
+
+fn configure_webview_settings(webview: &ICoreWebView2) {
+    if let Ok(settings) = unsafe { webview.Settings() } {
+        unsafe {
+            let _ = settings.SetIsStatusBarEnabled(false);
+            let _ = settings.SetAreDevToolsEnabled(true);
+            let _ = settings.SetAreDefaultContextMenusEnabled(true);
+            if let Ok(settings2) = settings.cast::<ICoreWebView2Settings2>() {
+                let ua = HSTRING::from(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+                );
+                let _ = settings2.SetUserAgent(PCWSTR::from_raw(ua.as_ptr()));
+            }
+        }
+    }
+}
 
 fn read_istream(stream: &IStream) -> Vec<u8> {
     let mut out = Vec::new();
@@ -275,7 +738,44 @@ impl WebViewEngine {
             .recv()
             .map_err(|e| EngineError::Channel(e.to_string()))??;
 
-        Ok(Self { environment })
+        Ok(Self {
+            environment,
+            spare_controller: Rc::new(RefCell::new(None)),
+            is_prewarming: Rc::new(Cell::new(false)),
+        })
+    }
+
+    pub fn prewarm(&self, parent: HWND) {
+        if self.spare_controller.borrow().is_some() || self.is_prewarming.get() {
+            return;
+        }
+        self.is_prewarming.set(true);
+
+        let env = self.environment.clone();
+        let spare_cell = self.spare_controller.clone();
+        let prewarm_flag = self.is_prewarming.clone();
+
+        let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |error_code, ctrl| {
+            prewarm_flag.set(false);
+            if error_code.is_ok() {
+                if let Some(controller) = ctrl {
+                    if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                        unsafe {
+                            let _ = controller.SetIsVisible(false);
+                        }
+                        configure_webview_settings(&webview);
+                        inject_default_scripts(&webview);
+                        *spare_cell.borrow_mut() = Some((controller, webview));
+                        tracing::info!("Pre-warmed spare WebView2 controller ready");
+                    }
+                }
+            }
+            Ok(())
+        }));
+
+        unsafe {
+            let _ = env.CreateCoreWebView2Controller(parent, &handler);
+        }
     }
 
     pub fn create_controller(
@@ -290,40 +790,46 @@ impl WebViewEngine {
         on_favicon_changed: Option<Box<dyn Fn(Vec<u8>) + Send + 'static>>,
         on_new_window: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_shortcut: Option<Box<dyn Fn(BrowserShortcut) + Send + 'static>>,
+        on_fullscreen_changed: Option<Box<dyn Fn(bool) + Send + 'static>>,
     ) -> Result<WebViewController, EngineError> {
-        let (tx, rx) = mpsc::channel();
-        let env_clone = self.environment.clone();
+        let (controller, webview, is_spare) = if let Some((ctrl, wv)) = self.spare_controller.borrow_mut().take() {
+            (ctrl, wv, true)
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let env_clone = self.environment.clone();
 
-        CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
-            Box::new(move |handler| unsafe {
-                env_clone
-                    .CreateCoreWebView2Controller(parent, &handler)
-                    .map_err(webview2_com::Error::WindowsError)
-            }),
-            Box::new(move |error_code, ctrl| {
-                if let Err(e) = error_code {
-                    let _ = tx.send(Err(EngineError::Windows(e)));
-                    return Ok(());
-                }
-                match ctrl {
-                    Some(c) => {
-                        let _ = tx.send(Ok(c));
+            CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
+                Box::new(move |handler| unsafe {
+                    env_clone
+                        .CreateCoreWebView2Controller(parent, &handler)
+                        .map_err(webview2_com::Error::WindowsError)
+                }),
+                Box::new(move |error_code, ctrl| {
+                    if let Err(e) = error_code {
+                        let _ = tx.send(Err(EngineError::Windows(e)));
+                        return Ok(());
                     }
-                    None => {
-                        let _ = tx.send(Err(EngineError::Windows(windows::core::Error::from(
-                            E_POINTER,
-                        ))));
+                    match ctrl {
+                        Some(c) => {
+                            let _ = tx.send(Ok(c));
+                        }
+                        None => {
+                            let _ = tx.send(Err(EngineError::Windows(windows::core::Error::from(
+                                E_POINTER,
+                            ))));
+                        }
                     }
-                }
-                Ok(())
-            }),
-        )?;
+                    Ok(())
+                }),
+            )?;
 
-        let controller = rx
-            .recv()
-            .map_err(|e| EngineError::Channel(e.to_string()))??;
+            let controller = rx
+                .recv()
+                .map_err(|e| EngineError::Channel(e.to_string()))??;
 
-        let webview = unsafe { controller.CoreWebView2()? };
+            let webview = unsafe { controller.CoreWebView2()? };
+            (controller, webview, false)
+        };
 
         // Set bounds and make visible
         unsafe {
@@ -331,152 +837,20 @@ impl WebViewEngine {
             controller.SetIsVisible(true)?;
         }
 
-        // Configure basic settings
-        if let Ok(settings) = unsafe { webview.Settings() } {
-            unsafe {
-                let _ = settings.SetIsStatusBarEnabled(false);
-                let _ = settings.SetAreDevToolsEnabled(true);
-                let _ = settings.SetAreDefaultContextMenusEnabled(true);
-            }
-        }
-
-        // Inject modern minimal overlay scrollbar script into all documents
-        {
-            let script_hstring = HSTRING::from(MODERN_SCROLLBAR_CSS_SCRIPT);
-            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-                |_res, _id| Ok(()),
-            ));
-            unsafe {
-                let _ = webview.AddScriptToExecuteOnDocumentCreated(
-                    PCWSTR::from_raw(script_hstring.as_ptr()),
-                    &handler,
-                );
-            }
-        }
-
-        // Inject instant cosmetic ad-blocking CSS script into all documents
-        {
-            let script_hstring = HSTRING::from(COSMETIC_ADBLOCK_CSS_SCRIPT);
-            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-                |_res, _id| Ok(()),
-            ));
-            unsafe {
-                let _ = webview.AddScriptToExecuteOnDocumentCreated(
-                    PCWSTR::from_raw(script_hstring.as_ptr()),
-                    &handler,
-                );
-            }
-        }
-
-        // Hide YouTube's "Experiencing interruptions?" popup
-        {
-            let script_hstring = HSTRING::from(YT_HIDE_INTERRUPTIONS_SCRIPT);
-            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-                |_res, _id| Ok(()),
-            ));
-            unsafe {
-                let _ = webview.AddScriptToExecuteOnDocumentCreated(
-                    PCWSTR::from_raw(script_hstring.as_ptr()),
-                    &handler,
-                );
-            }
-        }
-
-        // Inject SPA and dynamic title observer script (e.g. YouTube video changes)
-        {
-            const PAGE_META_OBSERVER_SCRIPT: &str = r#"
-            (() => {
-                let curTitle = '';
-                let curUrl = '';
-
-                function reportMeta() {
-                    try {
-                        const t = document.title || '';
-                        const u = location.href || '';
-                        if (t !== curTitle || u !== curUrl) {
-                            curTitle = t;
-                            curUrl = u;
-                            if (window.chrome && window.chrome.webview) {
-                                window.chrome.webview.postMessage("meta:" + t + "|||" + u);
-                            }
-                        }
-                    } catch(e) {}
-                }
-
-                function hookTitle() {
-                    const titleEl = document.querySelector('title');
-                    if (titleEl) {
-                        const obs = new MutationObserver(() => reportMeta());
-                        obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
-                    }
-                    reportMeta();
-                }
-
-                if (document.readyState === 'loading') {
-                    document.addEventListener('DOMContentLoaded', hookTitle);
-                } else {
-                    hookTitle();
-                }
-
-                window.addEventListener('popstate', () => {
-                    setTimeout(reportMeta, 50);
-                    setTimeout(reportMeta, 300);
-                });
-
-                window.addEventListener('yt-navigate-finish', () => {
-                    setTimeout(reportMeta, 50);
-                    setTimeout(reportMeta, 300);
-                });
-
-                document.addEventListener('yt-page-data-updated', () => {
-                    setTimeout(reportMeta, 50);
-                    setTimeout(reportMeta, 300);
-                });
-
-                try {
-                    const origPush = history.pushState;
-                    if (origPush) {
-                        history.pushState = function(...args) {
-                            const res = origPush.apply(this, args);
-                            setTimeout(reportMeta, 50);
-                            setTimeout(reportMeta, 300);
-                            return res;
-                        };
-                    }
-                } catch(e) {}
-
-                try {
-                    const origReplace = history.replaceState;
-                    if (origReplace) {
-                        history.replaceState = function(...args) {
-                            const res = origReplace.apply(this, args);
-                            setTimeout(reportMeta, 50);
-                            setTimeout(reportMeta, 300);
-                            return res;
-                        };
-                    }
-                } catch(e) {}
-            })();
-            "#;
-            let script_hstring = HSTRING::from(PAGE_META_OBSERVER_SCRIPT);
-            let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-                |_res, _id| Ok(()),
-            ));
-            unsafe {
-                let _ = webview.AddScriptToExecuteOnDocumentCreated(
-                    PCWSTR::from_raw(script_hstring.as_ptr()),
-                    &handler,
-                );
-            }
+        if !is_spare {
+            configure_webview_settings(&webview);
+            inject_default_scripts(&webview);
         }
 
         let title_cb_shared = on_title_changed.map(|cb| std::sync::Arc::new(cb));
         let url_cb_shared = on_url_changed.map(|cb| std::sync::Arc::new(cb));
+        let new_win_cb_shared = on_new_window.map(|cb| std::sync::Arc::new(cb));
 
-        // Hook WebMessageReceived for dynamic SPA title updates (e.g. YouTube video clicks)
+        // Hook WebMessageReceived for dynamic SPA title updates & selection search
         {
             let meta_title_cb = title_cb_shared.clone();
             let meta_url_cb = url_cb_shared.clone();
+            let search_cb = new_win_cb_shared.clone();
             let mut msg_token = 0;
             let msg_handler = WebMessageReceivedEventHandler::create(Box::new(
                 move |_sender, args| {
@@ -503,6 +877,15 @@ impl WebViewEngine {
                                                 cb(u.to_string());
                                             }
                                         }
+                                    }
+                                } else if let Some(query) = msg.strip_prefix("search:") {
+                                    if let Some(ref cb) = search_cb {
+                                        let search_url = format!("https://www.google.com/search?q={}", query);
+                                        cb(search_url);
+                                    }
+                                } else if let Some(url) = msg.strip_prefix("open_tab:") {
+                                    if let Some(ref cb) = search_cb {
+                                        cb(url.to_string());
                                     }
                                 }
                             }
@@ -649,7 +1032,7 @@ impl WebViewEngine {
         }
 
         // Hook new window requested (target="_blank" -> open in our tabs!)
-        if let Some(cb) = on_new_window {
+        if let Some(cb) = new_win_cb_shared {
             let mut token = 0;
             let handler = NewWindowRequestedEventHandler::create(Box::new(
                 move |_sender, args| {
@@ -672,6 +1055,24 @@ impl WebViewEngine {
             ));
             unsafe {
                 let _ = webview.add_NewWindowRequested(&handler, &mut token);
+            }
+        }
+
+        // Hook HTML5 fullscreen changes (e.g. YouTube video full screen)
+        if let Some(cb) = on_fullscreen_changed {
+            let mut fs_token = 0;
+            let webview_clone = webview.clone();
+            let handler = ContainsFullScreenElementChangedEventHandler::create(Box::new(
+                move |_sender, _args| {
+                    let mut full = windows::core::BOOL(0);
+                    if unsafe { webview_clone.ContainsFullScreenElement(&mut full) }.is_ok() {
+                        cb(full.as_bool());
+                    }
+                    Ok(())
+                },
+            ));
+            unsafe {
+                let _ = webview.add_ContainsFullScreenElementChanged(&handler, &mut fs_token);
             }
         }
 
@@ -761,11 +1162,24 @@ impl WebViewEngine {
             webview.Navigate(PCWSTR::from_raw(url_hstring.as_ptr()))?;
         }
 
+        // Asynchronously pre-warm the next spare controller for instant tab creation!
+        self.prewarm(parent);
+
         Ok(WebViewController {
             controller,
             webview,
             last_bounds: std::cell::Cell::new((0, 0, 0, 0)),
         })
+    }
+}
+
+impl Drop for WebViewEngine {
+    fn drop(&mut self) {
+        if let Some((ctrl, _)) = self.spare_controller.borrow_mut().take() {
+            unsafe {
+                let _ = ctrl.Close();
+            }
+        }
     }
 }
 
@@ -827,6 +1241,36 @@ impl WebViewController {
             self.controller.SetIsVisible(visible)?;
         }
         Ok(())
+    }
+
+    pub fn set_fullscreen_mode(&self, fullscreen: bool) {
+        unsafe {
+            let mut parent = HWND::default();
+            if self.controller.ParentWindow(&mut parent).is_ok() && !parent.0.is_null() {
+                let mut children: Vec<HWND> = Vec::new();
+                unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+                    let list = &mut *(lparam.0 as *mut Vec<HWND>);
+                    list.push(hwnd);
+                    windows::core::BOOL(1)
+                }
+                let _ = EnumChildWindows(
+                    Some(parent),
+                    Some(enum_child),
+                    LPARAM(&mut children as *mut _ as isize),
+                );
+                let (left, top, right, bottom) = self.last_bounds.get();
+                let w = right - left;
+                let h = bottom - top;
+                for child in children {
+                    if fullscreen {
+                        let _ = SetWindowRgn(child, None, true);
+                    } else if w > 0 && h > 0 {
+                        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16);
+                        let _ = SetWindowRgn(child, Some(rgn), true);
+                    }
+                }
+            }
+        }
     }
 
     pub fn focus(&self) -> Result<(), EngineError> {
@@ -983,6 +1427,37 @@ impl WebViewController {
             }
         }
         Ok(())
+    }
+
+    pub fn try_suspend(&self) -> Result<(), EngineError> {
+        if let Ok(wv3) = self.webview.cast::<ICoreWebView2_3>() {
+            let handler = TrySuspendCompletedHandler::create(Box::new(move |_error_code, _is_successful| {
+                Ok(())
+            }));
+            unsafe {
+                let _ = wv3.TrySuspend(&handler);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resume(&self) -> Result<(), EngineError> {
+        if let Ok(wv3) = self.webview.cast::<ICoreWebView2_3>() {
+            unsafe {
+                let _ = wv3.Resume();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        if let Ok(wv3) = self.webview.cast::<ICoreWebView2_3>() {
+            let mut suspended = windows::core::BOOL(0);
+            if unsafe { wv3.IsSuspended(&mut suspended) }.is_ok() {
+                return suspended.as_bool();
+            }
+        }
+        false
     }
 }
 

@@ -3,3 +3,6 @@
 Cargo.lock
 *.log
 .arc_browser/
+.browser/
+optimization_roadmap.md
+plan.md

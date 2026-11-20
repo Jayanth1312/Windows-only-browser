@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "uBlock Origin Lite",
   "version": "1.0.0",
-  "description": "Fast, lightweight permissionless ad and tracker content blocker bundled with Arc Browser.",
+  "description": "Fast, lightweight permissionless ad and tracker content blocker bundled with Browser.",
   "permissions": [
     "declarativeNetRequest"
   ],

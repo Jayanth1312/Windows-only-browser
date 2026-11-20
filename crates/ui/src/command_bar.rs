@@ -242,7 +242,7 @@ impl CommandBar {
     where
         F: Fn(CommandAction) + 'static,
     {
-        let class_name = w!("ArcCommandBarWindowClass");
+        let class_name = w!("BrowserCommandBarWindowClass");
         let hinstance = unsafe { GetModuleHandleW(None)?.into() };
 
         let wc = WNDCLASSW {
@@ -363,7 +363,7 @@ impl CommandBar {
         let content_w = pt_bottom_right.x - pt_top_left.x;
         let content_h = pt_bottom_right.y - pt_top_left.y;
 
-        // Horizontally centered; vertically positioned in upper portion (modern Arc / Spotlight style)
+        // Horizontally centered; vertically positioned in upper portion (modern Spotlight style)
         let card_x = pt_top_left.x + (content_w - g.card_w) / 2;
         let card_y = (pt_top_left.y + ((content_h - g.input_h) as f32 * 0.20).round() as i32)
             .max(pt_top_left.y + (16.0 * (unsafe { GetDpiForWindow(self.hwnd) } as f32 / 96.0)).round() as i32);
@@ -863,7 +863,7 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<CommandBarState>) {
     cv.fill_rect(&card, th.card, 1.0);
     cv.stroke_round(&card, g.radius, th.border, th.border_a, 1.0);
 
-    // ── Search input (no pill: big text on the card, like Arc) ──
+    // ── Search input (no pill: big text on the card, like modern command palettes) ──
     let in_top = card.top;
     let in_mid = in_top + g.input_h / 2;
     SelectObject(mem_dc, icon_lg.into());

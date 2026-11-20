@@ -14,7 +14,7 @@ use ui::{
     accent_for_url, friendly_title_for_url, BrowserWindow, CommandAction, CommandBar,
     CommandBarMode, SidebarAction, TabItem, WindowConfig,
 };
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 fn get_app_data_dir() -> PathBuf {
@@ -69,6 +69,7 @@ struct Tab {
     custom_title: bool,
     is_muted: bool,
     controller: Option<WebViewController>,
+    last_active: Instant,
 }
 
 enum AppEvent {
@@ -113,6 +114,7 @@ enum AppEvent {
     ZoomReset,
     NextTab,
     PrevTab,
+    FullScreenChanged(bool),
 }
 
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
@@ -162,35 +164,7 @@ struct BrowserApp {
     persist_dirty: bool,
     last_persist: Instant,
     closed_tabs: Vec<ClosedTab>,
-}
-
-fn write_if_changed(path: &Path, content: &str) {
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if existing == content {
-            return;
-        }
-    }
-    let _ = std::fs::write(path, content);
-}
-
-fn ensure_bundled_adblocker(ext_dir: &Path) {
-    if let Err(e) = std::fs::create_dir_all(ext_dir) {
-        tracing::warn!("Failed to create extension dir: {:?}", e);
-        return;
-    }
-    const MANIFEST_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/manifest.json");
-    const RULES_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/rules.json");
-    const COSMETIC_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/cosmetic.css");
-    const CONTENT_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/content.js");
-    const YT_ADSTRIP_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/yt-adstrip.js");
-    const YT_CSS_CONTENT: &str = include_str!("../../engine/extensions/ublock_origin_lite/yt.css");
-
-    write_if_changed(&ext_dir.join("manifest.json"), MANIFEST_CONTENT);
-    write_if_changed(&ext_dir.join("rules.json"), RULES_CONTENT);
-    write_if_changed(&ext_dir.join("cosmetic.css"), COSMETIC_CONTENT);
-    write_if_changed(&ext_dir.join("content.js"), CONTENT_CONTENT);
-    write_if_changed(&ext_dir.join("yt-adstrip.js"), YT_ADSTRIP_CONTENT);
-    write_if_changed(&ext_dir.join("yt.css"), YT_CSS_CONTENT);
+    sidebar_before_fullscreen: Option<bool>,
 }
 
 const UBOL_VERSION: &str = "2026.1116.1650";
@@ -430,6 +404,7 @@ impl BrowserApp {
                 custom_title: s.custom_title,
                 is_muted: false,
                 controller: None, // sleeping, will be activated if active tab
+                last_active: Instant::now(),
             });
         }
 
@@ -457,6 +432,7 @@ impl BrowserApp {
             persist_dirty: false,
             last_persist: Instant::now(),
             closed_tabs: Vec::new(),
+            sidebar_before_fullscreen: None,
         };
 
         app.persist_state();
@@ -507,6 +483,21 @@ impl BrowserApp {
     fn flush_if_dirty(&mut self) {
         if self.persist_dirty && self.last_persist.elapsed().as_millis() >= 250 {
             self.persist_state();
+        }
+        self.check_tab_hibernation();
+    }
+
+    /// Check inactive tabs and suspend background tabs (> 3 mins) to reclaim memory and freeze JS timers.
+    fn check_tab_hibernation(&mut self) {
+        let now = Instant::now();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i != self.active_tab_idx && !tab.is_muted {
+                if let Some(ref ctrl) = tab.controller {
+                    if now.duration_since(tab.last_active).as_secs() >= 180 && !ctrl.is_suspended() {
+                        let _ = ctrl.try_suspend();
+                    }
+                }
+            }
         }
     }
 
@@ -651,6 +642,15 @@ impl BrowserApp {
             }
         });
 
+        let tx_fs = self.event_tx.clone();
+        let on_fullscreen = Box::new(move |is_full: bool| {
+            let _ = tx_fs.send(AppEvent::FullScreenChanged(is_full));
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         let controller = match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -662,6 +662,7 @@ impl BrowserApp {
             Some(on_favicon),
             Some(on_new_window),
             Some(on_shortcut),
+            Some(on_fullscreen),
         ) {
             Ok(c) => {
                 if !self.extension_loaded {
@@ -702,6 +703,7 @@ impl BrowserApp {
             custom_title: false,
             is_muted: false,
             controller: Some(controller),
+            last_active: Instant::now(),
         });
 
         if let Ok(st) = self.storage.try_borrow() {
@@ -825,6 +827,15 @@ impl BrowserApp {
             }
         });
 
+        let tx_fs = self.event_tx.clone();
+        let on_fullscreen = Box::new(move |is_full: bool| {
+            let _ = tx_fs.send(AppEvent::FullScreenChanged(is_full));
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -836,6 +847,7 @@ impl BrowserApp {
             Some(on_favicon),
             Some(on_new_window),
             Some(on_shortcut),
+            Some(on_fullscreen),
         ) {
             Ok(c) => {
                 if !self.extension_loaded {
@@ -864,6 +876,9 @@ impl BrowserApp {
             if let Some(ref current) = self.tabs[self.active_tab_idx].controller {
                 let _ = current.set_visible(false);
             }
+            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                tab.last_active = Instant::now();
+            }
         }
 
         self.ensure_tab_controller(idx);
@@ -871,15 +886,19 @@ impl BrowserApp {
         self.active_tab_idx = idx;
         let (content_rect, _) = self.window.get_layout_rects();
         if let Some(ref active) = self.tabs[idx].controller {
+            let _ = active.resume(); // Restore page state and JS timers from hibernation
             let _ = active.set_bounds(content_rect);
             let _ = active.set_visible(true);
             let _ = active.focus();
             let zoom = active.get_zoom_factor();
             self.window.set_zoom(zoom);
         }
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.last_active = Instant::now();
+        }
 
         self.sync_tabs_ui();
-        self.persist_state();
+        self.mark_dirty();
     }
 
     fn close_tab(&mut self, idx: usize) {
@@ -890,19 +909,6 @@ impl BrowserApp {
         };
 
         if target_idx >= self.tabs.len() {
-            return;
-        }
-
-        if self.tabs.len() <= 1 {
-            // If only one tab left, closing it exits the application
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(self.window.hwnd()),
-                    windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                );
-            }
             return;
         }
 
@@ -921,6 +927,16 @@ impl BrowserApp {
             let _ = ctrl.set_visible(false);
         }
         self.tabs.remove(target_idx);
+
+        if self.tabs.is_empty() {
+            self.active_tab_idx = 0;
+            self.sync_tabs_ui();
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, true);
+            }
+            self.mark_dirty();
+            return;
+        }
 
         if self.active_tab_idx >= self.tabs.len() {
             self.active_tab_idx = self.tabs.len().saturating_sub(1);
@@ -1115,7 +1131,7 @@ impl BrowserApp {
                         });
                     }
                     self.sync_tabs_ui();
-                    self.persist_state();
+                    self.mark_dirty();
                 }
             }
             AppEvent::UnpinTab(idx) => {
@@ -1139,11 +1155,12 @@ impl BrowserApp {
                             custom_title: false,
                             is_muted: false,
                             controller: None, // Sleeping!
+                            last_active: Instant::now(),
                         });
                         self.next_tab_id += 1;
                     }
                     self.sync_tabs_ui();
-                    self.persist_state();
+                    self.mark_dirty();
                 }
             }
             AppEvent::DuplicateTab(idx) => {
@@ -1171,7 +1188,7 @@ impl BrowserApp {
                         self.tabs[idx].custom_title = true;
                     }
                     self.sync_tabs_ui();
-                    self.persist_state();
+                    self.mark_dirty();
                 }
             }
             AppEvent::CloseTab(idx) => {
@@ -1318,7 +1335,7 @@ impl BrowserApp {
                         }
                         self.window.show_toast("Tab unloaded (sleeping)");
                         self.sync_tabs_ui();
-                        self.persist_state();
+                        self.mark_dirty();
                     }
                 }
             }
@@ -1419,7 +1436,7 @@ impl BrowserApp {
                     let _ = st.add_history(&url, &friendly_title_for_url(&url));
                 }
                 self.sync_tabs_ui();
-                self.persist_state();
+                self.mark_dirty();
             }
             AppEvent::NavBack => {
                 if let Some(tab) = self.tabs.get(self.active_tab_idx) {
@@ -1624,7 +1641,7 @@ impl BrowserApp {
                     tab.is_pinned = !tab.is_pinned;
                 }
                 self.sync_tabs_ui();
-                self.persist_state();
+                self.mark_dirty();
             }
             AppEvent::OpenSettings => {
                 self.create_tab("https://www.google.com/preferences", false);
@@ -1675,6 +1692,39 @@ impl BrowserApp {
                 if !self.tabs.is_empty() {
                     let prev = (self.active_tab_idx + self.tabs.len() - 1) % self.tabs.len();
                     self.switch_tab(prev);
+                }
+            }
+            AppEvent::FullScreenChanged(is_full) => {
+                let hwnd = self.window.hwnd();
+                let mut client_rect = RECT::default();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client_rect);
+                }
+
+                if is_full {
+                    if self.sidebar_before_fullscreen.is_none() {
+                        self.sidebar_before_fullscreen = Some(self.window.is_sidebar_visible());
+                    }
+                    self.window.set_sidebar_visible(false);
+                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.set_bounds(client_rect);
+                            ctrl.set_fullscreen_mode(true);
+                        }
+                    }
+                } else {
+                    let prev_vis = self.sidebar_before_fullscreen.take().unwrap_or(true);
+                    self.window.set_sidebar_visible(prev_vis);
+                    let (content_rect, _) = self.window.get_layout_rects();
+                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.set_bounds(content_rect);
+                            ctrl.set_fullscreen_mode(false);
+                        }
+                    }
+                }
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
                 }
             }
         }
