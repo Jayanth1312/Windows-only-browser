@@ -5,7 +5,7 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
-    FillRect, FillRgn, InvalidateRect, ScreenToClient, PAINTSTRUCT,
+    FillRect, FillRgn, FrameRgn, InvalidateRect, ScreenToClient, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, CS_DBLCLKS, CW_USEDEFAULT, GWLP_USERDATA,
     HTCLIENT, IDC_ARROW, IDC_HAND, IDC_SIZEWE, MSG, SWP_FRAMECHANGED, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    WM_APP, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
     WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
     WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
@@ -60,6 +60,9 @@ pub enum SidebarAction {
     PromptRenameTab(usize),
     RenameTab(usize, String),
     CopyUrl,
+    CopyCleanLink(usize),
+    CopyCleanPinnedTab(usize),
+    CopyCleanLinkActive,
     TogglePinCurrentTab,
     OpenSettings,
     OpenDownloads,
@@ -79,7 +82,21 @@ pub enum SidebarAction {
     NewTabBelow(usize),
     ReloadSpecificTab(usize),
     ReloadSpecificPinnedTab(usize),
+    TabAnimTick,
+    CreateFolder,
+    ToggleFolder(usize),
+    RenameFolder(String, String),
+    ChangeFolderIcon(String, String),
+    DeleteFolder(String),
+    MoveTabToFolder(usize, Option<String>),
+    NewTabInFolder(String),
+    SelectTabId(String),
+    ToggleZapper,
+    RestoreAllHidden,
 }
+
+const TAB_ANIM_TIMER_ID: usize = 0x4203;
+const INLINE_CARET_TIMER_ID: usize = 0x4301;
 
 pub struct WindowConfig {
     pub title: String,
@@ -121,6 +138,9 @@ struct WindowState {
     on_custom_msg: Option<CustomMsgHandler>,
     is_tracking_mouse: bool,
     context_menu: Option<crate::context_menu::ContextMenu>,
+    toast_overlay: Option<crate::toast::ToastOverlay>,
+    folder_flyout: Option<crate::folder_flyout::FolderFlyout>,
+    icon_picker: Option<crate::icon_picker::IconPicker>,
 }
 
 #[inline]
@@ -174,6 +194,9 @@ impl BrowserWindow {
                 on_custom_msg: None,
                 is_tracking_mouse: false,
                 context_menu: None,
+                toast_overlay: None,
+                folder_flyout: None,
+                icon_picker: None,
             }));
 
             let raw_state = Rc::into_raw(state.clone()) as *mut _;
@@ -199,6 +222,15 @@ impl BrowserWindow {
 
             let menu = crate::context_menu::ContextMenu::new(hwnd).ok();
             state.borrow_mut().context_menu = menu;
+
+            let toast = crate::toast::ToastOverlay::new(hwnd).ok();
+            state.borrow_mut().toast_overlay = toast;
+
+            let flyout = crate::folder_flyout::FolderFlyout::new(hwnd).ok();
+            state.borrow_mut().folder_flyout = flyout;
+
+            let picker = crate::icon_picker::IconPicker::new(hwnd).ok();
+            state.borrow_mut().icon_picker = picker;
 
             Ok(Self { hwnd, state })
         }
@@ -246,6 +278,72 @@ impl BrowserWindow {
         }
     }
 
+    pub fn update_sidebar_data(
+        &self,
+        tabs: Vec<TabItem>,
+        pinned: Vec<TabItem>,
+        folders: Vec<crate::sidebar::FolderItem>,
+        active: Option<ActiveTab>,
+        can_go_back: bool,
+        can_go_forward: bool,
+        has_closed_tabs: bool,
+    ) {
+        let active_changed = {
+            let mut b = self.state.borrow_mut();
+            let changed = b.sidebar_state.active != active;
+            b.sidebar_state.tabs = tabs;
+            b.sidebar_state.pinned = pinned;
+            b.sidebar_state.folders = folders;
+            b.sidebar_state.active = active;
+            b.sidebar_state.can_go_back = can_go_back;
+            b.sidebar_state.can_go_forward = can_go_forward;
+            b.sidebar_state.has_closed_tabs = has_closed_tabs;
+            changed
+        };
+        unsafe {
+            clamp_scroll(self.hwnd, &self.state);
+            if active_changed {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            } else {
+                invalidate_sidebar(self.hwnd, &self.state);
+            }
+        }
+    }
+
+    pub fn start_inline_rename_folder(&self, folder_id: &str, current_name: &str) {
+        {
+            let mut b = self.state.borrow_mut();
+            b.sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                target: crate::sidebar::InlineEditTarget::Folder(folder_id.to_string()),
+                text: current_name.to_string(),
+                cursor: current_name.len(),
+                selection: Some((0, current_name.len())),
+                caret_visible: true,
+            });
+        }
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), INLINE_CARET_TIMER_ID, 500, None);
+            invalidate_sidebar(self.hwnd, &self.state);
+        }
+    }
+
+    pub fn start_inline_rename_tab(&self, tab_idx: usize, current_title: &str) {
+        {
+            let mut b = self.state.borrow_mut();
+            b.sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                target: crate::sidebar::InlineEditTarget::Tab(tab_idx),
+                text: current_title.to_string(),
+                cursor: current_title.len(),
+                selection: Some((0, current_title.len())),
+                caret_visible: true,
+            });
+        }
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), INLINE_CARET_TIMER_ID, 500, None);
+            invalidate_sidebar(self.hwnd, &self.state);
+        }
+    }
+
     pub fn update_tabs_and_pinned(
         &self,
         tabs: Vec<TabItem>,
@@ -255,19 +353,8 @@ impl BrowserWindow {
         can_go_forward: bool,
         has_closed_tabs: bool,
     ) {
-        {
-            let mut b = self.state.borrow_mut();
-            b.sidebar_state.tabs = tabs;
-            b.sidebar_state.pinned = pinned;
-            b.sidebar_state.active = active;
-            b.sidebar_state.can_go_back = can_go_back;
-            b.sidebar_state.can_go_forward = can_go_forward;
-            b.sidebar_state.has_closed_tabs = has_closed_tabs;
-        }
-        unsafe {
-            clamp_scroll(self.hwnd, &self.state);
-            invalidate_sidebar(self.hwnd, &self.state);
-        }
+        let folders = self.state.borrow().sidebar_state.folders.clone();
+        self.update_sidebar_data(tabs, pinned, folders, active, can_go_back, can_go_forward, has_closed_tabs);
     }
 
     pub fn is_sidebar_visible(&self) -> bool {
@@ -280,8 +367,20 @@ impl BrowserWindow {
     }
 
     pub fn toggle_sidebar(&self) {
-        let new_vis = !self.state.borrow().sidebar_visible;
-        self.set_sidebar_visible(new_vis);
+        let cur = self.is_sidebar_visible();
+        self.set_sidebar_visible(!cur);
+    }
+
+    pub fn start_tab_anim_timer(&self) {
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), TAB_ANIM_TIMER_ID, 16, None);
+        }
+    }
+
+    pub fn stop_tab_anim_timer(&self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TAB_ANIM_TIMER_ID);
+        }
     }
 
     pub fn update_pinned_favicon(&self, url: &str, favicon: std::sync::Arc<crate::sidebar::FaviconData>) {
@@ -350,11 +449,8 @@ impl BrowserWindow {
     }
 
     pub fn show_toast(&self, message: &str) {
-        let hwnd = self.hwnd();
-        self.state.borrow_mut().sidebar_state.toast = Some(message.to_string());
-        unsafe {
-            let _ = SetTimer(Some(hwnd), 0x4201, 2500, None);
-            invalidate_sidebar(hwnd, &self.state);
+        if let Some(ref t) = self.state.borrow().toast_overlay {
+            t.show(message);
         }
     }
 
@@ -404,11 +500,12 @@ fn compute_layout_rects(hwnd: HWND, state: &RefCell<WindowState>) -> (RECT, RECT
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let scale = dpi as f32 / 96.0;
 
-    let sidebar_visible = state.borrow().sidebar_visible;
+    let sidebar_visible = state.try_borrow().map(|s| s.sidebar_visible).unwrap_or(true);
     let pad = (8.0 * scale).round() as i32;
 
     if sidebar_visible {
-        let sidebar_width = (state.borrow().config.sidebar_width as f32 * scale).round() as i32;
+        let sidebar_width_cfg = state.try_borrow().map(|s| s.config.sidebar_width).unwrap_or(280);
+        let sidebar_width = (sidebar_width_cfg as f32 * scale).round() as i32;
         let available_content_w = (width - sidebar_width).max(0);
 
         let content_rect = RECT {
@@ -497,6 +594,9 @@ unsafe fn clamp_scroll(hwnd: HWND, state: &RefCell<WindowState>) {
         let max = b.sidebar.max_scroll(hwnd, h, w, &b.sidebar_state);
         let cur = b.sidebar_state.scroll;
         b.sidebar_state.scroll = cur.clamp(0, max);
+        let max_top = b.sidebar.max_scroll_top(hwnd, h, w, &b.sidebar_state);
+        let cur_top = b.sidebar_state.scroll_top;
+        b.sidebar_state.scroll_top = cur_top.clamp(0, max_top);
     }
 }
 
@@ -573,6 +673,9 @@ unsafe extern "system" fn wndproc(
                     let is_interactive = matches!(
                         hit,
                         SidebarHit::Pinned(_)
+                            | SidebarHit::Folder(_)
+                            | SidebarHit::FolderIcon(_)
+                            | SidebarHit::JumpToActiveTab
                             | SidebarHit::Tab(_)
                             | SidebarHit::TabClose(_)
                             | SidebarHit::NewTab
@@ -606,21 +709,42 @@ unsafe extern "system" fn wndproc(
 
             let (content_rect, sidebar_rect) = compute_layout_rects(hwnd, state);
 
-            // Fill window background only when update region actually touches webview area (never repaint over webview unnecessarily)
-            if ps.rcPaint.left < sidebar_rect.left {
-                let brush = CreateSolidBrush(b.sidebar.theme.bg);
-                let frame_rect = if b.sidebar_visible {
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: sidebar_rect.left,
-                        bottom: client.bottom,
-                    }
-                } else {
-                    client
-                };
-                let _ = FillRect(hdc, &frame_rect, brush);
-                let _ = DeleteObject(brush.into());
+            // Fill window background / frame padding with the unified dark chassis color (matches sidebar)
+            let brush = CreateSolidBrush(b.sidebar.theme.bg);
+            let frame_rect = if b.sidebar_visible {
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: sidebar_rect.left,
+                    bottom: client.bottom,
+                }
+            } else {
+                client
+            };
+            let _ = FillRect(hdc, &frame_rect, brush);
+            let _ = DeleteObject(brush.into());
+
+            // If empty (no active tabs), draw the stage card with reduced darkness (#1e1e23) inside content_rect
+            if b.sidebar_state.active.is_none() {
+                let dpi = GetDpiForWindow(hwnd);
+                let scale = dpi as f32 / 96.0;
+                let corner_r = (16.0 * scale).round() as i32;
+                let stage_rgn = CreateRoundRectRgn(
+                    content_rect.left,
+                    content_rect.top,
+                    content_rect.right,
+                    content_rect.bottom,
+                    corner_r,
+                    corner_r,
+                );
+                let stage_brush = CreateSolidBrush(crate::sidebar::rgb(23, 23, 26));
+                let _ = FillRgn(hdc, stage_rgn, stage_brush);
+                let _ = DeleteObject(stage_brush.into());
+
+                let border_brush = CreateSolidBrush(crate::sidebar::rgb(35, 35, 40));
+                let _ = FrameRgn(hdc, stage_rgn, border_brush, 1, 1);
+                let _ = DeleteObject(border_brush.into());
+                let _ = DeleteObject(stage_rgn.into());
             }
 
             // If loading, draw sleek capsule pill loading progress bar with rounded corners in #14dcff
@@ -644,9 +768,12 @@ unsafe extern "system" fn wndproc(
 
             // Render sidebar smoothly from offscreen memory DC
             if b.sidebar_visible {
+                let dpi = GetDpiForWindow(hwnd);
+                let scale = dpi as f32 / 96.0;
+                let base_sidebar_w = (b.config.sidebar_width as f32 * scale).round() as i32;
                 let hovered = caption_of(b.sidebar_state.hovered);
                 let pressed = caption_of(b.pressed_hit);
-                b.sidebar.render(hwnd, hdc, sidebar_rect, &b.sidebar_state, hovered, pressed);
+                b.sidebar.render(hwnd, hdc, sidebar_rect, base_sidebar_w, &b.sidebar_state, hovered, pressed);
             }
 
             let _ = EndPaint(hwnd, &ps);
@@ -686,13 +813,7 @@ unsafe extern "system" fn wndproc(
                         cb(content_rect, sidebar_rect);
                     }
                     clamp_scroll(hwnd, state);
-                    let update_r = RECT {
-                        left: sidebar_rect.left - 10,
-                        top: 0,
-                        right: sidebar_rect.right,
-                        bottom: sidebar_rect.bottom,
-                    };
-                    let _ = InvalidateRect(Some(hwnd), Some(&update_r), false);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                     let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
                 }
                 return LRESULT(0);
@@ -738,6 +859,37 @@ unsafe extern "system" fn wndproc(
                     menu.hide();
                 }
             }
+            if let Some(ref ip) = state.borrow().icon_picker {
+                if ip.is_visible() {
+                    ip.hide();
+                }
+            }
+
+            let had_edit = {
+                let mut b = state.borrow_mut();
+                b.sidebar_state.inline_edit.take()
+            };
+            if let Some(ed) = had_edit {
+                let trimmed = ed.text.trim().to_string();
+                if !trimmed.is_empty() {
+                    let on_action = state.borrow().on_action.clone();
+                    if let Some(ref cb) = on_action {
+                        match ed.target {
+                            crate::sidebar::InlineEditTarget::Folder(fid) => {
+                                cb(SidebarAction::RenameFolder(fid, trimmed));
+                            }
+                            crate::sidebar::InlineEditTarget::Tab(idx) => {
+                                cb(SidebarAction::RenameTab(idx, trimmed));
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), INLINE_CARET_TIMER_ID);
+                    invalidate_sidebar(hwnd, state);
+                }
+            }
+
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
 
@@ -766,6 +918,7 @@ unsafe extern "system" fn wndproc(
             if state.borrow().is_resizing_sidebar {
                 state.borrow_mut().is_resizing_sidebar = false;
                 let _ = ReleaseCapture();
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
 
@@ -857,6 +1010,29 @@ unsafe extern "system" fn wndproc(
                                 cb(SidebarAction::CloseTab(i));
                             }
                         }
+                        SidebarHit::Folder(i) | SidebarHit::FolderIcon(i) => {
+                            {
+                                let mut b = state.borrow_mut();
+                                if let Some(folder) = b.sidebar_state.folders.get_mut(i) {
+                                    folder.is_open = !folder.is_open;
+                                }
+                            }
+                            unsafe {
+                                let _ = SetTimer(Some(hwnd), TAB_ANIM_TIMER_ID, 16, None);
+                                invalidate_sidebar(hwnd, state);
+                            }
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::ToggleFolder(i));
+                            }
+                        }
+                        SidebarHit::JumpToActiveTab => {
+                            let target = state.borrow().sidebar.last_layout.borrow().as_ref().map(|l| l.jump_target_scroll).unwrap_or(0);
+                            state.borrow_mut().sidebar_state.scroll = target;
+                            unsafe {
+                                invalidate_sidebar(hwnd, state);
+                            }
+                        }
                         SidebarHit::Pinned(i) => {
                             let on_action = state.borrow().on_action.clone();
                             if let Some(cb) = on_action {
@@ -893,42 +1069,194 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item_disabled(10, "Reopen Closed Tab", Some("Ctrl+Shift+T"))
                         };
 
-                        let items = vec![
+                        let is_pin_section = tab.folder_id.as_deref() == Some(crate::sidebar::PINNED_SECTION_ID);
+                        let pin_label = if is_pin_section { "Unpin Tab" } else { "Pin Tab" };
+
+                        let mut items = vec![
                             crate::context_menu::ContextMenuItem::item(11, "New Tab Below", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(1, "Reload Tab", Some("Ctrl+R")),
                             crate::context_menu::ContextMenuItem::item(2, mute_label, None),
-                            crate::context_menu::ContextMenuItem::item(3, "Pin Tab", Some("Ctrl+Shift+X")),
+                            crate::context_menu::ContextMenuItem::item(3, "Favourite Tab", Some("Ctrl+Shift+X")),
+                            crate::context_menu::ContextMenuItem::item(12, pin_label, None),
                             crate::context_menu::ContextMenuItem::separator(),
-                            crate::context_menu::ContextMenuItem::item(4, "Change Label...", None),
+                            crate::context_menu::ContextMenuItem::item(4, "Rename...", Some("F2")),
+                        ];
+
+                        let folders = state.borrow().sidebar_state.folders.clone();
+                        if !folders.is_empty() {
+                            items.push(crate::context_menu::ContextMenuItem::separator());
+                            if tab.folder_id.is_some() && !is_pin_section {
+                                items.push(crate::context_menu::ContextMenuItem::item(199, "Remove from Folder", None));
+                            }
+                            for (fi, f) in folders.iter().enumerate() {
+                                items.push(crate::context_menu::ContextMenuItem::item(
+                                    200 + fi as u32,
+                                    &format!("Move to {}", f.name),
+                                    None,
+                                ));
+                            }
+                        }
+
+                        items.extend(vec![
                             crate::context_menu::ContextMenuItem::separator(),
                             unload_item,
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
+                            crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
+                            crate::context_menu::ContextMenuItem::separator(),
+                            crate::context_menu::ContextMenuItem::item(13, "Element Zapper", Some("Ctrl+Shift+H")),
+                            crate::context_menu::ContextMenuItem::item(14, "Restore Hidden Elements", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(8, "Close Tab", Some("Ctrl+W")),
                             crate::context_menu::ContextMenuItem::item(9, "Close Other Tabs", None),
                             reopen_item,
-                        ];
+                        ]);
 
                         let on_action = state.borrow().on_action.clone();
+                        let state_rc = state;
+                        let folders_rc = folders.clone();
+                        let tab_title_rename = tab.title.clone();
                         if let Some(ref menu) = state.borrow().context_menu {
                             menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
+                                if cmd == 4 {
+                                    // Inline rename directly on tab!
+                                    {
+                                        let mut b = state_rc.borrow_mut();
+                                        b.sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                                            target: crate::sidebar::InlineEditTarget::Tab(idx),
+                                            text: tab_title_rename.clone(),
+                                            cursor: tab_title_rename.len(),
+                                            selection: Some((0, tab_title_rename.len())),
+                                            caret_visible: true,
+                                        });
+                                    }
+                                    unsafe {
+                                        let _ = SetTimer(Some(hwnd), INLINE_CARET_TIMER_ID, 500, None);
+                                        invalidate_sidebar(hwnd, &state_rc);
+                                    }
+                                    return;
+                                }
+                                if cmd == 199 {
+                                    if let Some(ref cb) = on_action {
+                                        cb(SidebarAction::MoveTabToFolder(idx, None));
+                                    }
+                                    return;
+                                }
+                                if cmd >= 200 && (cmd - 200) < folders_rc.len() as u32 {
+                                    let fi = (cmd - 200) as usize;
+                                    let folder_id = folders_rc[fi].id.clone();
+                                    if let Some(ref cb) = on_action {
+                                        cb(SidebarAction::MoveTabToFolder(idx, Some(folder_id)));
+                                    }
+                                    return;
+                                }
                                 if let Some(ref cb) = on_action {
                                     match cmd {
                                         1 => cb(SidebarAction::ReloadSpecificTab(idx)),
                                         2 => cb(SidebarAction::ToggleMuteTab(idx)),
                                         3 => cb(SidebarAction::PinTab(idx)),
-                                        4 => cb(SidebarAction::PromptRenameTab(idx)),
                                         5 => cb(SidebarAction::UnloadTab(idx)),
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::ShareTab(idx)),
+                                        15 => cb(SidebarAction::CopyCleanLink(idx)),
                                         8 => cb(SidebarAction::CloseTab(idx)),
                                         9 => cb(SidebarAction::CloseOtherTabs(idx)),
                                         10 => cb(SidebarAction::ReopenClosedTab),
                                         11 => cb(SidebarAction::NewTabBelow(idx)),
+                                        12 => cb(SidebarAction::MoveTabToFolder(
+                                            idx,
+                                            if is_pin_section { None } else { Some(crate::sidebar::PINNED_SECTION_ID.to_string()) },
+                                        )),
+                                        13 => cb(SidebarAction::ToggleZapper),
+                                        14 => cb(SidebarAction::RestoreAllHidden),
                                         _ => {}
                                     }
+                                }
+                            }));
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                SidebarHit::Folder(idx) | SidebarHit::FolderIcon(idx) => {
+                    let mut pt = POINT { x, y };
+                    unsafe { let _ = ClientToScreen(hwnd, &mut pt); }
+                    let folder_opt = state.borrow().sidebar_state.folders.get(idx).cloned();
+                    if let Some(folder) = folder_opt {
+                        let folder_id_rename = folder.id.clone();
+                        let folder_name_rename = folder.name.clone();
+                        let folder_id_icon = folder.id.clone();
+                        let folder_id_new_tab = folder.id.clone();
+                        let folder_id_del = folder.id.clone();
+
+                        let items = vec![
+                            crate::context_menu::ContextMenuItem::item(1, "Rename Folder", Some("F2")),
+                            crate::context_menu::ContextMenuItem::item(2, "Change Icon...", None),
+                            crate::context_menu::ContextMenuItem::item(3, "New Tab in Folder", None),
+                            crate::context_menu::ContextMenuItem::separator(),
+                            crate::context_menu::ContextMenuItem::item(4, "Delete Folder", None),
+                        ];
+
+                        let on_action = state.borrow().on_action.clone();
+                        let state_rc = state;
+                        if let Some(ref menu) = state.borrow().context_menu {
+                            menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
+                                match cmd {
+                                    1 => {
+                                        // Inline rename
+                                        {
+                                            let mut b = state_rc.borrow_mut();
+                                            b.sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                                                target: crate::sidebar::InlineEditTarget::Folder(folder_id_rename.clone()),
+                                                text: folder_name_rename.clone(),
+                                                cursor: folder_name_rename.len(),
+                                                selection: Some((0, folder_name_rename.len())),
+                                                caret_visible: true,
+                                            });
+                                        }
+                                        unsafe {
+                                            let _ = SetTimer(Some(hwnd), INLINE_CARET_TIMER_ID, 500, None);
+                                            invalidate_sidebar(hwnd, &state_rc);
+                                        }
+                                    }
+                                    2 => {
+                                        // Change Icon
+                                        let (folder_rect, sidebar_left) = {
+                                            let b = state_rc.borrow();
+                                            let frect = b.sidebar.last_layout.borrow().as_ref().and_then(|l| l.folders.get(idx).copied()).unwrap_or_default();
+                                            let (_, srect) = compute_layout_rects(hwnd, &state_rc);
+                                            (frect, srect.left)
+                                        };
+                                        let mut sidebar_screen_pt = POINT { x: sidebar_left, y: 0 };
+                                        let mut folder_screen_pt = POINT { x: 0, y: folder_rect.top };
+                                        unsafe {
+                                            let _ = ClientToScreen(hwnd, &mut sidebar_screen_pt);
+                                            let _ = ClientToScreen(hwnd, &mut folder_screen_pt);
+                                        }
+                                        if let Some(ref ip) = state_rc.borrow().icon_picker {
+                                            let on_act = on_action.clone();
+                                            let s = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+                                            let card_w = (252.0 * s).round() as i32;
+                                            let target_x = sidebar_screen_pt.x - card_w - (8.0 * s).round() as i32;
+                                            let target_y = if folder_rect.top > 0 { folder_screen_pt.y } else { pt.y - 40 };
+                                            ip.show(target_x, target_y, &folder_id_icon, Box::new(move |fid, icon| {
+                                                if let Some(ref cb) = on_act {
+                                                    cb(SidebarAction::ChangeFolderIcon(fid, icon));
+                                                }
+                                            }));
+                                        }
+                                    }
+                                    3 => {
+                                        if let Some(ref cb) = on_action {
+                                            cb(SidebarAction::NewTabInFolder(folder_id_new_tab.clone()));
+                                        }
+                                    }
+                                    4 => {
+                                        if let Some(ref cb) = on_action {
+                                            cb(SidebarAction::DeleteFolder(folder_id_del.clone()));
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }));
                         }
@@ -955,13 +1283,14 @@ unsafe extern "system" fn wndproc(
                         let items = vec![
                             crate::context_menu::ContextMenuItem::item(1, "Reload Tab", Some("Ctrl+R")),
                             crate::context_menu::ContextMenuItem::item(2, mute_label, None),
-                            crate::context_menu::ContextMenuItem::item(3, "Unpin Tab", Some("Ctrl+Shift+X")),
+                            crate::context_menu::ContextMenuItem::item(3, "Unfavourite Tab", Some("Ctrl+Shift+X")),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(4, "Change Label...", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             unload_item,
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
+                            crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(8, "Close Tab", Some("Ctrl+W")),
                             reopen_item,
@@ -979,6 +1308,7 @@ unsafe extern "system" fn wndproc(
                                         5 => cb(SidebarAction::UnloadTab(idx)),
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::SharePinnedTab(idx)),
+                                        15 => cb(SidebarAction::CopyCleanPinnedTab(idx)),
                                         8 => cb(SidebarAction::ClosePinnedTab(idx)),
                                         10 => cb(SidebarAction::ReopenClosedTab),
                                         _ => {}
@@ -1001,6 +1331,8 @@ unsafe extern "system" fn wndproc(
                         };
                         let items = vec![
                             crate::context_menu::ContextMenuItem::item(1, "New Tab", Some("Ctrl+T")),
+                            crate::context_menu::ContextMenuItem::item(3, "New Folder", None),
+                            crate::context_menu::ContextMenuItem::separator(),
                             reopen_item,
                         ];
                         let on_action = state.borrow().on_action.clone();
@@ -1010,6 +1342,7 @@ unsafe extern "system" fn wndproc(
                                     match cmd {
                                         1 => cb(SidebarAction::NavNewTab),
                                         2 => cb(SidebarAction::ReopenClosedTab),
+                                        3 => cb(SidebarAction::CreateFolder),
                                         _ => {}
                                     }
                                 }
@@ -1041,10 +1374,25 @@ unsafe extern "system" fn wndproc(
             if pt.x >= r.left && state.borrow().sidebar_visible {
                 let dpi = GetDpiForWindow(hwnd);
                 let step = (48.0 * dpi as f32 / 96.0) as i32;
+                // Wheel over the top section (folders + pinned tabs) scrolls that box only.
+                let over_top = {
+                    let b = state.borrow();
+                    let ll = b.sidebar.last_layout.borrow();
+                    let hit = ll
+                        .as_ref()
+                        .map(|l| l.top_clip.bottom > l.top_clip.top && pt.y >= l.top_clip.top && pt.y < l.top_clip.bottom)
+                        .unwrap_or(false);
+                    hit
+                };
                 {
                     let mut b = state.borrow_mut();
-                    let cur = b.sidebar_state.scroll;
-                    b.sidebar_state.scroll = cur - delta * step / 120;
+                    if over_top {
+                        let cur = b.sidebar_state.scroll_top;
+                        b.sidebar_state.scroll_top = cur - delta * step / 120;
+                    } else {
+                        let cur = b.sidebar_state.scroll;
+                        b.sidebar_state.scroll = cur - delta * step / 120;
+                    }
                 }
                 clamp_scroll(hwnd, state);
                 invalidate_sidebar(hwnd, state);
@@ -1077,6 +1425,163 @@ unsafe extern "system" fn wndproc(
             return LRESULT(0);
         }
         WM_KEYDOWN => {
+            let has_edit = state.borrow().sidebar_state.inline_edit.is_some();
+            if has_edit {
+                match wparam.0 as i32 {
+                    0x0D => {
+                        // VK_RETURN -> Commit rename
+                        let edit_opt = state.borrow_mut().sidebar_state.inline_edit.take();
+                        if let Some(ed) = edit_opt {
+                            let trimmed = ed.text.trim().to_string();
+                            if !trimmed.is_empty() {
+                                let on_action = state.borrow().on_action.clone();
+                                if let Some(ref cb) = on_action {
+                                    match ed.target {
+                                        crate::sidebar::InlineEditTarget::Folder(fid) => {
+                                            cb(SidebarAction::RenameFolder(fid, trimmed));
+                                        }
+                                        crate::sidebar::InlineEditTarget::Tab(idx) => {
+                                            cb(SidebarAction::RenameTab(idx, trimmed));
+                                        }
+                                    }
+                                }
+                            }
+                            unsafe {
+                                let _ = KillTimer(Some(hwnd), INLINE_CARET_TIMER_ID);
+                                invalidate_sidebar(hwnd, state);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                    0x1B => {
+                        // VK_ESCAPE -> Cancel rename
+                        state.borrow_mut().sidebar_state.inline_edit = None;
+                        unsafe {
+                            let _ = KillTimer(Some(hwnd), INLINE_CARET_TIMER_ID);
+                            invalidate_sidebar(hwnd, state);
+                        }
+                        return LRESULT(0);
+                    }
+                    0x08 => {
+                        // VK_BACK
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            if let Some((s_idx, e_idx)) = ed.selection.take() {
+                                let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                                let min_i = min_i.min(ed.text.len());
+                                let max_i = max_i.min(ed.text.len());
+                                ed.text.drain(min_i..max_i);
+                                ed.cursor = min_i;
+                            } else if ed.cursor > 0 {
+                                let mut prev = ed.cursor - 1;
+                                while prev > 0 && !ed.text.is_char_boundary(prev) {
+                                    prev -= 1;
+                                }
+                                ed.text.drain(prev..ed.cursor);
+                                ed.cursor = prev;
+                            }
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x2E => {
+                        // VK_DELETE
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            if let Some((s_idx, e_idx)) = ed.selection.take() {
+                                let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                                let min_i = min_i.min(ed.text.len());
+                                let max_i = max_i.min(ed.text.len());
+                                ed.text.drain(min_i..max_i);
+                                ed.cursor = min_i;
+                            } else if ed.cursor < ed.text.len() {
+                                let mut next = ed.cursor + 1;
+                                while next < ed.text.len() && !ed.text.is_char_boundary(next) {
+                                    next += 1;
+                                }
+                                ed.text.drain(ed.cursor..next);
+                            }
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x25 => {
+                        // VK_LEFT
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            ed.selection = None;
+                            if ed.cursor > 0 {
+                                let mut prev = ed.cursor - 1;
+                                while prev > 0 && !ed.text.is_char_boundary(prev) {
+                                    prev -= 1;
+                                }
+                                ed.cursor = prev;
+                            }
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x27 => {
+                        // VK_RIGHT
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            ed.selection = None;
+                            if ed.cursor < ed.text.len() {
+                                let mut next = ed.cursor + 1;
+                                while next < ed.text.len() && !ed.text.is_char_boundary(next) {
+                                    next += 1;
+                                }
+                                ed.cursor = next;
+                            }
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x24 => {
+                        // VK_HOME
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            ed.selection = None;
+                            ed.cursor = 0;
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x23 => {
+                        // VK_END
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                            ed.selection = None;
+                            ed.cursor = ed.text.len();
+                            ed.caret_visible = true;
+                        }
+                        unsafe { invalidate_sidebar(hwnd, state); }
+                        return LRESULT(0);
+                    }
+                    0x41 => {
+                        // 'A' with Ctrl
+                        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+                        let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
+                        if ctrl {
+                            let mut b = state.borrow_mut();
+                            if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                                ed.selection = Some((0, ed.text.len()));
+                                ed.cursor = ed.text.len();
+                                ed.caret_visible = true;
+                            }
+                            unsafe { invalidate_sidebar(hwnd, state); }
+                            return LRESULT(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, GetAsyncKeyState, VK_CONTROL, VK_SHIFT, VK_MENU};
             let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0
                 || (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
@@ -1101,8 +1606,8 @@ unsafe extern "system" fn wndproc(
             if ctrl {
                 if shift {
                     match vk {
-                        0x43 => { // 'C' -> Copy URL
-                            if let Some(ref cb) = on_action { cb(SidebarAction::CopyUrl); }
+                        0x43 => { // 'C' -> Copy Clean Link (Ctrl+Shift+C)
+                            if let Some(ref cb) = on_action { cb(SidebarAction::CopyCleanLinkActive); }
                             return LRESULT(0);
                         }
                         0x58 => { // 'X' -> Pin Tab
@@ -1182,6 +1687,52 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(0);
             }
         }
+        WM_CHAR => {
+            let ch = wparam.0 as u16;
+            if ch >= 32 {
+                if let Some(c) = char::from_u32(ch as u32) {
+                    let mut b = state.borrow_mut();
+                    if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                        if let Some((s_idx, e_idx)) = ed.selection.take() {
+                            let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                            let min_i = min_i.min(ed.text.len());
+                            let max_i = max_i.min(ed.text.len());
+                            ed.text.drain(min_i..max_i);
+                            ed.cursor = min_i;
+                        }
+                        ed.text.insert(ed.cursor, c);
+                        ed.cursor += c.len_utf8();
+                        ed.caret_visible = true;
+                    }
+                    drop(b);
+                    unsafe {
+                        invalidate_sidebar(hwnd, state);
+                    }
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_TIMER if wparam.0 == INLINE_CARET_TIMER_ID => {
+            let has_edit = {
+                let mut b = state.borrow_mut();
+                if let Some(ref mut ed) = b.sidebar_state.inline_edit {
+                    ed.caret_visible = !ed.caret_visible;
+                    true
+                } else {
+                    false
+                }
+            };
+            if has_edit {
+                unsafe {
+                    invalidate_sidebar(hwnd, state);
+                }
+            } else {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), INLINE_CARET_TIMER_ID);
+                }
+            }
+            return LRESULT(0);
+        }
         msg if msg >= WM_APP => {
             let handler = state.borrow().on_custom_msg.clone();
             if let Some(handler) = handler {
@@ -1194,6 +1745,13 @@ unsafe extern "system" fn wndproc(
                 let _ = KillTimer(Some(hwnd), 0x4201);
                 state.borrow_mut().sidebar_state.toast = None;
                 invalidate_sidebar(hwnd, state);
+            }
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == TAB_ANIM_TIMER_ID => {
+            let on_action = state.borrow().on_action.clone();
+            if let Some(cb) = on_action {
+                cb(SidebarAction::TabAnimTick);
             }
             return LRESULT(0);
         }

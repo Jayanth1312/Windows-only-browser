@@ -11,6 +11,16 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenElement {
+    pub id: i64,
+    pub host: String,
+    pub selector: String,
+    pub label: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
     pub id: i64,
@@ -27,6 +37,16 @@ pub struct SavedTab {
     pub position: i32,
     pub is_pinned: bool,
     pub custom_title: bool,
+    pub folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SavedFolder {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub position: i32,
+    pub is_open: bool,
 }
 
 pub struct Storage {
@@ -72,7 +92,16 @@ impl Storage {
                 is_pinned INTEGER NOT NULL DEFAULT 0,
                 custom_title INTEGER NOT NULL DEFAULT 0,
                 space_id TEXT NOT NULL DEFAULT 'default',
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                folder_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS folders (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                icon TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                is_open INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -87,11 +116,25 @@ impl Storage {
                 png_bytes BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS hidden_elements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT NOT NULL,
+                selector TEXT NOT NULL,
+                label TEXT NOT NULL,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hidden_host_sel ON hidden_elements(host, selector);
+            CREATE INDEX IF NOT EXISTS idx_hidden_host ON hidden_elements(host);
+
             CREATE INDEX IF NOT EXISTS idx_history_url ON history(url);
             CREATE INDEX IF NOT EXISTS idx_history_visited ON history(visited_at DESC);
             "#,
         )?;
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN folder_id TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE folders ADD COLUMN is_open INTEGER NOT NULL DEFAULT 1", []);
         Ok(())
     }
 
@@ -210,6 +253,47 @@ impl Storage {
         }
     }
 
+    pub fn save_folders_state(&self, folders: &[SavedFolder]) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM folders", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO folders (id, name, icon, position, is_open) VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
+            for f in folders {
+                stmt.execute(params![
+                    f.id,
+                    f.name,
+                    f.icon,
+                    f.position,
+                    if f.is_open { 1 } else { 0 },
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_saved_folders(&self) -> Result<Vec<SavedFolder>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, icon, position, is_open FROM folders ORDER BY position ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SavedFolder {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                icon: row.get(2)?,
+                position: row.get(3)?,
+                is_open: row.get::<_, i32>(4).map(|v| v != 0).unwrap_or(true),
+            })
+        })?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
     pub fn save_tabs_state(&self, tabs: &[SavedTab], active_idx: usize) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM tabs WHERE space_id = 'default'", [])?;
@@ -219,7 +303,7 @@ impl Storage {
             .unwrap_or(0);
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tabs (id, title, url, position, is_pinned, custom_title, space_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', ?7)"
+                "INSERT INTO tabs (id, title, url, position, is_pinned, custom_title, space_id, created_at, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', ?7, ?8)"
             )?;
             for t in tabs {
                 stmt.execute(params![
@@ -229,7 +313,8 @@ impl Storage {
                     t.position,
                     if t.is_pinned { 1 } else { 0 },
                     if t.custom_title { 1 } else { 0 },
-                    now
+                    now,
+                    t.folder_id,
                 ])?;
             }
         }
@@ -243,7 +328,7 @@ impl Storage {
 
     pub fn get_saved_tabs(&self) -> Result<Vec<SavedTab>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, url, position, is_pinned, custom_title FROM tabs WHERE space_id = 'default' ORDER BY position ASC"
+            "SELECT id, title, url, position, is_pinned, custom_title, folder_id FROM tabs WHERE space_id = 'default' ORDER BY position ASC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SavedTab {
@@ -253,6 +338,7 @@ impl Storage {
                 position: row.get(3)?,
                 is_pinned: row.get::<_, i32>(4)? != 0,
                 custom_title: row.get::<_, i32>(5).unwrap_or(0) != 0,
+                folder_id: row.get(6).ok(),
             })
         })?;
         let mut res = Vec::new();
@@ -269,6 +355,147 @@ impl Storage {
             }
         }
         Ok(None)
+    }
+
+    pub fn normalize_host(host: &str) -> String {
+        let trimmed = host.trim().to_ascii_lowercase();
+        let domain_only = if let Some(stripped) = trimmed.strip_prefix("http://") {
+            stripped
+        } else if let Some(stripped) = trimmed.strip_prefix("https://") {
+            stripped
+        } else {
+            &trimmed
+        };
+        let host_part = domain_only.split(['/', ':', '?', '#']).next().unwrap_or(domain_only);
+        if let Some(stripped) = host_part.strip_prefix("www.") {
+            stripped.to_string()
+        } else {
+            host_part.to_string()
+        }
+    }
+
+    pub fn add_hidden_element(
+        &self,
+        host: &str,
+        selector: &str,
+        label: &str,
+        note: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let norm_host = Self::normalize_host(host);
+        let sel = selector.trim();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.conn.execute(
+            r#"
+            INSERT INTO hidden_elements (host, selector, label, note, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(host, selector) DO UPDATE SET
+                label = excluded.label,
+                note = excluded.note,
+                created_at = excluded.created_at
+            "#,
+            params![norm_host, sel, label.trim(), note.map(|n| n.trim()), now],
+        )?;
+
+        let id = self.conn.last_insert_rowid();
+        Ok(id)
+    }
+
+    pub fn get_hidden_elements(&self, host: &str) -> Result<Vec<HiddenElement>, StorageError> {
+        let norm_host = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, host, selector, label, note, created_at FROM hidden_elements WHERE host = ?1 ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map(params![norm_host], |row| {
+            Ok(HiddenElement {
+                id: row.get(0)?,
+                host: row.get(1)?,
+                selector: row.get(2)?,
+                label: row.get(3)?,
+                note: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
+    pub fn get_hidden_elements_css(
+        &self,
+        host: &str,
+        without_selector: Option<&str>,
+    ) -> Result<String, StorageError> {
+        let elements = self.get_hidden_elements(host)?;
+        let mut css = String::new();
+        for elem in elements {
+            if let Some(without) = without_selector {
+                if elem.selector == without {
+                    continue;
+                }
+            }
+            css.push_str(&format!("{} {{ display: none !important; }}\n", elem.selector));
+        }
+        Ok(css)
+    }
+
+    pub fn remove_hidden_element(&self, id: i64) -> Result<(), StorageError> {
+        self.conn.execute(
+            "DELETE FROM hidden_elements WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_hidden_element_by_selector(&self, host: &str, selector: &str) -> Result<(), StorageError> {
+        let norm_host = Self::normalize_host(host);
+        self.conn.execute(
+            "DELETE FROM hidden_elements WHERE host = ?1 AND selector = ?2",
+            params![norm_host, selector.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn pop_last_hidden_element(&self, host: &str) -> Result<Option<HiddenElement>, StorageError> {
+        let norm_host = Self::normalize_host(host);
+        let last = self.conn.query_row(
+            "SELECT id, host, selector, label, note, created_at FROM hidden_elements WHERE host = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![norm_host],
+            |row| {
+                Ok(HiddenElement {
+                    id: row.get(0)?,
+                    host: row.get(1)?,
+                    selector: row.get(2)?,
+                    label: row.get(3)?,
+                    note: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            },
+        );
+
+        match last {
+            Ok(elem) => {
+                self.remove_hidden_element(elem.id)?;
+                Ok(Some(elem))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StorageError::Sqlite(e)),
+        }
+    }
+
+    pub fn clear_hidden_elements(&self, host: &str) -> Result<usize, StorageError> {
+        let norm_host = Self::normalize_host(host);
+        let rows = self.conn.execute(
+            "DELETE FROM hidden_elements WHERE host = ?1",
+            params![norm_host],
+        )?;
+        Ok(rows)
     }
 }
 
@@ -287,6 +514,7 @@ mod tests {
                 position: 0,
                 is_pinned: true,
                 custom_title: false,
+                folder_id: None,
             },
             SavedTab {
                 id: "pin-custom".into(),
@@ -295,6 +523,7 @@ mod tests {
                 position: 1,
                 is_pinned: true,
                 custom_title: true,
+                folder_id: Some("f-work".into()),
             },
             SavedTab {
                 id: "tab-1".into(),
@@ -303,6 +532,7 @@ mod tests {
                 position: 2,
                 is_pinned: false,
                 custom_title: false,
+                folder_id: None,
             },
         ];
 
@@ -316,9 +546,78 @@ mod tests {
         assert!(loaded[1].custom_title);
         assert_eq!(loaded[2].url, "https://en.wikipedia.org");
         assert!(!loaded[2].is_pinned);
+        assert_eq!(loaded[1].folder_id.as_deref(), Some("f-work"));
+
+        let folders = vec![
+            SavedFolder {
+                id: "f-work".into(),
+                name: "Work".into(),
+                icon: "<>".into(),
+                position: 0,
+                is_open: true,
+            },
+        ];
+        storage.save_folders_state(&folders).expect("save folders");
+        let loaded_folders = storage.get_saved_folders().expect("get folders");
+        assert_eq!(loaded_folders.len(), 1);
+        assert_eq!(loaded_folders[0].name, "Work");
+        assert_eq!(loaded_folders[0].icon, "<>");
+        assert!(loaded_folders[0].is_open);
 
         let active_idx = storage.get_saved_active_tab_idx().expect("get active tab idx");
         assert_eq!(active_idx, Some(2));
+    }
+
+    #[test]
+    fn test_hidden_elements() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+
+        // Normalize host testing
+        assert_eq!(Storage::normalize_host("https://www.youtube.com/watch?v=123"), "youtube.com");
+        assert_eq!(Storage::normalize_host("http://reddit.com/r/rust"), "reddit.com");
+        assert_eq!(Storage::normalize_host("WWW.GitHub.com"), "github.com");
+
+        // Add hidden elements
+        let id1 = storage
+            .add_hidden_element("www.youtube.com", "#masthead", "YouTube Header", Some("1200x56 top center"))
+            .expect("add id1");
+        assert!(id1 > 0);
+
+        let id2 = storage
+            .add_hidden_element("youtube.com", "#related", "Sidebar Recommendations", Some("400x800 middle right"))
+            .expect("add id2");
+        assert!(id2 > 0);
+
+        // Fetch elements for youtube.com
+        let list = storage.get_hidden_elements("https://youtube.com").expect("get elements");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].selector, "#masthead");
+        assert_eq!(list[0].label, "YouTube Header");
+        assert_eq!(list[1].selector, "#related");
+
+        // Check CSS generation
+        let css = storage.get_hidden_elements_css("youtube.com", None).expect("get css");
+        assert!(css.contains("#masthead { display: none !important; }"));
+        assert!(css.contains("#related { display: none !important; }"));
+
+        // CSS with spared selector (peeking)
+        let css_peeking = storage.get_hidden_elements_css("youtube.com", Some("#related")).expect("peek css");
+        assert!(css_peeking.contains("#masthead { display: none !important; }"));
+        assert!(!css_peeking.contains("#related { display: none !important; }"));
+
+        // Pop last element (Undo)
+        let undone = storage.pop_last_hidden_element("youtube.com").expect("undo");
+        assert!(undone.is_some());
+        assert_eq!(undone.unwrap().selector, "#related");
+
+        let remaining = storage.get_hidden_elements("youtube.com").expect("remaining");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].selector, "#masthead");
+
+        // Clear all
+        let cleared = storage.clear_hidden_elements("youtube.com").expect("clear");
+        assert_eq!(cleared, 1);
+        assert!(storage.get_hidden_elements("youtube.com").unwrap().is_empty());
     }
 }
 

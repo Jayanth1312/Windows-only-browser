@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use engine::{init_com, BrowserShortcut, WebViewController, WebViewEngine};
+use engine::{init_com, BrowserShortcut, WebViewController, WebViewEngine, ZapperMessage};
 use storage::Storage;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -53,6 +53,15 @@ fn log_timing(stage: &str, duration_ms: f64, total_ms: f64) {
 }
 
 #[derive(Clone, Debug)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub is_open: bool,
+    pub open_progress: f32,
+}
+
+#[derive(Clone, Debug)]
 struct ClosedTab {
     url: String,
     title: String,
@@ -66,10 +75,13 @@ struct Tab {
     accent: COLORREF,
     favicon: Option<std::sync::Arc<ui::FaviconData>>,
     is_pinned: bool,
+    folder_id: Option<String>,
     custom_title: bool,
     is_muted: bool,
     controller: Option<WebViewController>,
     last_active: Instant,
+    anim_progress: f32,
+    is_closing: bool,
 }
 
 enum AppEvent {
@@ -106,6 +118,9 @@ enum AppEvent {
     UnpinTab(usize),
     DuplicateTab(usize),
     CopyUrl,
+    CopyCleanLink,
+    CopyCleanTab(usize),
+    CopyCleanPinnedTab(usize),
     TogglePinCurrentTab,
     OpenSettings,
     OpenDownloads,
@@ -115,6 +130,33 @@ enum AppEvent {
     NextTab,
     PrevTab,
     FullScreenChanged(bool),
+    TabAnimTick,
+    CreateFolder,
+    ToggleFolder(usize),
+    RenameFolder(String, String),
+    ChangeFolderIcon(String, String),
+    DeleteFolder(String),
+    MoveTabToFolder(usize, Option<String>),
+    NewTabInFolder(String),
+    SelectTabId(String),
+    ToggleZapper,
+    ElementZapped {
+        tab_id: String,
+        selector: String,
+        label: String,
+        note: String,
+    },
+    ZapperUndo {
+        tab_id: String,
+    },
+    ZapperStatus {
+        tab_id: String,
+        active: bool,
+    },
+    ZapperRequestCss {
+        tab_id: String,
+    },
+    RestoreAllHiddenElements,
 }
 
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
@@ -152,6 +194,7 @@ struct BrowserApp {
     tabs: Vec<Tab>,
     active_tab_idx: usize,
     pinned_shortcuts: Vec<TabItem>,
+    folders: Vec<Folder>,
     next_tab_id: usize,
     window: Rc<BrowserWindow>,
     command_bar: Rc<RefCell<Option<CommandBar>>>,
@@ -165,6 +208,7 @@ struct BrowserApp {
     last_persist: Instant,
     closed_tabs: Vec<ClosedTab>,
     sidebar_before_fullscreen: Option<bool>,
+    last_anim_tick: Instant,
 }
 
 const UBOL_VERSION: &str = "2026.1116.1650";
@@ -276,6 +320,29 @@ impl BrowserApp {
             (Vec::new(), Vec::new(), 0)
         };
 
+        let saved_folders = if let Ok(st) = storage.try_borrow() {
+            st.get_saved_folders().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let folders: Vec<Folder> = if !saved_folders.is_empty() {
+            saved_folders.into_iter().map(|f| Folder {
+                id: f.id,
+                name: f.name,
+                icon: f.icon,
+                is_open: f.is_open,
+                open_progress: if f.is_open { 1.0 } else { 0.0 },
+            }).collect()
+        } else {
+            vec![
+                Folder { id: "f-web2".into(), name: "Web2".into(), icon: "<>".into(), is_open: true, open_progress: 1.0 },
+                Folder { id: "f-designs".into(), name: "Designs".into(), icon: "♥".into(), is_open: false, open_progress: 0.0 },
+                Folder { id: "f-mcp".into(), name: "MCP".into(), icon: "🔧".into(), is_open: false, open_progress: 0.0 },
+                Folder { id: "f-ai".into(), name: "AI".into(), icon: "🪟".into(), is_open: false, open_progress: 0.0 },
+            ]
+        };
+
         let pinned_shortcuts: Vec<TabItem> = if !saved_pinned.is_empty() {
             saved_pinned
                 .into_iter()
@@ -309,6 +376,9 @@ impl BrowserApp {
                         favicon: fav,
                         is_loaded: false,
                         is_muted: false,
+                        anim_progress: 1.0,
+                        is_closing: false,
+                        folder_id: None,
                     }
                 })
                 .collect()
@@ -324,6 +394,9 @@ impl BrowserApp {
                     }),
                     is_loaded: false,
                     is_muted: false,
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    folder_id: None,
                 },
                 TabItem {
                     id: "pin-github".into(),
@@ -335,6 +408,9 @@ impl BrowserApp {
                     }),
                     is_loaded: false,
                     is_muted: false,
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    folder_id: None,
                 },
                 TabItem {
                     id: "pin-youtube".into(),
@@ -350,6 +426,9 @@ impl BrowserApp {
                     }),
                     is_loaded: false,
                     is_muted: false,
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    folder_id: None,
                 },
             ];
             for sc in &defaults {
@@ -401,10 +480,13 @@ impl BrowserApp {
                 accent: accent_for_url(&s.url),
                 favicon: fav,
                 is_pinned: false,
+                folder_id: s.folder_id,
                 custom_title: s.custom_title,
                 is_muted: false,
                 controller: None, // sleeping, will be activated if active tab
                 last_active: Instant::now(),
+                anim_progress: 1.0,
+                is_closing: false,
             });
         }
 
@@ -420,6 +502,7 @@ impl BrowserApp {
             tabs: restored_tabs,
             active_tab_idx,
             pinned_shortcuts,
+            folders,
             next_tab_id,
             window,
             command_bar,
@@ -433,6 +516,7 @@ impl BrowserApp {
             last_persist: Instant::now(),
             closed_tabs: Vec::new(),
             sidebar_before_fullscreen: None,
+            last_anim_tick: Instant::now(),
         };
 
         app.persist_state();
@@ -441,6 +525,17 @@ impl BrowserApp {
 
     fn persist_state(&mut self) {
         if let Ok(st) = self.storage.try_borrow() {
+            let saved_folders: Vec<storage::SavedFolder> = self.folders.iter().enumerate().map(|(pos, f)| {
+                storage::SavedFolder {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    icon: f.icon.clone(),
+                    is_open: f.is_open,
+                    position: pos as i32,
+                }
+            }).collect();
+            let _ = st.save_folders_state(&saved_folders);
+
             let mut saved = Vec::new();
             let mut pos = 0;
             for sc in &self.pinned_shortcuts {
@@ -451,6 +546,7 @@ impl BrowserApp {
                     position: pos,
                     is_pinned: true,
                     custom_title: false,
+                    folder_id: None,
                 });
                 pos += 1;
             }
@@ -463,6 +559,7 @@ impl BrowserApp {
                         position: pos,
                         is_pinned: false,
                         custom_title: t.custom_title,
+                        folder_id: t.folder_id.clone(),
                     });
                     pos += 1;
                 }
@@ -599,6 +696,7 @@ impl BrowserApp {
                 BrowserShortcut::NavBack => AppEvent::NavBack,
                 BrowserShortcut::NavForward => AppEvent::NavForward,
                 BrowserShortcut::CopyUrl => AppEvent::CopyUrl,
+                BrowserShortcut::CopyCleanLink => AppEvent::CopyCleanLink,
                 BrowserShortcut::FocusUrlBar => AppEvent::OpenCommandBar(CommandBarMode::NavigateCurrent),
                 BrowserShortcut::OpenSettings => AppEvent::OpenSettings,
                 BrowserShortcut::ZoomIn => AppEvent::ZoomIn,
@@ -609,6 +707,7 @@ impl BrowserApp {
                 BrowserShortcut::PrevTab => AppEvent::PrevTab,
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
+                BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -651,6 +750,34 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_zapper = tab_id.clone();
+        let tx_zapper = self.event_tx.clone();
+        let on_zapper = Box::new(move |msg: ZapperMessage| {
+            let ev = match msg {
+                ZapperMessage::Zap { selector, label, note } => AppEvent::ElementZapped {
+                    tab_id: tab_id_clone_zapper.clone(),
+                    selector,
+                    label,
+                    note,
+                },
+                ZapperMessage::Undo => AppEvent::ZapperUndo {
+                    tab_id: tab_id_clone_zapper.clone(),
+                },
+                ZapperMessage::Status { active } => AppEvent::ZapperStatus {
+                    tab_id: tab_id_clone_zapper.clone(),
+                    active,
+                },
+                ZapperMessage::RequestCss => AppEvent::ZapperRequestCss {
+                    tab_id: tab_id_clone_zapper.clone(),
+                },
+            };
+            let _ = tx_zapper.send(ev);
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         let controller = match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -663,6 +790,7 @@ impl BrowserApp {
             Some(on_new_window),
             Some(on_shortcut),
             Some(on_fullscreen),
+            Some(on_zapper),
         ) {
             Ok(c) => {
                 if !self.extension_loaded {
@@ -700,11 +828,18 @@ impl BrowserApp {
             accent: initial_accent,
             favicon: preloaded_favicon,
             is_pinned,
+            folder_id: None,
             custom_title: false,
             is_muted: false,
             controller: Some(controller),
             last_active: Instant::now(),
+            anim_progress: if is_pinned { 1.0 } else { 0.05 },
+            is_closing: false,
         });
+
+        if !is_pinned {
+            self.window.start_tab_anim_timer();
+        }
 
         if let Ok(st) = self.storage.try_borrow() {
             let _ = st.add_history(url, &initial_title);
@@ -712,6 +847,15 @@ impl BrowserApp {
 
         self.switch_tab(new_idx);
         self.persist_state();
+    }
+
+    fn create_tab_in_folder(&mut self, url: &str, folder_id: Option<String>) {
+        self.create_tab(url, false);
+        if let Some(tab) = self.tabs.last_mut() {
+            tab.folder_id = folder_id;
+        }
+        self.sync_tabs_ui();
+        self.mark_dirty();
     }
 
     fn ensure_tab_controller(&mut self, idx: usize) {
@@ -784,6 +928,7 @@ impl BrowserApp {
                 BrowserShortcut::NavBack => AppEvent::NavBack,
                 BrowserShortcut::NavForward => AppEvent::NavForward,
                 BrowserShortcut::CopyUrl => AppEvent::CopyUrl,
+                BrowserShortcut::CopyCleanLink => AppEvent::CopyCleanLink,
                 BrowserShortcut::FocusUrlBar => AppEvent::OpenCommandBar(CommandBarMode::NavigateCurrent),
                 BrowserShortcut::OpenSettings => AppEvent::OpenSettings,
                 BrowserShortcut::ZoomIn => AppEvent::ZoomIn,
@@ -794,6 +939,7 @@ impl BrowserApp {
                 BrowserShortcut::PrevTab => AppEvent::PrevTab,
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
+                BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -836,6 +982,34 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_zapper = tab_id.clone();
+        let tx_zapper = self.event_tx.clone();
+        let on_zapper = Box::new(move |msg: ZapperMessage| {
+            let ev = match msg {
+                ZapperMessage::Zap { selector, label, note } => AppEvent::ElementZapped {
+                    tab_id: tab_id_clone_zapper.clone(),
+                    selector,
+                    label,
+                    note,
+                },
+                ZapperMessage::Undo => AppEvent::ZapperUndo {
+                    tab_id: tab_id_clone_zapper.clone(),
+                },
+                ZapperMessage::Status { active } => AppEvent::ZapperStatus {
+                    tab_id: tab_id_clone_zapper.clone(),
+                    active,
+                },
+                ZapperMessage::RequestCss => AppEvent::ZapperRequestCss {
+                    tab_id: tab_id_clone_zapper.clone(),
+                },
+            };
+            let _ = tx_zapper.send(ev);
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -848,6 +1022,7 @@ impl BrowserApp {
             Some(on_new_window),
             Some(on_shortcut),
             Some(on_fullscreen),
+            Some(on_zapper),
         ) {
             Ok(c) => {
                 if !self.extension_loaded {
@@ -922,38 +1097,147 @@ impl BrowserApp {
             self.closed_tabs.remove(0);
         }
 
-        // Hide and remove the tab
-        if let Some(ref ctrl) = self.tabs[target_idx].controller {
-            let _ = ctrl.set_visible(false);
-        }
-        self.tabs.remove(target_idx);
-
-        if self.tabs.is_empty() {
-            self.active_tab_idx = 0;
-            self.sync_tabs_ui();
-            unsafe {
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, true);
+        if self.tabs[target_idx].is_pinned {
+            if let Some(ref ctrl) = self.tabs[target_idx].controller {
+                let _ = ctrl.set_visible(false);
             }
-            self.mark_dirty();
+            self.tabs.remove(target_idx);
+
+            if self.tabs.is_empty() {
+                self.active_tab_idx = 0;
+                self.sync_tabs_ui();
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, true);
+                }
+                self.mark_dirty();
+                return;
+            }
+
+            if self.active_tab_idx >= self.tabs.len() {
+                self.active_tab_idx = self.tabs.len().saturating_sub(1);
+            } else if self.active_tab_idx > target_idx {
+                self.active_tab_idx -= 1;
+            }
+
+            self.ensure_tab_controller(self.active_tab_idx);
+
+            let (content_rect, _) = self.window.get_layout_rects();
+            if let Some(ref active) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+                let _ = active.set_bounds(content_rect);
+                let _ = active.set_visible(true);
+            }
+
+            self.sync_tabs_ui();
+            self.persist_state();
             return;
         }
 
-        if self.active_tab_idx >= self.tabs.len() {
-            self.active_tab_idx = self.tabs.len().saturating_sub(1);
-        } else if self.active_tab_idx > target_idx {
-            self.active_tab_idx -= 1;
+        if self.tabs[target_idx].is_closing {
+            return;
         }
 
-        self.ensure_tab_controller(self.active_tab_idx);
+        self.tabs[target_idx].is_closing = true;
 
-        let (content_rect, _) = self.window.get_layout_rects();
-        if let Some(ref active) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
-            let _ = active.set_bounds(content_rect);
-            let _ = active.set_visible(true);
+        // If closing active tab, switch active to another non-closing tab
+        if self.active_tab_idx == target_idx {
+            let next_tab = self.tabs.iter().enumerate()
+                .filter(|(i, t)| *i != target_idx && !t.is_closing)
+                .map(|(i, _)| i)
+                .next();
+            if let Some(new_idx) = next_tab {
+                self.switch_tab(new_idx);
+            } else {
+                if let Some(ref ctrl) = self.tabs[target_idx].controller {
+                    let _ = ctrl.set_visible(false);
+                }
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, false);
+                }
+            }
+        }
+
+        self.window.start_tab_anim_timer();
+        self.sync_tabs_ui();
+    }
+
+    fn on_tab_anim_tick(&mut self) {
+        let speed = 0.12;
+        // Folder open/close is time-based (frame-rate independent); eased at render time.
+        let now = Instant::now();
+        let mut dt = now.duration_since(self.last_anim_tick).as_secs_f32();
+        self.last_anim_tick = now;
+        if dt > 0.05 {
+            dt = 0.016;
+        }
+        let f_step = dt / 0.28;
+        let mut any_animating = false;
+
+        for tab in self.tabs.iter_mut() {
+            if tab.is_closing {
+                tab.anim_progress = (tab.anim_progress - speed).max(0.0);
+                if tab.anim_progress > 0.0 {
+                    any_animating = true;
+                }
+            } else if tab.anim_progress < 1.0 {
+                tab.anim_progress = (tab.anim_progress + speed).min(1.0);
+                if tab.anim_progress < 1.0 {
+                    any_animating = true;
+                }
+            }
+        }
+
+        for folder in self.folders.iter_mut() {
+            let target = if folder.is_open { 1.0 } else { 0.0 };
+            if (folder.open_progress - target).abs() > 0.01 {
+                if folder.is_open {
+                    folder.open_progress = (folder.open_progress + f_step).min(1.0);
+                } else {
+                    folder.open_progress = (folder.open_progress - f_step).max(0.0);
+                }
+                any_animating = true;
+            } else {
+                folder.open_progress = target;
+            }
+        }
+
+        let mut i = 0;
+        let mut removed = false;
+        while i < self.tabs.len() {
+            if self.tabs[i].is_closing && self.tabs[i].anim_progress <= 0.001 {
+                if let Some(ref ctrl) = self.tabs[i].controller {
+                    let _ = ctrl.set_visible(false);
+                }
+                self.tabs.remove(i);
+                removed = true;
+                if self.active_tab_idx >= self.tabs.len() {
+                    self.active_tab_idx = self.tabs.len().saturating_sub(1);
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        if removed {
+            if !self.tabs.is_empty() {
+                self.ensure_tab_controller(self.active_tab_idx);
+                let (content_rect, _) = self.window.get_layout_rects();
+                if let Some(ref active) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+                    let _ = active.set_bounds(content_rect);
+                    let _ = active.set_visible(true);
+                }
+            } else {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, false);
+                }
+            }
+            self.persist_state();
         }
 
         self.sync_tabs_ui();
-        self.persist_state();
+
+        if !any_animating {
+            self.window.stop_tab_anim_timer();
+        }
     }
 
     fn sync_tabs_ui(&self) {
@@ -980,6 +1264,9 @@ impl BrowserApp {
                     favicon: t.favicon.clone().or_else(|| sc.favicon.clone()),
                     is_loaded: true,
                     is_muted: t.is_muted,
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    folder_id: None,
                 });
             } else {
                 pinned_items.push(TabItem {
@@ -990,6 +1277,9 @@ impl BrowserApp {
                     favicon: sc.favicon.clone(),
                     is_loaded: false,
                     is_muted: false,
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    folder_id: None,
                 });
             }
         }
@@ -1007,9 +1297,20 @@ impl BrowserApp {
                     favicon: t.favicon.clone(),
                     is_loaded: t.controller.is_some(),
                     is_muted: t.is_muted,
+                    anim_progress: t.anim_progress,
+                    is_closing: t.is_closing,
+                    folder_id: t.folder_id.clone(),
                 });
             }
         }
+
+        let folder_items: Vec<ui::FolderItem> = self.folders.iter().map(|f| ui::FolderItem {
+            id: f.id.clone(),
+            name: f.name.clone(),
+            icon: f.icon.clone(),
+            is_open: f.is_open,
+            open_progress: f.open_progress,
+        }).collect();
 
         let active = if let Some(p) = active_pinned {
             Some(ui::ActiveTab::Pinned(p))
@@ -1026,13 +1327,14 @@ impl BrowserApp {
         };
 
         let has_closed = !self.closed_tabs.is_empty();
-        self.window.update_tabs_and_pinned(regular_items, pinned_items, active, can_back, can_forward, has_closed);
+        self.window.update_sidebar_data(regular_items, pinned_items, folder_items, active, can_back, can_forward, has_closed);
     }
 
     fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::CreateTab(url) => {
-                self.create_tab(&url, false);
+                let clean = engine::clean_url(&url);
+                self.create_tab(&clean, false);
             }
             AppEvent::SwitchTab(idx) => {
                 let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
@@ -1128,8 +1430,12 @@ impl BrowserApp {
                             favicon: self.tabs[pos].favicon.clone(),
                             is_loaded: true,
                             is_muted: self.tabs[pos].is_muted,
+                            anim_progress: 1.0,
+                            is_closing: false,
+                            folder_id: None,
                         });
                     }
+                    self.window.show_toast("Added to Favourite tabs");
                     self.sync_tabs_ui();
                     self.mark_dirty();
                 }
@@ -1152,13 +1458,17 @@ impl BrowserApp {
                             accent: removed.accent,
                             favicon: removed.favicon,
                             is_pinned: false,
+                            folder_id: None,
                             custom_title: false,
                             is_muted: false,
                             controller: None, // Sleeping!
                             last_active: Instant::now(),
+                            anim_progress: 1.0,
+                            is_closing: false,
                         });
                         self.next_tab_id += 1;
                     }
+                    self.window.show_toast("Removed from Favourite tabs");
                     self.sync_tabs_ui();
                     self.mark_dirty();
                 }
@@ -1172,20 +1482,19 @@ impl BrowserApp {
             }
             AppEvent::PromptRenameTab(idx) => {
                 let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx);
-                if let Some((real_idx, tab)) = target {
+                if let Some((_, tab)) = target {
                     let current_title = tab.title.clone();
-                    let (content_rect, _) = self.window.get_layout_rects();
-                    if let Some(ref cb) = *self.command_bar.borrow() {
-                        cb.show(content_rect, CommandBarMode::RenameTab(real_idx), Some(&current_title));
-                    }
+                    self.window.start_inline_rename_tab(idx, &current_title);
                 }
             }
             AppEvent::RenameTab(idx, new_title) => {
-                if idx < self.tabs.len() {
+                let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
+                let real_idx = target.unwrap_or(idx);
+                if real_idx < self.tabs.len() {
                     let trimmed = new_title.trim();
                     if !trimmed.is_empty() {
-                        self.tabs[idx].title = trimmed.to_string();
-                        self.tabs[idx].custom_title = true;
+                        self.tabs[real_idx].title = trimmed.to_string();
+                        self.tabs[real_idx].custom_title = true;
                     }
                     self.sync_tabs_ui();
                     self.mark_dirty();
@@ -1253,7 +1562,8 @@ impl BrowserApp {
                 }
             }
             AppEvent::CreateTabAt(url, at_idx) => {
-                self.create_tab(&url, false);
+                let clean = engine::clean_url(&url);
+                self.create_tab(&clean, false);
                 // Move the newly created tab from the end to at_idx if valid
                 if self.tabs.len() > 1 && at_idx < self.tabs.len() {
                     let last_idx = self.tabs.len() - 1;
@@ -1359,6 +1669,36 @@ impl BrowserApp {
                     self.window.show_toast("Link copied to clipboard!");
                 }
             }
+            AppEvent::CopyCleanTab(idx) => {
+                let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
+                if let Some(pos) = target {
+                    let tab = &self.tabs[pos];
+                    let live_url = tab.controller.as_ref().and_then(|c| c.get_source().ok()).unwrap_or_default();
+                    let raw_url = if !live_url.is_empty() && live_url != "about:blank" {
+                        live_url
+                    } else {
+                        tab.url.clone()
+                    };
+                    let clean = engine::clean_url(&raw_url);
+                    copy_to_clipboard(self.window.hwnd(), &clean);
+                    if clean != raw_url {
+                        self.window.show_toast("Clean link copied (tracking parameters removed)!");
+                    } else {
+                        self.window.show_toast("Clean link copied to clipboard!");
+                    }
+                }
+            }
+            AppEvent::CopyCleanPinnedTab(idx) => {
+                if let Some(sc) = self.pinned_shortcuts.get(idx) {
+                    let clean = engine::clean_url(&sc.url);
+                    copy_to_clipboard(self.window.hwnd(), &clean);
+                    if clean != sc.url {
+                        self.window.show_toast("Clean link copied (tracking parameters removed)!");
+                    } else {
+                        self.window.show_toast("Clean link copied to clipboard!");
+                    }
+                }
+            }
             AppEvent::CloseOtherTabs(idx) => {
                 let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
                 if let Some(keep_pos) = target {
@@ -1416,6 +1756,7 @@ impl BrowserApp {
                 }
             }
             AppEvent::Navigate(url) => {
+                let url = engine::clean_url(&url);
                 self.window.set_loading(true, 0.25);
                 let domain = ui::domain_of(&url);
                 let cached_fav = self.get_cached_favicon(&domain);
@@ -1616,6 +1957,20 @@ impl BrowserApp {
                 if is_active {
                     self.window.set_loading(false, 1.0);
                 }
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    let domain = ui::domain_of(&tab.url);
+                    if !domain.is_empty() {
+                        if let Ok(st) = self.storage.try_borrow() {
+                            if let Ok(css) = st.get_hidden_elements_css(&domain, None) {
+                                if !css.is_empty() {
+                                    if let Some(ref ctrl) = tab.controller {
+                                        let _ = ctrl.apply_zapper_rules(&css);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             AppEvent::HardReload => {
                 if let Some(tab) = self.tabs.get(self.active_tab_idx) {
@@ -1636,9 +1991,31 @@ impl BrowserApp {
                     self.window.show_toast("Copied current URL!");
                 }
             }
+            AppEvent::CopyCleanLink => {
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    let live_url = tab.controller.as_ref().and_then(|c| c.get_source().ok()).unwrap_or_default();
+                    let raw_url = if !live_url.is_empty() && live_url != "about:blank" {
+                        live_url
+                    } else {
+                        tab.url.clone()
+                    };
+                    let clean = engine::clean_url(&raw_url);
+                    copy_to_clipboard(self.window.hwnd(), &clean);
+                    if clean != raw_url {
+                        self.window.show_toast("Clean link copied (tracking parameters removed)!");
+                    } else {
+                        self.window.show_toast("Clean link copied to clipboard!");
+                    }
+                }
+            }
             AppEvent::TogglePinCurrentTab => {
                 if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
                     tab.is_pinned = !tab.is_pinned;
+                    if tab.is_pinned {
+                        self.window.show_toast("Added to Favourite tabs");
+                    } else {
+                        self.window.show_toast("Removed from Favourite tabs");
+                    }
                 }
                 self.sync_tabs_ui();
                 self.mark_dirty();
@@ -1660,6 +2037,7 @@ impl BrowserApp {
                         let new_z = new_z.min(3.0);
                         let _ = ctrl.set_zoom_factor(new_z);
                         self.window.set_zoom(new_z);
+                        self.window.show_toast(&format!("Zoom: {}%", (new_z * 100.0).round() as i32));
                     }
                 }
             }
@@ -1671,6 +2049,7 @@ impl BrowserApp {
                         let new_z = new_z.max(0.3);
                         let _ = ctrl.set_zoom_factor(new_z);
                         self.window.set_zoom(new_z);
+                        self.window.show_toast(&format!("Zoom: {}%", (new_z * 100.0).round() as i32));
                     }
                 }
             }
@@ -1679,6 +2058,7 @@ impl BrowserApp {
                     if let Some(ref ctrl) = tab.controller {
                         let _ = ctrl.set_zoom_factor(1.0);
                         self.window.set_zoom(1.0);
+                        self.window.show_toast("Zoom: 100% (Reset)");
                     }
                 }
             }
@@ -1725,6 +2105,189 @@ impl BrowserApp {
                 }
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+                }
+            }
+            AppEvent::TabAnimTick => {
+                self.on_tab_anim_tick();
+            }
+            AppEvent::CreateFolder => {
+                let id = format!("f-{}", Instant::now().elapsed().as_nanos());
+                let new_name = "New Folder".to_string();
+                self.folders.push(Folder {
+                    id: id.clone(),
+                    name: new_name.clone(),
+                    icon: "📁".to_string(),
+                    is_open: true,
+                    open_progress: 1.0,
+                });
+                self.sync_tabs_ui();
+                self.persist_state();
+                self.window.start_inline_rename_folder(&id, &new_name);
+            }
+            AppEvent::ToggleFolder(idx) => {
+                if let Some(folder) = self.folders.get_mut(idx) {
+                    folder.is_open = !folder.is_open;
+                    self.window.start_tab_anim_timer();
+                    self.sync_tabs_ui();
+                    self.persist_state();
+                }
+            }
+            AppEvent::RenameFolder(id, new_name) => {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                    let trimmed = new_name.trim();
+                    if !trimmed.is_empty() {
+                        folder.name = trimmed.to_string();
+                    }
+                }
+                self.sync_tabs_ui();
+                self.persist_state();
+            }
+            AppEvent::ChangeFolderIcon(id, new_icon) => {
+                if let Some(folder) = self.folders.iter_mut().find(|f| f.id == id) {
+                    folder.icon = new_icon;
+                }
+                self.sync_tabs_ui();
+                self.persist_state();
+            }
+            AppEvent::DeleteFolder(id) => {
+                self.folders.retain(|f| f.id != id);
+                for tab in &mut self.tabs {
+                    if tab.folder_id.as_deref() == Some(&id) {
+                        tab.folder_id = None;
+                    }
+                }
+                self.sync_tabs_ui();
+                self.persist_state();
+                self.window.show_toast("Folder deleted");
+            }
+            AppEvent::MoveTabToFolder(tab_idx, folder_id) => {
+                let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(tab_idx).map(|(i, _)| i);
+                if let Some(pos) = target {
+                    self.tabs[pos].folder_id = folder_id;
+                    self.sync_tabs_ui();
+                    self.persist_state();
+                }
+            }
+            AppEvent::NewTabInFolder(folder_id) => {
+                self.create_tab_in_folder("https://www.google.com", Some(folder_id));
+            }
+            AppEvent::SelectTabId(tab_id) => {
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                    self.switch_tab(pos);
+                }
+            }
+            AppEvent::ToggleZapper => {
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref ctrl) = tab.controller {
+                        let _ = ctrl.toggle_zapper();
+                    }
+                }
+            }
+            AppEvent::ZapperStatus { tab_id, active } => {
+                let is_active = self.tabs.get(self.active_tab_idx).map_or(false, |t| t.id == tab_id);
+                if is_active {
+                    if active {
+                        self.window.show_toast("Element Zapper: Point & click to hide (Esc to exit, Ctrl+Z to undo)");
+                    } else {
+                        self.window.show_toast("Element Zapper closed");
+                    }
+                }
+            }
+            AppEvent::ZapperRequestCss { tab_id } => {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    let domain = ui::domain_of(&tab.url);
+                    if !domain.is_empty() {
+                        if let Ok(st) = self.storage.try_borrow() {
+                            if let Ok(css) = st.get_hidden_elements_css(&domain, None) {
+                                if !css.is_empty() {
+                                    if let Some(ref ctrl) = tab.controller {
+                                        let _ = ctrl.apply_zapper_rules(&css);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AppEvent::ElementZapped { tab_id, selector, label, note } => {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    let domain = ui::domain_of(&tab.url);
+                    if !domain.is_empty() {
+                        let note_opt = if note.is_empty() { None } else { Some(note.as_str()) };
+                        let mut ok = false;
+                        if let Ok(st) = self.storage.try_borrow() {
+                            if st.add_hidden_element(&domain, &selector, &label, note_opt).is_ok() {
+                                ok = true;
+                                if let Ok(css) = st.get_hidden_elements_css(&domain, None) {
+                                    if let Some(ref ctrl) = tab.controller {
+                                        let _ = ctrl.apply_zapper_rules(&css);
+                                    }
+                                }
+                            }
+                        }
+                        if ok {
+                            let msg = if label.is_empty() {
+                                "Hidden element on this site (Ctrl+Z to undo)".to_string()
+                            } else {
+                                format!("Hidden \"{}\" (Ctrl+Z to undo)", label)
+                            };
+                            self.window.show_toast(&msg);
+                        }
+                    }
+                }
+            }
+            AppEvent::ZapperUndo { tab_id } => {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    let domain = ui::domain_of(&tab.url);
+                    if !domain.is_empty() {
+                        let mut undone = None;
+                        if let Ok(st) = self.storage.try_borrow() {
+                            if let Ok(elem_opt) = st.pop_last_hidden_element(&domain) {
+                                undone = elem_opt;
+                                if let Ok(remaining_css) = st.get_hidden_elements_css(&domain, None) {
+                                    if let Some(ref ctrl) = tab.controller {
+                                        let _ = ctrl.apply_zapper_rules(&remaining_css);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(elem) = undone {
+                            let msg = if elem.label.is_empty() {
+                                "Restored hidden element".to_string()
+                            } else {
+                                format!("Restored \"{}\"", elem.label)
+                            };
+                            self.window.show_toast(&msg);
+                        } else {
+                            self.window.show_toast("Nothing to undo on this site");
+                        }
+                    }
+                }
+            }
+            AppEvent::RestoreAllHiddenElements => {
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    let domain = ui::domain_of(&tab.url);
+                    if !domain.is_empty() {
+                        let mut count = 0;
+                        if let Ok(st) = self.storage.try_borrow() {
+                            if let Ok(deleted) = st.clear_hidden_elements(&domain) {
+                                count = deleted;
+                            }
+                        }
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.apply_zapper_rules("");
+                        }
+                        if count > 0 {
+                            self.window.show_toast(&format!(
+                                "Restored {} hidden element{} on {}",
+                                count,
+                                if count == 1 { "" } else { "s" },
+                                domain
+                            ));
+                        } else {
+                            self.window.show_toast(&format!("No hidden elements on {}", domain));
+                        }
+                    }
                 }
             }
         }
@@ -1822,12 +2385,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(storage.clone()),
         Box::new(move |action| {
             let ev = match action {
-                CommandAction::OpenInNewTab(url) => AppEvent::CreateTab(url),
-                CommandAction::Navigate(url) => AppEvent::Navigate(url),
+                CommandAction::OpenInNewTab(url) => AppEvent::CreateTab(engine::clean_url(&url)),
+                CommandAction::Navigate(url) => AppEvent::Navigate(engine::clean_url(&url)),
                 CommandAction::RenameTab(idx, title) => AppEvent::RenameTab(idx, title),
                 CommandAction::NewTab => AppEvent::CreateTab("https://www.google.com".to_string()),
                 CommandAction::CloseTab => AppEvent::CloseTab(usize::MAX),
                 CommandAction::ToggleSidebar => AppEvent::ToggleSidebar,
+                CommandAction::ToggleZapper => AppEvent::ToggleZapper,
+                CommandAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
+                CommandAction::CopyCleanLink => AppEvent::CopyCleanLink,
             };
             let _ = tx_cb.send(ev);
             unsafe {
@@ -1857,6 +2423,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::PromptRenameTab(idx) => AppEvent::PromptRenameTab(idx),
             SidebarAction::RenameTab(idx, title) => AppEvent::RenameTab(idx, title),
             SidebarAction::CopyUrl => AppEvent::CopyUrl,
+            SidebarAction::CopyCleanLink(idx) => AppEvent::CopyCleanTab(idx),
+            SidebarAction::CopyCleanPinnedTab(idx) => AppEvent::CopyCleanPinnedTab(idx),
+            SidebarAction::CopyCleanLinkActive => AppEvent::CopyCleanLink,
             SidebarAction::TogglePinCurrentTab => AppEvent::TogglePinCurrentTab,
             SidebarAction::OpenSettings => AppEvent::OpenSettings,
             SidebarAction::OpenDownloads => AppEvent::OpenDownloads,
@@ -1876,6 +2445,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::NewTabBelow(idx) => AppEvent::CreateTabAt("https://www.google.com".to_string(), idx + 1),
             SidebarAction::ReloadSpecificTab(idx) => AppEvent::ReloadSpecificTab(idx),
             SidebarAction::ReloadSpecificPinnedTab(idx) => AppEvent::ReloadSpecificPinnedTab(idx),
+            SidebarAction::TabAnimTick => AppEvent::TabAnimTick,
+            SidebarAction::CreateFolder => AppEvent::CreateFolder,
+            SidebarAction::ToggleFolder(idx) => AppEvent::ToggleFolder(idx),
+            SidebarAction::RenameFolder(id, name) => AppEvent::RenameFolder(id, name),
+            SidebarAction::ChangeFolderIcon(id, icon) => AppEvent::ChangeFolderIcon(id, icon),
+            SidebarAction::DeleteFolder(id) => AppEvent::DeleteFolder(id),
+            SidebarAction::MoveTabToFolder(idx, fid) => AppEvent::MoveTabToFolder(idx, fid),
+            SidebarAction::NewTabInFolder(fid) => AppEvent::NewTabInFolder(fid),
+            SidebarAction::SelectTabId(tid) => AppEvent::SelectTabId(tid),
+            SidebarAction::ToggleZapper => AppEvent::ToggleZapper,
+            SidebarAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
         };
         let _ = tx_action.send(ev);
         unsafe {

@@ -15,6 +15,22 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::IsZoomed;
 
+pub use crate::folder_icon::draw_folder_icon;
+
+/// Reserved `TabItem::folder_id` value: the tab lives in the Pinned Tabs section
+/// (under the folders) instead of a real folder. Persisted through `folder_id`.
+pub const PINNED_SECTION_ID: &str = "__pinned__";
+
+/// Smooth in/out easing for open/close animations (input and output are 0..=1).
+pub fn ease_in_out(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    if p < 0.5 {
+        4.0 * p * p * p
+    } else {
+        1.0 - (-2.0 * p + 2.0).powi(3) / 2.0
+    }
+}
+
 // ───────────────────────────── Public types ─────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +53,38 @@ pub enum SidebarHit {
     UrlBar,
     ZoomReset,
     Pinned(usize),
+    Folder(usize),
+    FolderIcon(usize),
     Tab(usize),
     TabClose(usize),
     NewTab,
     Downloads,
     Settings,
+    JumpToActiveTab,
+}
+
+#[derive(Debug, Clone)]
+pub struct FolderItem {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub is_open: bool,
+    pub open_progress: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineEditTarget {
+    Folder(String),
+    Tab(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineEditState {
+    pub target: InlineEditTarget,
+    pub text: String,
+    pub cursor: usize,
+    pub selection: Option<(usize, usize)>,
+    pub caret_visible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,22 +190,22 @@ pub fn draw_sidebar_icon(cv: &Canvas, r: &RECT, color: COLORREF, a: f32, px: imp
     let oy = cy - total_h / 2;
     let outer_r = rc(ox, oy, ox + total_w, oy + total_h);
 
-    let border_w = (1.0 * s).max(1.0);
-    let radius = (3.0 * s).round() as i32;
+    let border_w = (1.8 * s).max(1.8);
+    let radius = (3.5 * s).round() as i32;
 
     // 1. Outer rounded rectangle (window frame)
     cv.stroke_round(&outer_r, radius, color, a, border_w);
 
     // 2. Vertical panel divider separating left sidebar from right content
-    let div_w = border_w.round() as i32;
+    let div_w = border_w.round().max(1.0) as i32;
     let div_x = ox + (total_w * 7 / 16);
     let top_y = oy + border_w.round() as i32;
     let bot_y = oy + total_h - border_w.round() as i32;
     cv.fill_rect(&rc(div_x, top_y, div_x + div_w.max(1), bot_y), color, a);
 
     // 3. Two content indicator marks inside the right pane
-    let dot_w = (2.5 * s).max(2.0).round() as i32;
-    let dot_h = (1.0 * s).max(1.0).round() as i32;
+    let dot_w = (3.5 * s).max(3.0).round() as i32;
+    let dot_h = border_w.round().max(1.0) as i32;
     let dot_x = ox + (total_w * 11 / 16);
     let dot1_y = oy + (total_h * 4 / 13);
     let dot2_y = oy + (total_h * 8 / 13);
@@ -184,15 +227,42 @@ pub struct TabItem {
     pub is_loaded: bool,
     /// Whether the tab audio is muted.
     pub is_muted: bool,
+    /// Animation progress from 0.0 (collapsed) to 1.0 (fully expanded).
+    pub anim_progress: f32,
+    /// Whether this tab is currently closing (animating down to 0).
+    pub is_closing: bool,
+    /// Optional folder ID if this tab belongs to a folder.
+    pub folder_id: Option<String>,
+}
+
+impl TabItem {
+    pub fn new(id: String, title: String, url: String, accent: COLORREF) -> Self {
+        Self {
+            id,
+            title,
+            url,
+            accent,
+            favicon: None,
+            is_loaded: false,
+            is_muted: false,
+            anim_progress: 1.0,
+            is_closing: false,
+            folder_id: None,
+        }
+    }
 }
 
 pub struct SidebarState {
     pub pinned: Vec<TabItem>,
+    pub folders: Vec<FolderItem>,
     pub tabs: Vec<TabItem>,
     pub active: Option<ActiveTab>,
     pub hovered: SidebarHit,
+    pub inline_edit: Option<InlineEditState>,
     /// Vertical scroll of the tab list, in physical pixels (>= 0).
     pub scroll: i32,
+    /// Vertical scroll of the top section (folders + pinned tabs), physical pixels.
+    pub scroll_top: i32,
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub zoom: f64,
@@ -209,10 +279,13 @@ impl Default for SidebarState {
     fn default() -> Self {
         Self {
             pinned: Vec::new(),
+            folders: Vec::new(),
             tabs: Vec::new(),
             active: None,
             hovered: SidebarHit::None,
+            inline_edit: None,
             scroll: 0,
+            scroll_top: 0,
             can_go_back: false,
             can_go_forward: false,
             zoom: 1.0,
@@ -539,7 +612,7 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            bg: rgb(22, 22, 26),
+            bg: rgb(18, 18, 21),
             white: rgb(255, 255, 255),
             surface_a: 0.050,
             hover_a: 0.070,
@@ -549,8 +622,8 @@ impl Theme {
             text: rgb(236, 236, 242),
             text_dim: rgb(140, 142, 154),
             accent: rgb(112, 134, 255),
-            caption_hover: rgb(45, 45, 52),
-            caption_press: rgb(60, 60, 70),
+            caption_hover: rgb(42, 42, 48),
+            caption_press: rgb(58, 58, 66),
             close_hover: rgb(196, 43, 28),
             close_press: rgb(175, 30, 18),
         }
@@ -559,6 +632,7 @@ impl Theme {
 
 // ───────────────────────────── Layout ─────────────────────────────
 
+#[derive(Clone)]
 pub struct Layout {
     pub back: RECT,
     pub forward: RECT,
@@ -568,6 +642,13 @@ pub struct Layout {
     pub pinned: Vec<RECT>,
     pub divider_y: i32,
     pub list_clip: RECT,
+    pub folders: Vec<RECT>,
+    pub folder_icons: Vec<RECT>,
+    /// Divider between the top section (folders + pinned tabs) and the normal tabs.
+    pub folder_divider: Option<RECT>,
+    /// Clip rect of the top section (folders + pinned tabs); empty when there is none.
+    pub top_clip: RECT,
+    pub top_content_h: i32,
     pub tabs: Vec<RECT>,
     pub new_tab: RECT,
     pub footer_top: i32,
@@ -575,6 +656,9 @@ pub struct Layout {
     pub settings: RECT,
     pub footer_toggle: RECT,
     pub zoom_pill: RECT,
+    pub jump_to_active_pill: Option<RECT>,
+    pub jump_target_scroll: i32,
+    pub jump_active_favicon: Option<std::sync::Arc<FaviconData>>,
     pub list_content_h: i32,
 }
 
@@ -599,11 +683,15 @@ pub fn domain_of(url: &str) -> String {
 
 pub struct SidebarRenderer {
     pub theme: Theme,
+    pub last_layout: std::cell::RefCell<Option<Layout>>,
 }
 
 impl Default for SidebarRenderer {
     fn default() -> Self {
-        Self { theme: Theme::dark() }
+        Self {
+            theme: Theme::dark(),
+            last_layout: std::cell::RefCell::new(None),
+        }
     }
 }
 
@@ -704,50 +792,174 @@ impl SidebarRenderer {
         let settings = rc(width - rp - fb, fy, width - rp, fy + fb);
         let footer_toggle = rc(0, 0, 0, 0);
 
-        // Scrollable list
+        // Scrollable area, split into two sections:
+        //   top    = folders + pinned tabs (own clip + own scroll, height capped)
+        //   bottom = "+ New Tab" + normal tabs (scrolls with `scroll`)
         let list_top = if st.pinned.is_empty() {
             url.bottom + px(12.0)
         } else {
-            divider_y + px(10.0)
+            pinned_bottom + px(10.0)
         };
-        let list_clip = rc(0, list_top, width, footer_top);
-        let row_h = px(36.0);
-        let row_gap = px(2.0);
-        let mut y = list_top - st.scroll;
-        let mut tabs = Vec::with_capacity(st.tabs.len());
-        let group = st.split_group.filter(|g| g.1 == g.0 + 1);
-        for i in 0..st.tabs.len() {
-            let row_l = lp - px(4.0);
-            let row_r = width - rp + px(4.0);
-            let mid = (row_l + row_r) / 2;
-            match group {
-                Some((a, _)) if i == a => {
-                    // first half of a split row (y not advanced)
-                    tabs.push(rc(row_l, y, mid - px(1.0), y + row_h));
-                }
-                Some((_, b)) if i == b => {
-                    tabs.push(rc(mid + px(1.0), y, row_r, y + row_h));
-                    y += row_h + row_gap;
-                }
-                _ => {
-                    tabs.push(rc(row_l, y, row_r, y + row_h));
-                    y += row_h + row_gap;
+        let avail_h = (footer_top - list_top).max(0);
+
+        let row_l = lp - px(4.0);
+        let row_r = width - rp + px(4.0);
+
+        let folder_row_h = px(38.0);
+        let folder_gap = px(2.0);
+        let full_row_h = px(34.0);
+        let full_row_gap = px(2.0);
+
+        let mut folders = Vec::with_capacity(st.folders.len());
+        let mut folder_icons = Vec::with_capacity(st.folders.len());
+        let mut tabs = vec![rc(0, 0, 0, 0); st.tabs.len()];
+
+        // ── Top section: folders (accordion) ──
+        let mut y = list_top - st.scroll_top;
+
+        for f in &st.folders {
+            let r = rc(row_l, y, row_r, y + folder_row_h);
+            let icon_w = px(28.0);
+            let icon_h = px(28.0);
+            let icon_x = row_l + px(8.0);
+            let icon_y = y + (folder_row_h - icon_h) / 2;
+            let icon_r = rc(icon_x, icon_y, icon_x + icon_w, icon_y + icon_h);
+
+            folders.push(r);
+            folder_icons.push(icon_r);
+            y += folder_row_h + folder_gap;
+
+            // Sites belonging to this folder (accordion)
+            if f.open_progress > 0.001 {
+                let ease = ease_in_out(f.open_progress);
+                let row_h = (full_row_h as f32 * ease).round() as i32;
+                let row_gap = (full_row_gap as f32 * ease).round() as i32;
+                let indent_l = row_l + px(16.0);
+
+                for (tab_idx, tab) in st.tabs.iter().enumerate() {
+                    if tab.folder_id.as_deref() == Some(&f.id) {
+                        if row_h > 0 {
+                            tabs[tab_idx] = rc(indent_l, y, row_r, y + row_h);
+                            y += row_h + row_gap;
+                        }
+                    }
                 }
             }
         }
-        let new_tab = rc(lp - px(4.0), y, width - rp + px(4.0), y + row_h);
-        let list_content_h = (y + row_h + st.scroll) - list_top;
 
-        Layout {
-            back, forward, reload, toggle_sidebar, url, zoom_pill, pinned, divider_y, list_clip, tabs, new_tab,
-            footer_top, downloads, settings, footer_toggle, list_content_h,
+        // ── Top section: pinned tabs (under the folders) ──
+        let mut any_pinned_tab = false;
+        for (i, tab_item) in st.tabs.iter().enumerate() {
+            if tab_item.folder_id.as_deref() != Some(PINNED_SECTION_ID) {
+                continue;
+            }
+            if !any_pinned_tab {
+                any_pinned_tab = true;
+                if !st.folders.is_empty() {
+                    y += px(6.0);
+                }
+            }
+            let progress = tab_item.anim_progress.clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - progress).powi(3);
+            let row_h = (full_row_h as f32 * ease).round() as i32;
+            let row_gap = (full_row_gap as f32 * ease).round() as i32;
+            tabs[i] = rc(row_l, y, row_r, y + row_h);
+            y += row_h + row_gap;
         }
+
+        // The top section never grows past half of the list area; it scrolls inside its own box.
+        let top_content_h = ((y + st.scroll_top) - list_top).max(0);
+        let max_top_h = ((avail_h as f32) * 0.5).round() as i32;
+        let top_h = top_content_h.min(max_top_h);
+        let top_clip = rc(0, list_top, width, list_top + top_h);
+
+        let (folder_divider, b_top) = if top_h > 0 {
+            let dy = list_top + top_h + px(6.0);
+            let dh = px(1.0).max(1);
+            (Some(rc(row_l, dy, row_r, dy + dh)), dy + dh + px(8.0))
+        } else {
+            (None, list_top)
+        };
+
+        // ── Bottom section: "+ New Tab" then normal tabs ──
+        let list_clip = rc(0, b_top, width, footer_top);
+        let mut y = b_top - st.scroll;
+
+        let new_tab = rc(lp - px(4.0), y, width - rp + px(4.0), y + full_row_h);
+        y += full_row_h + full_row_gap + px(4.0);
+
+        // Normal open tabs (UNDER "+ New Tab" button)
+        let group = st.split_group.filter(|g| g.1 == g.0 + 1);
+        for (i, tab_item) in st.tabs.iter().enumerate() {
+            if tab_item.folder_id.is_none() {
+                let mid = (row_l + row_r) / 2;
+                let progress = tab_item.anim_progress.clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - progress).powi(3);
+                let row_h = (full_row_h as f32 * ease).round() as i32;
+                let row_gap = (full_row_gap as f32 * ease).round() as i32;
+
+                match group {
+                    Some((a, _)) if i == a => {
+                        tabs[i] = rc(row_l, y, mid - px(1.0), y + row_h);
+                    }
+                    Some((_, b)) if i == b => {
+                        tabs[i] = rc(mid + px(1.0), y, row_r, y + row_h);
+                        y += row_h + row_gap;
+                    }
+                    _ => {
+                        tabs[i] = rc(row_l, y, row_r, y + row_h);
+                        y += row_h + row_gap;
+                    }
+                }
+            }
+        }
+
+        let list_content_h = (y + st.scroll) - b_top;
+        let max_scroll = (list_content_h - (list_clip.bottom - list_clip.top)).max(0);
+
+        let mut jump_to_active_pill = None;
+        let mut jump_target_scroll = 0;
+        let mut jump_active_favicon = None;
+
+        if let Some(ActiveTab::Tab(active_i)) = st.active {
+            if active_i < tabs.len() && active_i < st.tabs.len() && st.tabs[active_i].folder_id.is_none() {
+                let tab_r = tabs[active_i];
+                if tab_r.bottom > tab_r.top && tab_r.bottom > list_clip.bottom {
+                    let pill_w = px(58.0);
+                    let pill_h = px(28.0);
+                    let pill_x = (width - pill_w) / 2;
+                    let pill_y = footer_top - pill_h - px(8.0);
+                    jump_to_active_pill = Some(rc(pill_x, pill_y, pill_x + pill_w, pill_y + pill_h));
+
+                    let tab_unscrolled_top = tab_r.top + st.scroll;
+                    let view_h = list_clip.bottom - list_clip.top;
+                    jump_target_scroll = (tab_unscrolled_top - b_top - view_h / 2).clamp(0, max_scroll);
+                    jump_active_favicon = st.tabs[active_i].favicon.clone();
+                }
+            }
+        }
+
+        let layout = Layout {
+            back, forward, reload, toggle_sidebar, url, zoom_pill, pinned, divider_y, list_clip,
+            folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, new_tab,
+            footer_top, downloads, settings, footer_toggle,
+            jump_to_active_pill, jump_target_scroll, jump_active_favicon,
+            list_content_h,
+        };
+        self.last_layout.replace(Some(layout.clone()));
+        layout
     }
 
     /// Max valid value for `SidebarState::scroll`.
     pub fn max_scroll(&self, hwnd: HWND, height: i32, width: i32, st: &SidebarState) -> i32 {
         let l = self.compute_layout(Self::scale(hwnd), width, height, st);
         (l.list_content_h - (l.list_clip.bottom - l.list_clip.top)).max(0)
+    }
+
+    /// Max valid value for `SidebarState::scroll_top` (folders + pinned tabs section).
+    pub fn max_scroll_top(&self, hwnd: HWND, height: i32, width: i32, st: &SidebarState) -> i32 {
+        let l = self.compute_layout(Self::scale(hwnd), width, height, st);
+        (l.top_content_h - (l.top_clip.bottom - l.top_clip.top)).max(0)
     }
 
     // ───────────────────────── Hit testing ─────────────────────────
@@ -806,19 +1018,56 @@ impl SidebarRenderer {
         if contains(&l.downloads, x, y) { return SidebarHit::Downloads; }
         if contains(&l.settings, x, y) { return SidebarHit::Settings; }
         if contains(&l.footer_toggle, x, y) { return SidebarHit::ToggleSidebar; }
+        if let Some(ref pill) = l.jump_to_active_pill {
+            if contains(pill, x, y) {
+                return SidebarHit::JumpToActiveTab;
+            }
+        }
         for (i, r) in l.pinned.iter().enumerate() {
             if contains(r, x, y) { return SidebarHit::Pinned(i); }
         }
-        if contains(&l.list_clip, x, y) {
-            let cb = (20.0 * s).round() as i32;
+        let cb = (20.0 * s).round() as i32;
+        // `top_section` = folder/pinned-section tabs (top clip); otherwise normal tabs (bottom clip).
+        let hit_tab = |top_section: bool| -> Option<SidebarHit> {
             for (i, r) in l.tabs.iter().enumerate() {
+                if r.bottom <= r.top {
+                    continue;
+                }
+                let tab_item = match st.tabs.get(i) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if tab_item.folder_id.is_some() != top_section {
+                    continue;
+                }
+                if tab_item.is_closing || tab_item.anim_progress < 0.1 {
+                    continue;
+                }
                 if contains(r, x, y) {
                     let close = rc(r.right - cb - (8.0 * s) as i32, r.top + (r.bottom - r.top - cb) / 2,
                                    r.right - (8.0 * s) as i32, r.top + (r.bottom - r.top - cb) / 2 + cb);
-                    return if contains(&close, x, y) { SidebarHit::TabClose(i) } else { SidebarHit::Tab(i) };
+                    return Some(if contains(&close, x, y) { SidebarHit::TabClose(i) } else { SidebarHit::Tab(i) });
                 }
             }
+            None
+        };
+
+        if l.top_clip.bottom > l.top_clip.top && contains(&l.top_clip, x, y) {
+            for (i, r) in l.folders.iter().enumerate() {
+                if contains(r, x, y) {
+                    return SidebarHit::Folder(i);
+                }
+            }
+            if let Some(h) = hit_tab(true) {
+                return h;
+            }
+        }
+
+        if contains(&l.list_clip, x, y) {
             if contains(&l.new_tab, x, y) { return SidebarHit::NewTab; }
+            if let Some(h) = hit_tab(false) {
+                return h;
+            }
         }
         SidebarHit::None
     }
@@ -830,6 +1079,7 @@ impl SidebarRenderer {
         hwnd: HWND,
         hdc: HDC,
         sidebar_rect: RECT,
+        full_width: i32,
         st: &SidebarState,
         hovered_button: CaptionButton,
         pressed_button: CaptionButton,
@@ -839,10 +1089,11 @@ impl SidebarRenderer {
         if width <= 0 || height <= 0 {
             return;
         }
+        let layout_w = full_width.max(width);
         let t = &self.theme;
         let s = Self::scale(hwnd);
         let px = |v: f32| (v * s).round() as i32;
-        let l = self.compute_layout(s, width, height, st);
+        let l = self.compute_layout(s, layout_w, height, st);
 
         unsafe {
             // 32-bit top-down DIB so we can rasterize anti-aliased shapes ourselves.
@@ -850,11 +1101,11 @@ impl SidebarRenderer {
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
+                    biWidth: layout_w,
                     biHeight: -height,
                     biPlanes: 1,
                     biBitCount: 32,
-                    biCompression: BI_RGB.0 as u32,
+                    biCompression: BI_RGB.0,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -873,9 +1124,9 @@ impl SidebarRenderer {
             let cv = Canvas {
                 dc: mem_dc,
                 bits: bits as *mut u32,
-                w: width,
+                w: layout_w,
                 h: height,
-                clip: Cell::new(rc(0, 0, width, height)),
+                clip: Cell::new(rc(0, 0, layout_w, height)),
             };
 
             // Fonts: Segoe Fluent Icons for symbols, Segoe UI for text.
@@ -922,9 +1173,29 @@ impl SidebarRenderer {
                 Some(ActiveTab::Tab(i)) => st.tabs.get(i),
                 None => None,
             };
+            let active_url = active_item.map(|a| a.url.as_str()).unwrap_or("");
+            let is_insecure = !active_url.is_empty()
+                && !active_url.starts_with("about:")
+                && !active_url.starts_with("browser:")
+                && !active_url.starts_with("https://");
+
             SelectObject(mem_dc, icon.into());
             let lock = rc(l.url.left + px(13.0), l.url.top, l.url.left + px(31.0), l.url.bottom);
-            text(mem_dc, "\u{E72E}", lock, DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
+            let lock_col = if is_insecure { rgb(235, 87, 87) } else { t.text_dim };
+            text(mem_dc, "\u{E72E}", lock, DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, lock_col);
+
+            if is_insecure {
+                cv.sync();
+                let cx = lock.left as f32 + px(6.0) as f32;
+                let cy = (lock.top + lock.bottom) as f32 / 2.0;
+                let slash_sz = 6.5 * s;
+                let stroke = (1.6 * s).max(1.5);
+                // Subtle dark background outline around strike
+                cv.draw_line_aa(cx - slash_sz, cy + slash_sz, cx + slash_sz, cy - slash_sz, rgb(28, 28, 34), 0.85, stroke + 1.2);
+                // Crisp warning red diagonal strike line
+                cv.draw_line_aa(cx - slash_sz, cy + slash_sz, cx + slash_sz, cy - slash_sz, rgb(235, 87, 87), 1.0, stroke);
+            }
+
             SelectObject(mem_dc, ui.into());
             let label = active_item.map(|a| host_of(&a.url)).filter(|h| !h.is_empty()).unwrap_or("Search or enter address");
             let right_limit = if l.zoom_pill.right > l.zoom_pill.left {
@@ -1030,13 +1301,89 @@ impl SidebarRenderer {
                 }
             }
 
-            // Divider (soft hairline) - only shown when there are pinned tabs
-            if !st.pinned.is_empty() {
-                cv.fill_rect(&rc(px(4.0), l.divider_y, width - px(12.0), l.divider_y + 1), t.white, t.divider_a);
+            // ── Two clipped sections: top (folders + pinned tabs), bottom (New Tab + normal tabs) ──
+            for pass in 0..2 {
+            cv.reset_clip();
+            let sect_clip = if pass == 0 { l.top_clip } else { l.list_clip };
+            if sect_clip.bottom <= sect_clip.top {
+                continue;
+            }
+            cv.set_clip(sect_clip);
+
+            // Folders list
+            for (i, r) in l.folders.iter().enumerate() {
+                if pass != 0 || r.bottom < sect_clip.top || r.top > sect_clip.bottom {
+                    continue;
+                }
+                if let Some(folder) = st.folders.get(i) {
+                    let is_hover = matches!(st.hovered, SidebarHit::Folder(idx) | SidebarHit::FolderIcon(idx) if idx == i);
+                    if is_hover {
+                        cv.fill_round(r, px(6.0), t.white, t.hover_a);
+                    }
+
+                    // Folder icon badge (Image 1, 4)
+                    if let Some(ir) = l.folder_icons.get(i) {
+                        draw_folder_icon(&cv, mem_dc, ir, folder.is_open, folder.open_progress, &folder.icon, is_hover, px);
+                    }
+
+                    let is_editing = match st.inline_edit {
+                        Some(ref ed) => ed.target == InlineEditTarget::Folder(folder.id.clone()),
+                        None => false,
+                    };
+
+                    let text_x = r.left + px(44.0);
+                    let text_r = rc(text_x, r.top, r.right - px(8.0), r.bottom);
+
+                    if is_editing {
+                        let ed = st.inline_edit.as_ref().unwrap();
+                        SelectObject(mem_dc, ui_semi.into());
+                        if let Some((sel_s, sel_e)) = ed.selection {
+                            let s_idx = sel_s.min(ed.text.len());
+                            let e_idx = sel_e.min(ed.text.len());
+                            let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                            let prefix = &ed.text[..min_i];
+                            let sel_text = &ed.text[min_i..max_i];
+                            let prefix_w = text_w(mem_dc, prefix);
+                            let sel_w = text_w(mem_dc, sel_text);
+                            let max_r = text_r.right - px(4.0);
+                            let box_l = (text_x + prefix_w).min(max_r);
+                            let box_r = (text_x + prefix_w + sel_w).min(max_r);
+                            if box_r > box_l {
+                                let sel_box = rc(box_l, r.top + px(6.0), box_r, r.bottom - px(6.0));
+                                cv.fill_round(&sel_box, px(2.0), rgb(43, 108, 176), 0.95);
+                            }
+                        }
+                        text(
+                            mem_dc,
+                            &ed.text,
+                            text_r,
+                            DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
+                            rgb(255, 255, 255),
+                        );
+                        if ed.selection.is_none() && ed.caret_visible {
+                            let cursor_idx = ed.cursor.min(ed.text.len());
+                            let text_up_to_cursor = &ed.text[..cursor_idx];
+                            let cw = text_w(mem_dc, text_up_to_cursor);
+                            let caret_x = (text_x + cw).min(text_r.right - px(4.0));
+                            let caret_y0 = r.top + px(8.0);
+                            let caret_y1 = r.bottom - px(8.0);
+                            cv.fill_rect(&rc(caret_x, caret_y0, caret_x + px(1.5).max(1), caret_y1), rgb(255, 255, 255), 1.0);
+                        }
+                    } else {
+                        SelectObject(mem_dc, ui_semi.into());
+                        text(
+                            mem_dc,
+                            &folder.name,
+                            text_r,
+                            DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
+                            if is_hover { rgb(245, 245, 250) } else { rgb(220, 222, 232) },
+                        );
+                    }
+                }
             }
 
-            // ── Scrollable tab list with authentic web app icons ──
-            cv.set_clip(l.list_clip);
+            // (section divider is drawn after both clipped passes)
+
             // Stitched background for tabs that are split together
             if let Some((ga, gb)) = st.split_group.filter(|g| g.1 == g.0 + 1) {
                 if let (Some(ra), Some(rb)) = (l.tabs.get(ga), l.tabs.get(gb)) {
@@ -1048,20 +1395,34 @@ impl SidebarRenderer {
                 }
             }
             for (i, r) in l.tabs.iter().enumerate() {
-                if r.bottom < l.list_clip.top || r.top > l.list_clip.bottom {
+                if r.bottom < sect_clip.top || r.top > sect_clip.bottom {
                     continue;
                 }
+                let tab_item = &st.tabs[i];
+                if tab_item.folder_id.is_some() != (pass == 0) {
+                    continue;
+                }
+                let progress = tab_item.anim_progress.clamp(0.0, 1.0);
+                if progress <= 0.001 || (r.bottom - r.top) < px(6.0) {
+                    continue;
+                }
+                let ease = 1.0 - (1.0 - progress).powi(3);
+
                 let is_active = st.active == Some(ActiveTab::Tab(i));
                 let is_hover = matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == i);
                 if st.selected.contains(&i) {
-                    cv.fill_round(r, px(7.0), t.accent, 0.28);
-                    cv.stroke_round(r, px(7.0), t.accent, 0.8, 1.0);
+                    cv.fill_round(r, px(7.0), t.accent, 0.28 * ease);
+                    cv.stroke_round(r, px(7.0), t.accent, 0.8 * ease, 1.0);
                 }
                 if is_active {
-                    cv.fill_round(r, px(7.0), t.white, t.active_a);
-                    cv.stroke_round(r, px(7.0), t.white, t.stroke_a, 1.0);
+                    cv.fill_round(r, px(7.0), t.white, t.active_a * ease);
+                    cv.stroke_round(r, px(7.0), t.white, t.stroke_a * ease, 1.0);
                 } else if is_hover {
-                    cv.fill_round(r, px(7.0), t.white, t.hover_a);
+                    cv.fill_round(r, px(7.0), t.white, t.hover_a * ease);
+                }
+
+                if (r.bottom - r.top) < px(14.0) {
+                    continue;
                 }
 
                 let fav = px(15.0);
@@ -1088,11 +1449,60 @@ impl SidebarRenderer {
                 } else {
                     rgb(125, 130, 142) // Sleeping tab title color (subtly dimmer)
                 };
-                SelectObject(mem_dc, ui.into());
-                text(mem_dc, &st.tabs[i].title,
-                     rc(fx + fav + px(10.0), r.top, right_limit, r.bottom),
-                     DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
-                     text_color);
+
+                let is_editing = match st.inline_edit {
+                    Some(ref ed) => ed.target == InlineEditTarget::Tab(i),
+                    None => false,
+                };
+
+                let text_left = fx + fav + px(10.0);
+                let title_rect = rc(text_left, r.top, right_limit, r.bottom);
+
+                if is_editing {
+                    let ed = st.inline_edit.as_ref().unwrap();
+                    SelectObject(mem_dc, ui.into());
+                    if let Some((sel_s, sel_e)) = ed.selection {
+                        let s_idx = sel_s.min(ed.text.len());
+                        let e_idx = sel_e.min(ed.text.len());
+                        let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                        let prefix = &ed.text[..min_i];
+                        let sel_text = &ed.text[min_i..max_i];
+                        let prefix_w = text_w(mem_dc, prefix);
+                        let sel_w = text_w(mem_dc, sel_text);
+                        let max_r = right_limit - px(4.0);
+                        let box_l = (text_left + prefix_w).min(max_r);
+                        let box_r = (text_left + prefix_w + sel_w).min(max_r);
+                        if box_r > box_l {
+                            let sel_box = rc(box_l, r.top + px(6.0), box_r, r.bottom - px(6.0));
+                            cv.fill_round(&sel_box, px(2.0), rgb(43, 108, 176), 0.95);
+                        }
+                    }
+                    text(
+                        mem_dc,
+                        &ed.text,
+                        title_rect,
+                        DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
+                        rgb(255, 255, 255),
+                    );
+                    if ed.selection.is_none() && ed.caret_visible {
+                        let cursor_idx = ed.cursor.min(ed.text.len());
+                        let text_up_to_cursor = &ed.text[..cursor_idx];
+                        let cw = text_w(mem_dc, text_up_to_cursor);
+                        let caret_x = (text_left + cw).min(right_limit - px(4.0));
+                        let caret_y0 = r.top + px(8.0);
+                        let caret_y1 = r.bottom - px(8.0);
+                        cv.fill_rect(&rc(caret_x, caret_y0, caret_x + px(1.5).max(1), caret_y1), rgb(255, 255, 255), 1.0);
+                    }
+                } else {
+                    SelectObject(mem_dc, ui.into());
+                    text(
+                        mem_dc,
+                        &st.tabs[i].title,
+                        title_rect,
+                        DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
+                        text_color,
+                    );
+                }
 
                 let cy = r.top + (r.bottom - r.top - cb) / 2;
 
@@ -1113,6 +1523,7 @@ impl SidebarRenderer {
                 }
             }
 
+            if pass == 1 {
             // New tab row
             let nt = l.new_tab;
             if st.hovered == SidebarHit::NewTab {
@@ -1124,7 +1535,46 @@ impl SidebarRenderer {
             SelectObject(mem_dc, ui.into());
             text(mem_dc, "New Tab", rc(nt.left + px(42.0), nt.top, nt.right, nt.bottom),
                  DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
+            }
+            } // end section pass
             cv.reset_clip();
+
+            // Divider between the top section (folders + pinned tabs) and the normal tabs
+            if let Some(ref div) = l.folder_divider {
+                cv.fill_rect(div, rgb(255, 255, 255), 0.12);
+            }
+
+            // Floating Jump to Active Tab pill
+            if let Some(ref pill) = l.jump_to_active_pill {
+                let is_hover = st.hovered == SidebarHit::JumpToActiveTab;
+                let radius = (pill.bottom - pill.top) / 2;
+                cv.fill_round(pill, radius, rgb(30, 33, 42), 0.96);
+                cv.stroke_round(pill, radius, rgb(255, 255, 255), if is_hover { 0.38 } else { 0.20 }, 1.0);
+
+                let fav_size = px(16.0);
+                let fy = pill.top + (pill.bottom - pill.top - fav_size) / 2;
+                let fx = pill.left + px(9.0);
+                let fr = rc(fx, fy, fx + fav_size, fy + fav_size);
+
+                if let Some(ref fav) = l.jump_active_favicon {
+                    draw_favicon_to_canvas(&cv, fav, &fr);
+                } else {
+                    cv.fill_round(&fr, fav_size / 2, rgb(235, 60, 60), 0.9);
+                }
+
+                let arrow_r = rc(fx + fav_size + px(4.0), pill.top, pill.right - px(6.0), pill.bottom);
+                let arrow_font = make_font(w!("Segoe UI Symbol"), px(12.0), FW_SEMIBOLD.0 as i32, CLEARTYPE_QUALITY);
+                let old_af = SelectObject(mem_dc, arrow_font.into());
+                text(
+                    mem_dc,
+                    "\u{2193}", // Down arrow ↓
+                    arrow_r,
+                    DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
+                    if is_hover { rgb(255, 255, 255) } else { rgb(215, 218, 228) },
+                );
+                let _ = SelectObject(mem_dc, old_af);
+                let _ = DeleteObject(arrow_font.into());
+            }
 
             // ── Footer ── (top border removed, settings placed at right where sidebar button was, buttons enlarged)
             let icon_footer = make_font(w!("Segoe Fluent Icons"), px(17.0), FW_NORMAL.0 as i32, ANTIALIASED_QUALITY);
@@ -1168,35 +1618,6 @@ impl SidebarRenderer {
             text(mem_dc, max_glyph, max_r, fmt, glyph_col);
             let close_active = hovered_button == CaptionButton::Close || pressed_button == CaptionButton::Close;
             text(mem_dc, "\u{E8BB}", close_r, fmt, if close_active { rgb(255, 255, 255) } else { glyph_col });
-
-            // ── Floating Toast Notification (e.g. "Copied current URL!") matching user's image ──
-            if let Some(ref msg) = st.toast {
-                SelectObject(mem_dc, ui.into());
-                let tw = text_w(mem_dc, msg);
-                let toast_w = (tw + px(44.0)).min(width - px(24.0));
-                let toast_h = px(32.0);
-                let tx = px(4.0);
-                let cap_h = px(32.0);
-                let ty = cap_h + px(8.0);
-                let toast_r = rc(tx, ty, tx + toast_w, ty + toast_h);
-
-                // Subtle shadow
-                cv.fill_round(&rc(toast_r.left - 1, toast_r.top + 2, toast_r.right + 1, toast_r.bottom + 4), px(8.0), rgb(0, 0, 0), 0.40);
-                // Background card (Dark slate / translucent card matching image)
-                cv.fill_round(&toast_r, px(8.0), rgb(48, 52, 66), 0.98);
-                // Subtle border
-                cv.stroke_round(&toast_r, px(8.0), rgb(255, 255, 255), 0.22, 1.0);
-
-                // Share / Tray up-arrow icon (\u{E72D} in Segoe Fluent Icons)
-                SelectObject(mem_dc, icon_cap.into());
-                text(mem_dc, "\u{E72D}", rc(toast_r.left + px(8.0), toast_r.top, toast_r.left + px(28.0), toast_r.bottom),
-                     DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(200, 205, 220));
-
-                // Notification text
-                SelectObject(mem_dc, ui.into());
-                text(mem_dc, msg, rc(toast_r.left + px(28.0), toast_r.top, toast_r.right - px(8.0), toast_r.bottom),
-                     DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, rgb(240, 240, 245));
-            }
 
             // Blit + cleanup
             let _ = GdiFlush();
@@ -1390,6 +1811,48 @@ impl Canvas {
         for y in (r.top - 1)..(r.bottom + 1) {
             for x in (r.left - 1)..(r.right + 1) {
                 let cov = (0.5 - g.dist(x, y)).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend(x, y, color, a * cov);
+                }
+            }
+        }
+    }
+
+    pub fn draw_line_aa(
+        &self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        color: COLORREF,
+        a: f32,
+        width: f32,
+    ) {
+        if a <= 0.0 || width <= 0.0 {
+            return;
+        }
+        self.sync();
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq <= 0.001 {
+            return;
+        }
+        let half_w = width * 0.5;
+        let min_x = (x0.min(x1) - half_w - 1.0).floor() as i32;
+        let max_x = (x0.max(x1) + half_w + 1.0).ceil() as i32;
+        let min_y = (y0.min(y1) - half_w - 1.0).floor() as i32;
+        let max_y = (y0.max(y1) + half_w + 1.0).ceil() as i32;
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let t = (((px - x0) * dx + (py - y0) * dy) / len_sq).clamp(0.0, 1.0);
+                let qx = x0 + t * dx;
+                let qy = y0 + t * dy;
+                let dist = ((px - qx) * (px - qx) + (py - qy) * (py - qy)).sqrt();
+                let cov = (half_w + 0.5 - dist).clamp(0.0, 1.0);
                 if cov > 0.0 {
                     self.blend(x, y, color, a * cov);
                 }
@@ -1886,4 +2349,89 @@ where
     text(cv.dc, "\u{E774}", *r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, color);
     SelectObject(cv.dc, old);
     let _ = DeleteObject(icon_font.into());
+}
+
+pub fn draw_favicon_to_canvas(cv: &Canvas, fav: &FaviconData, r: &RECT) {
+    cv.draw_image_scaled_custom(r, &fav.rgba, fav.width, fav.height, 1.0, false);
+}
+
+const CLOSED_FOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><path fill="#1c1f28" stroke="#OUTLINE_COLOR#" stroke-width="1.4" stroke-linejoin="round" d="M21 15.8v-4.79c0-.683 0-1.22-.03-1.66c-.03-.444-.093-.817-.237-1.16a3.5 3.5 0 0 0-1.89-1.89c-.347-.144-.72-.206-1.16-.237c-.435-.03-.974-.03-1.66-.03h-3.81c-.657 0-.882-.005-1.08-.064a1.5 1.5 0 0 1-.517-.276c-.158-.13-.287-.314-.652-.861l-.14-.212c-.309-.462-.52-.781-.809-1.02a2.5 2.5 0 0 0-.86-.461c-.357-.108-.74-.108-1.29-.108h-1.58c-.822 0-1.47 0-1.99.042c-.532.044-.976.134-1.38.34a3.52 3.52 0 0 0-1.53 1.53c-.206.402-.297.846-.34 1.38c-.042.52-.042 1.17-.042 1.99v7.44c0 .82 0 1.47.042 1.99c.044.53.134.974.34 1.38c.335.658.87 1.19 1.53 1.53c.402.204.846.295 1.38.338c.52.043 1.17.043 1.99.043h10.5c.797 0 1.43 0 1.93-.04c.516-.042.948-.127 1.34-.322c.69-.34 1.25-.9 1.59-1.59c.193-.394.28-.826.32-1.34c.04-.506.04-1.14.04-1.93z"/></svg>"##;
+
+const OPEN_FOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><path fill="#1c1f28" stroke="#OUTLINE_COLOR#" stroke-width="1.4" stroke-linejoin="round" d="M7.87 4.06c-.196-.06-.421-.065-1.08-.065H5.3c-.848 0-1.45 0-1.93.04c-.469.038-.767.111-1.01.232a2.5 2.5 0 0 0-1.09 1.09c-.122.24-.195.536-.233 1.01c-.039.475-.04 1.08-.04 1.93v7.4c0 .849.001 1.45.04 1.93c.038.47.112.768.233 1.01c.24.47.622.854 1.09 1.09c.1.052.21.094.339.129l2.84-7.72a2.51 2.51 0 0 1 2.35-1.64h14.2c1.04 0 1.77 1.04 1.41 2.02l-2.28 6.19a3.495 3.495 0 0 1-3.28 2.29h-12.6c-.821 0-1.47 0-1.99-.043c-.531-.043-.975-.134-1.38-.34a3.52 3.52 0 0 1-1.53-1.53c-.205-.402-.296-.846-.339-1.38c-.043-.52-.043-1.17-.043-1.99v-7.44c0-.82 0-1.47.043-1.99c.043-.53.134-.974.339-1.38a3.52 3.52 0 0 1 1.53-1.53c.403-.204.847-.295 1.38-.338c.521-.043 1.17-.043 1.99-.043h1.58c.555 0 .938 0 1.29.108a2.5 2.5 0 0 1 .861.461c.288.237.5.556.808 1.02l.141.212c.365.547.493.731.652.861c.152.125.328.22.517.276c.196.06.421.065 1.08.065h3.81c.683 0 1.22 0 1.66.03c.444.03.817.093 1.16.237a3.5 3.5 0 0 1 1.89 1.89q.056.135.096.277c.085.293-.159.563-.464.563c-.25 0-.452-.187-.542-.421l-.014-.036a2.5 2.5 0 0 0-1.35-1.35c-.205-.085-.456-.136-.849-.163c-.397-.027-.902-.027-1.61-.027h-3.86c-.555 0-.938 0-1.29-.108a2.5 2.5 0 0 1-.86-.461c-.289-.237-.5-.556-.809-1.02l-.14-.212c-.366-.547-.494-.731-.653-.861a1.5 1.5 0 0 0-.517-.276z"/></svg>"##;
+
+fn render_folder_svg(raw_svg: &str, outline_color: &str, size: u32) -> Vec<u8> {
+    let svg = raw_svg.replace("#OUTLINE_COLOR#", outline_color);
+    let opt = resvg::usvg::Options::default();
+    if let Ok(rtree) = resvg::usvg::Tree::from_str(&svg, &opt) {
+        if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(size, size) {
+            let sx = size as f32 / rtree.size().width();
+            let sy = size as f32 / rtree.size().height();
+            let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
+            resvg::render(&rtree, transform, &mut pixmap.as_mut());
+            return pixmap.take();
+        }
+    }
+    Vec::new()
+}
+
+#[allow(dead_code)]
+fn draw_folder_icon_legacy(
+    cv: &Canvas,
+    dc: HDC,
+    r: &RECT,
+    is_open: bool,
+    open_progress: f32,
+    icon_str: &str,
+    is_hover: bool,
+    px: impl Fn(f32) -> i32,
+) {
+    use std::sync::OnceLock;
+    static ICONS: OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = OnceLock::new();
+    let (closed_norm, closed_hov, open_norm, open_hov) = ICONS.get_or_init(|| {
+        (
+            render_folder_svg(CLOSED_FOLDER_SVG, "#b0b5c4", 48),
+            render_folder_svg(CLOSED_FOLDER_SVG, "#ffffff", 48),
+            render_folder_svg(OPEN_FOLDER_SVG, "#b0b5c4", 48),
+            render_folder_svg(OPEN_FOLDER_SVG, "#ffffff", 48),
+        )
+    });
+
+    let use_open = open_progress >= 0.5 || is_open;
+    let rgba = match (use_open, is_hover) {
+        (false, false) => closed_norm,
+        (false, true) => closed_hov,
+        (true, false) => open_norm,
+        (true, true) => open_hov,
+    };
+
+    if !rgba.is_empty() {
+        cv.draw_image_scaled(r, rgba, 48, 48);
+    }
+
+    // Centered glyph/symbol inside folder icon
+    let trimmed = icon_str.trim();
+    if !trimmed.is_empty() && trimmed != "📁" && trimmed != "folder" {
+        let badge_size = px(13.0);
+        let bx = r.left + (r.right - r.left - badge_size) / 2;
+        let by = r.top + px(3.0) + (r.bottom - (r.top + px(3.0)) - badge_size) / 2;
+        let badge_r = rc(bx, by, bx + badge_size, by + badge_size);
+
+        if let Some(v_rgba) = crate::icon_picker::get_rendered_icon(trimmed, if is_hover { "#ffffff" } else { "#e2e6f0" }, badge_size as u32) {
+            cv.draw_image_scaled(&badge_r, &v_rgba, badge_size as u32, badge_size as u32);
+        } else {
+            let inner_font = unsafe { make_font(w!("Segoe UI Symbol"), px(9.0), FW_SEMIBOLD.0 as i32, CLEARTYPE_QUALITY) };
+            unsafe {
+                let old_f = SelectObject(dc, inner_font.into());
+                text(
+                    dc,
+                    trimmed,
+                    rc(r.left, r.top + px(3.0), r.right, r.bottom),
+                    DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
+                    if is_hover { rgb(255, 255, 255) } else { rgb(220, 222, 232) },
+                );
+                let _ = SelectObject(dc, old_f);
+                let _ = DeleteObject(inner_font.into());
+            }
+        }
+    }
 }

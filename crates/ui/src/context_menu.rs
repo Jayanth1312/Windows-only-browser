@@ -156,7 +156,6 @@ impl ContextMenu {
         let s = unsafe { GetDpiForWindow(self.hwnd) } as f32 / 96.0;
         let px = |v: f32| (v * s).round() as i32;
 
-        let m = px(16.0); // Shadow margin
         let card_w = px(240.0);
         let pad_y = px(6.0);
         let row_h = px(32.0);
@@ -171,15 +170,15 @@ impl ContextMenu {
             }
         }
 
-        let total_w = card_w + m * 2;
-        let total_h = card_h + m * 2;
+        let total_w = card_w;
+        let total_h = card_h;
 
         // Ensure menu fits on screen
         let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
         let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
 
-        let mut pos_x = screen_x - m;
-        let mut pos_y = screen_y - m;
+        let mut pos_x = screen_x;
+        let mut pos_y = screen_y;
 
         if pos_x + total_w > screen_w {
             pos_x = (screen_w - total_w).max(0);
@@ -210,18 +209,17 @@ unsafe fn item_at(hwnd: HWND, state: &RefCell<ContextMenuState>, x: i32, y: i32)
     let s = GetDpiForWindow(hwnd) as f32 / 96.0;
     let px = |v: f32| (v * s).round() as i32;
 
-    let m = px(16.0);
     let card_w = px(240.0);
     let pad_y = px(6.0);
     let row_h = px(32.0);
     let sep_h = px(9.0);
 
-    let card = rc(m, m, m + card_w, m + 2000);
+    let card = rc(0, 0, card_w, 2000);
     if x < card.left || x >= card.right {
         return None;
     }
 
-    let mut cur_y = m + pad_y;
+    let mut cur_y = pad_y;
     let st = state.borrow();
     for (i, it) in st.items.iter().enumerate() {
         if it.is_separator {
@@ -248,7 +246,6 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<ContextMenuState>) {
     let s = GetDpiForWindow(hwnd) as f32 / 96.0;
     let px = |v: f32| (v * s).round() as i32;
 
-    let m = px(16.0);
     let card_w = px(240.0);
     let pad_y = px(6.0);
     let row_h = px(32.0);
@@ -266,9 +263,9 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<ContextMenuState>) {
         }
     }
 
-    let total_w = card_w + m * 2;
-    let total_h = card_h + m * 2;
-    let card = rc(m, m, m + card_w, m + card_h);
+    let total_w = card_w;
+    let total_h = card_h;
+    let card = rc(0, 0, card_w, card_h);
 
     let hdc_screen = windows::Win32::Graphics::Gdi::GetDC(None);
     let mem_dc = CreateCompatibleDC(Some(hdc_screen));
@@ -311,8 +308,8 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<ContextMenuState>) {
         clip: Cell::new(RECT { left: 0, top: 0, right: total_w, bottom: total_h }),
     };
 
-    // 1. Charcoal dark background (Zen browser dark theme)
-    cv.fill_round(&card, px(8.0), rgb(28, 28, 32), 1.0);
+    // 1. Pure grayish-black background
+    cv.fill_round(&card, px(8.0), rgb(28, 28, 28), 1.0);
 
     // 2. Delicate 1px border
     cv.stroke_round(&card, px(8.0), rgb(255, 255, 255), 0.08, 1.0);
@@ -341,14 +338,14 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<ContextMenuState>) {
 
             let text_rect = rc(row.left + px(10.0), cur_y, row.right - px(10.0), cur_y + row_h);
             let text_color = if it.disabled {
-                rgb(105, 108, 120)
+                rgb(105, 105, 105)
             } else {
-                rgb(238, 238, 242)
+                rgb(240, 240, 240)
             };
             let sc_color = if it.disabled {
-                rgb(85, 88, 98)
+                rgb(85, 85, 85)
             } else {
-                rgb(135, 138, 148)
+                rgb(145, 145, 145)
             };
 
             text(
@@ -382,9 +379,9 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<ContextMenuState>) {
         total_h,
         &card,
         px(8.0) as f32,
-        px(6.0) as f32,
-        px(18.0) as f32,
-        0.40,
+        0.0,
+        0.0,
+        0.0,
     );
 
     let size = SIZE { cx: total_w, cy: total_h };

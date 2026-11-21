@@ -9,6 +9,7 @@ use webview2_com::{
     ContainsFullScreenElementChangedEventHandler,
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
+    ExecuteScriptCompletedHandler,
     FaviconChangedEventHandler, GetFaviconCompletedHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
@@ -44,6 +45,7 @@ pub enum BrowserShortcut {
     NavBack,
     NavForward,
     CopyUrl,
+    CopyCleanLink,
     FocusUrlBar,
     OpenSettings,
     ZoomIn,
@@ -54,6 +56,21 @@ pub enum BrowserShortcut {
     PrevTab,
     SelectTab(usize),
     ReopenClosedTab,
+    ToggleZapper,
+}
+
+#[derive(Debug, Clone)]
+pub enum ZapperMessage {
+    Zap {
+        selector: String,
+        label: String,
+        note: String,
+    },
+    Undo,
+    Status {
+        active: bool,
+    },
+    RequestCss,
 }
 
 pub fn init_com() -> Result<(), EngineError> {
@@ -366,7 +383,7 @@ const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                background: #23262f;
+                background: #1c1c1c;
                 color: #ffffff;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
                 font-size: 13px;
@@ -374,7 +391,7 @@ const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
                 line-height: 1;
                 padding: 7px 14px 7px 11px;
                 border-radius: 7px;
-                border: 1px solid rgba(255, 255, 255, 0.15);
+                border: 1px solid rgba(255, 255, 255, 0.12);
                 box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.2);
                 cursor: pointer;
                 pointer-events: auto;
@@ -398,13 +415,13 @@ const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
                 transform: translate(-50%, 0%) scale(1);
             }
             .zen-search-pill:hover {
-                background: #313543;
-                border-color: rgba(255, 255, 255, 0.26);
+                background: #282828;
+                border-color: rgba(255, 255, 255, 0.20);
                 box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55), 0 2px 5px rgba(0, 0, 0, 0.3);
             }
             .zen-search-pill:active {
                 transform: translate(-50%, -100%) scale(0.97);
-                background: #1c1e26;
+                background: #161616;
             }
             .zen-search-pill.bottom-placed:active {
                 transform: translate(-50%, 0%) scale(0.97);
@@ -556,6 +573,262 @@ const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
 })();
 "#;
 
+const ELEMENT_ZAPPER_SCRIPT: &str = r#"
+(() => {
+    if (window.__officeVeil) return;
+
+    var frame = null;
+    var tag = null;
+    var target = null;
+    var live = false;
+
+    function sheet(id) {
+        var s = document.getElementById(id);
+        if (!s) {
+            s = document.createElement('style');
+            s.id = id;
+            (document.head || document.documentElement).appendChild(s);
+        }
+        return s;
+    }
+
+    function chrome() {
+        if (frame) return frame;
+        frame = document.createElement('div');
+        frame.id = '__zapper_frame';
+        frame.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;' +
+            'border:2px solid #ff4444;background:rgba(255,68,68,0.12);' +
+            'border-radius:4px;transition:all .06s ease-out;display:none;' +
+            'box-shadow:0 0 12px rgba(255,68,68,0.35);';
+
+        tag = document.createElement('div');
+        tag.style.cssText = 'position:absolute;font:600 11px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;' +
+            'color:#ffffff;background:#181818;border:1px solid rgba(255,255,255,0.18);padding:3px 8px;' +
+            'border-radius:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' +
+            'box-shadow:0 2px 8px rgba(0,0,0,0.6);letter-spacing:0.2px;';
+
+        frame.appendChild(tag);
+        (document.body || document.documentElement).appendChild(frame);
+        return frame;
+    }
+
+    function place(el) {
+        var box = chrome();
+        var r = el.getBoundingClientRect();
+        box.style.display = 'block';
+        box.style.left = r.left + 'px';
+        box.style.top = r.top + 'px';
+        box.style.width = r.width + 'px';
+        box.style.height = r.height + 'px';
+
+        var n = name(el);
+        var s = shape(el);
+        tag.textContent = n + ' · ' + s;
+
+        // Above if room, inside top edge if flush with top
+        tag.style.top = r.top >= 28 ? '-24px' : '4px';
+        tag.style.left = Math.max(2, -r.left + 4) + 'px';
+        tag.style.maxWidth = Math.max(100, window.innerWidth - Math.max(0, r.left) - 20) + 'px';
+    }
+
+    var known = {
+        nav: 'Navigation', header: 'Header', footer: 'Footer', aside: 'Sidebar',
+        form: 'Form', dialog: 'Dialog', video: 'Video', img: 'Image',
+        button: 'Button', iframe: 'Embed', figure: 'Figure', table: 'Table',
+        section: 'Section', article: 'Article', main: 'Main'
+    };
+
+    function name(el) {
+        var said = el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title'));
+        if (said && said.trim()) return clip(said.trim(), 35);
+        var tagName = el.tagName.toLowerCase();
+        if (known[tagName]) return known[tagName];
+        var role = el.getAttribute && el.getAttribute('role');
+        if (role) return role.charAt(0).toUpperCase() + role.slice(1);
+        var text = (el.innerText || '').trim().replace(/\s+/g, ' ');
+        return text ? clip(text, 35) : tagName;
+    }
+
+    function shape(el) {
+        var r = el.getBoundingClientRect();
+        var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        var side = cx < window.innerWidth / 3 ? 'left'
+                 : (cx > window.innerWidth * 2 / 3 ? 'right' : 'center');
+        var band = cy < window.innerHeight / 3 ? 'top'
+                 : (cy > window.innerHeight * 2 / 3 ? 'bottom' : 'middle');
+        return Math.round(r.width) + '×' + Math.round(r.height) + ' · ' + band + ' ' + side;
+    }
+
+    function clip(text, n) {
+        return text.length > n ? text.slice(0, n) + '…' : text;
+    }
+
+    function steady(c) {
+        return /^[a-zA-Z][\w-]{2,29}$/.test(c) && !/\d{3,}/.test(c) &&
+               !/^(css|sc|jsx|emotion|svelte|styles?)-/.test(c);
+    }
+
+    function unique(sel) {
+        try {
+            return document.querySelectorAll(sel).length === 1;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function selectorFor(el) {
+        if (el.id && unique('#' + CSS.escape(el.id))) {
+            return '#' + CSS.escape(el.id);
+        }
+
+        var hooks = ['data-testid', 'data-test', 'data-qa', 'data-cy', 'aria-label', 'name', 'role'];
+        for (var i = 0; i < hooks.length; i++) {
+            var v = el.getAttribute && el.getAttribute(hooks[i]);
+            if (v) {
+                var s = el.tagName.toLowerCase() + '[' + hooks[i] + '="' + CSS.escape(v) + '"]';
+                if (unique(s)) return s;
+            }
+        }
+
+        var classes = (el.className && typeof el.className === 'string')
+            ? el.className.trim().split(/\s+/).filter(steady) : [];
+        if (classes.length) {
+            var byClass = el.tagName.toLowerCase() + '.' + classes.map(CSS.escape).join('.');
+            if (unique(byClass)) return byClass;
+        }
+
+        var parts = [], node = el;
+        while (node && node.nodeType === 1 && node !== document.documentElement) {
+            if (node.id && unique('#' + CSS.escape(node.id))) {
+                parts.unshift('#' + CSS.escape(node.id));
+                break;
+            }
+            var tagName = node.tagName.toLowerCase();
+            var parent = node.parentElement;
+            if (!parent) {
+                parts.unshift(tagName);
+                break;
+            }
+            var kin = Array.prototype.filter.call(parent.children, function (c) {
+                return c.tagName === node.tagName;
+            });
+            parts.unshift(kin.length > 1
+                ? tagName + ':nth-of-type(' + (kin.indexOf(node) + 1) + ')'
+                : tagName);
+            node = parent;
+        }
+        return parts.join(' > ');
+    }
+
+    function postMsg(action, selector, label, note) {
+        if (window.chrome && window.chrome.webview) {
+            window.chrome.webview.postMessage(
+                "zapper:" + action + "|||" + (selector || "") + "|||" + (label || "") + "|||" + (note || "")
+            );
+        }
+    }
+
+    function onMove(e) {
+        if (!live) return;
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        if (!el || el === frame || el === document.documentElement || el === document.body) return;
+        target = el;
+        place(el);
+    }
+
+    function swallow(e) {
+        if (!live) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+    }
+
+    function onPress(e) {
+        if (!live) return;
+        swallow(e);
+        var el = target || document.elementFromPoint(e.clientX, e.clientY);
+        if (!el || el === frame || el === document.documentElement || el === document.body) return;
+        var sel = selectorFor(el);
+        var lbl = name(el);
+        var shp = shape(el);
+
+        // Immediate visual hiding in page
+        try {
+            var curStyle = sheet('browser-zapper');
+            curStyle.textContent += '\n' + sel + ' { display: none !important; }';
+        } catch(err) {}
+
+        postMsg('zap', sel, lbl, shp);
+        target = null;
+        if (frame) frame.style.display = 'none';
+    }
+
+    function onKeyDown(e) {
+        if (!live) return;
+        if (e.key === 'Escape') {
+            window.__officeVeil.off();
+        } else if (e.key === 'z' && (e.ctrlKey || e.metaKey)) {
+            postMsg('undo');
+        }
+    }
+
+    var presses = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click',
+                   'dblclick', 'contextmenu', 'touchstart'];
+
+    window.__officeVeil = {
+        on: function () {
+            if (live) return;
+            live = true;
+            chrome();
+            document.documentElement.style.cursor = 'crosshair';
+            document.addEventListener('mousemove', onMove, true);
+            document.addEventListener('pointermove', onMove, true);
+            document.addEventListener('keydown', onKeyDown, true);
+            presses.forEach(function (kind) {
+                document.addEventListener(kind, kind === 'pointerdown' ? onPress : swallow, true);
+            });
+            postMsg('status', '', '', 'true');
+        },
+        off: function () {
+            if (!live) return;
+            live = false;
+            target = null;
+            if (frame) frame.style.display = 'none';
+            document.documentElement.style.cursor = '';
+            document.removeEventListener('mousemove', onMove, true);
+            document.removeEventListener('pointermove', onMove, true);
+            document.removeEventListener('keydown', onKeyDown, true);
+            presses.forEach(function (kind) {
+                document.removeEventListener(kind, kind === 'pointerdown' ? onPress : swallow, true);
+            });
+            postMsg('status', '', '', 'false');
+        },
+        isActive: function () {
+            return live;
+        },
+        applyRules: function (css) {
+            sheet('browser-zapper').textContent = css;
+        },
+        peek: function (css, sel) {
+            sheet('browser-zapper').textContent = css;
+            sheet('browser-peek').textContent = sel +
+                ' { outline: 2px solid #ff4444 !important; outline-offset: 2px !important; }';
+            try {
+                var el = document.querySelector(sel);
+                if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            } catch (e) {}
+        },
+        unpeek: function (css) {
+            sheet('browser-zapper').textContent = css;
+            sheet('browser-peek').textContent = '';
+        }
+    };
+
+    // Request initial site CSS on load
+    postMsg('request_css');
+})();
+"#;
+
 fn inject_default_scripts(webview: &ICoreWebView2) {
     // Inject modern minimal overlay scrollbar script into all documents
     {
@@ -616,6 +889,20 @@ fn inject_default_scripts(webview: &ICoreWebView2) {
     // Inject text selection search popup script into all documents
     {
         let script_hstring = HSTRING::from(SELECTION_SEARCH_POPUP_SCRIPT);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
+    // Inject element zapper picker script into all documents
+    {
+        let script_hstring = HSTRING::from(ELEMENT_ZAPPER_SCRIPT);
         let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
             |_res, _id| Ok(()),
         ));
@@ -791,6 +1078,7 @@ impl WebViewEngine {
         on_new_window: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_shortcut: Option<Box<dyn Fn(BrowserShortcut) + Send + 'static>>,
         on_fullscreen_changed: Option<Box<dyn Fn(bool) + Send + 'static>>,
+        on_zapper_message: Option<Box<dyn Fn(ZapperMessage) + Send + 'static>>,
     ) -> Result<WebViewController, EngineError> {
         let (controller, webview, is_spare) = if let Some((ctrl, wv)) = self.spare_controller.borrow_mut().take() {
             (ctrl, wv, true)
@@ -845,12 +1133,14 @@ impl WebViewEngine {
         let title_cb_shared = on_title_changed.map(|cb| std::sync::Arc::new(cb));
         let url_cb_shared = on_url_changed.map(|cb| std::sync::Arc::new(cb));
         let new_win_cb_shared = on_new_window.map(|cb| std::sync::Arc::new(cb));
+        let zapper_cb_shared = on_zapper_message.map(|cb| std::sync::Arc::new(cb));
 
         // Hook WebMessageReceived for dynamic SPA title updates & selection search
         {
             let meta_title_cb = title_cb_shared.clone();
             let meta_url_cb = url_cb_shared.clone();
             let search_cb = new_win_cb_shared.clone();
+            let zapper_cb = zapper_cb_shared.clone();
             let mut msg_token = 0;
             let msg_handler = WebMessageReceivedEventHandler::create(Box::new(
                 move |_sender, args| {
@@ -886,6 +1176,36 @@ impl WebViewEngine {
                                 } else if let Some(url) = msg.strip_prefix("open_tab:") {
                                     if let Some(ref cb) = search_cb {
                                         cb(url.to_string());
+                                    }
+                                } else if let Some(payload) = msg.strip_prefix("zapper:") {
+                                    let mut parts = payload.split("|||");
+                                    let action = parts.next().unwrap_or("");
+                                    match action {
+                                        "zap" => {
+                                            let selector = parts.next().unwrap_or("").to_string();
+                                            let label = parts.next().unwrap_or("").to_string();
+                                            let note = parts.next().unwrap_or("").to_string();
+                                            if let Some(ref cb) = zapper_cb {
+                                                cb(ZapperMessage::Zap { selector, label, note });
+                                            }
+                                        }
+                                        "undo" => {
+                                            if let Some(ref cb) = zapper_cb {
+                                                cb(ZapperMessage::Undo);
+                                            }
+                                        }
+                                        "status" => {
+                                            let active = parts.next().unwrap_or("false") == "true";
+                                            if let Some(ref cb) = zapper_cb {
+                                                cb(ZapperMessage::Status { active });
+                                            }
+                                        }
+                                        "request_css" => {
+                                            if let Some(ref cb) = zapper_cb {
+                                                cb(ZapperMessage::RequestCss);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -1114,7 +1434,8 @@ impl WebViewEngine {
                             if ctrl {
                                 if shift {
                                     match virtual_key {
-                                        0x43 => shortcut = Some(BrowserShortcut::CopyUrl), // 'C'
+                                        0x43 => shortcut = Some(BrowserShortcut::CopyCleanLink), // 'C' -> Copy Clean Link (Ctrl+Shift+C)
+                                        0x48 => shortcut = Some(BrowserShortcut::ToggleZapper), // 'H' -> Element Zapper!
                                         0x58 => shortcut = Some(BrowserShortcut::PinTab),  // 'X'
                                         0x52 => shortcut = Some(BrowserShortcut::HardReload), // 'R'
                                         0x09 => shortcut = Some(BrowserShortcut::PrevTab), // Tab
@@ -1330,6 +1651,11 @@ impl WebViewController {
         }
     }
 
+    pub fn get_clean_source(&self) -> Result<String, EngineError> {
+        let raw = self.get_source()?;
+        Ok(crate::clean_link::clean_url(&raw))
+    }
+
     pub fn reload(&self) -> Result<(), EngineError> {
         unsafe {
             self.webview.Reload()?;
@@ -1458,6 +1784,64 @@ impl WebViewController {
             }
         }
         false
+    }
+
+    pub fn execute_script(&self, script: &str) -> Result<(), EngineError> {
+        let script_hstring = HSTRING::from(script);
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(|_res, _str| Ok(())));
+        unsafe {
+            let _ = self.webview.ExecuteScript(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn toggle_zapper(&self) -> Result<(), EngineError> {
+        self.execute_script(
+            "if(window.__officeVeil){if(window.__officeVeil.isActive())window.__officeVeil.off();else window.__officeVeil.on();}"
+        )
+    }
+
+    pub fn set_zapper_active(&self, active: bool) -> Result<(), EngineError> {
+        let script = if active {
+            "if(window.__officeVeil){window.__officeVeil.on();}"
+        } else {
+            "if(window.__officeVeil){window.__officeVeil.off();}"
+        };
+        self.execute_script(script)
+    }
+
+    pub fn apply_zapper_rules(&self, css: &str) -> Result<(), EngineError> {
+        let escaped = css
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
+        let script = format!("if(window.__officeVeil){{window.__officeVeil.applyRules(`{}`);}}", escaped);
+        self.execute_script(&script)
+    }
+
+    pub fn peek_zapper_element(&self, css: &str, selector: &str) -> Result<(), EngineError> {
+        let escaped_css = css
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
+        let escaped_sel = selector
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
+        let script = format!("if(window.__officeVeil){{window.__officeVeil.peek(`{}`,`{}`);}}", escaped_css, escaped_sel);
+        self.execute_script(&script)
+    }
+
+    pub fn unpeek_zapper_element(&self, css: &str) -> Result<(), EngineError> {
+        let escaped = css
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace('$', "\\$");
+        let script = format!("if(window.__officeVeil){{window.__officeVeil.unpeek(`{}`);}}", escaped);
+        self.execute_script(&script)
     }
 }
 
