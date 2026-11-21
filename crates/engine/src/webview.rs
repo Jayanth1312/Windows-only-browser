@@ -15,6 +15,7 @@ use webview2_com::{
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
     ProfileAddBrowserExtensionCompletedHandler, SourceChangedEventHandler,
     TrySuspendCompletedHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
 use windows::core::{HSTRING, Interface, PCWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, RECT};
@@ -90,6 +91,8 @@ pub struct WebViewController {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     last_bounds: std::cell::Cell<(i32, i32, i32, i32)>,
+    shield_state: std::sync::Arc<crate::shield::ShieldState>,
+    current_host: std::sync::Arc<std::sync::RwLock<String>>,
 }
 
 const MODERN_SCROLLBAR_CSS_SCRIPT: &str = r#"
@@ -138,163 +141,6 @@ const MODERN_SCROLLBAR_CSS_SCRIPT: &str = r#"
         document.addEventListener('DOMContentLoaded', inject);
     } else {
         inject();
-    }
-})();
-"#;
-
-const COSMETIC_ADBLOCK_CSS_SCRIPT: &str = r#"
-(() => {
-    // Exclude YouTube so its internal player DOM & anti-adblock integrity are not disrupted
-    if (location.hostname.endsWith('youtube.com')) return;
-    const css = `
-        .adsbygoogle, [id^="google_ads_"], [id^="div-gpt-ad"], iframe[id^="google_ads_"],
-        .ad-container, .advertisement, .ad-banner, .ad-wrapper, .ad-slot,
-        .taboola-placeholder, #outbrain_widget_0, .OUTBRAIN,
-        [data-ad-unit], [data-ad-client], [data-ad-slot],
-        div[class*="SponsoredMessage"], div[class*="ad-placeholder"] {
-            display: none !important;
-            visibility: hidden !important;
-            height: 0 !important;
-            width: 0 !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-        }
-    `;
-    function inject() {
-        if (document.getElementById('__browser_adblock_cosmetic__')) return;
-        const style = document.createElement('style');
-        style.id = '__browser_adblock_cosmetic__';
-        style.textContent = css;
-        if (document.head) {
-            document.head.appendChild(style);
-        } else if (document.documentElement) {
-            document.documentElement.appendChild(style);
-        }
-    }
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', inject);
-    } else {
-        inject();
-    }
-})();
-"#;
-
-const YT_HIDE_INTERRUPTIONS_SCRIPT: &str = r#"
-(() => {
-    if (!location.hostname.endsWith('youtube.com')) return;
-
-    // 1. Defuse internal YouTube interruption & anti-adblock config flags
-    try {
-        if (window.yt && window.yt.config_) {
-            window.yt.config_.EXPERIENCE_INTERRUPTIONS_MODE = false;
-            if (window.yt.config_.EXPERIMENT_FLAGS) {
-                window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_rsp_cl = false;
-                window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_reg_app = false;
-            }
-            if (window.yt.config_.openPopupConfig && window.yt.config_.openPopupConfig.supportedPopups) {
-                window.yt.config_.openPopupConfig.supportedPopups.adBlockMessageViewModel = false;
-            }
-        }
-    } catch(e) {}
-
-    // 2. Inject anti-interruption styles immediately
-    function injectStyles() {
-        if (document.getElementById('__browser_yt_anti_interruption__')) return;
-        const style = document.createElement('style');
-        style.id = '__browser_yt_anti_interruption__';
-        style.textContent = `
-            ytd-enforcement-message-view-model,
-            tp-yt-paper-dialog:has(ytd-enforcement-message-view-model),
-            tp-yt-paper-toast:has(a[href*="3037019"]),
-            tp-yt-paper-toast:has(a[href*="check_ad_blockers"]),
-            ytd-notification-action-renderer:has(a[href*="3037019"]),
-            ytd-notification-action-renderer:has(a[href*="check_ad_blockers"]),
-            tp-yt-iron-overlay-backdrop {
-                display: none !important;
-                visibility: hidden !important;
-                opacity: 0 !important;
-                pointer-events: none !important;
-            }
-        `;
-        if (document.head) {
-            document.head.appendChild(style);
-        } else if (document.documentElement) {
-            document.documentElement.appendChild(style);
-        }
-    }
-    injectStyles();
-
-    // 3. Active dismissal and playback continuation sweep
-    function dismissInterruption() {
-        let interrupted = false;
-
-        // Auto-click any dismiss buttons if rendered
-        const dismissButtons = document.querySelectorAll(
-            'ytd-enforcement-message-view-model #dismiss-button, tp-yt-paper-toast #action-button'
-        );
-        for (const btn of dismissButtons) {
-            try { btn.click(); interrupted = true; } catch(e) {}
-        }
-
-        // Remove enforcement elements and interruption toasts from DOM
-        const popups = document.querySelectorAll(
-            'ytd-enforcement-message-view-model, tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), tp-yt-paper-toast:has(a[href*="3037019"])'
-        );
-        for (const p of popups) {
-            try { p.remove(); interrupted = true; } catch(e) {}
-        }
-
-        // Check popup container text
-        const pc = document.querySelector('ytd-popup-container');
-        if (pc && pc.textContent && pc.textContent.includes('Experiencing interruptions')) {
-            for (const el of pc.querySelectorAll('yt-notification-action-renderer, tp-yt-paper-toast, tp-yt-paper-dialog')) {
-                if (el.textContent && el.textContent.includes('Experiencing interruptions')) {
-                    try { el.remove(); interrupted = true; } catch(e) {}
-                }
-            }
-        }
-
-        // Clear backdrop overlay that traps mouse clicks
-        const backdrops = document.querySelectorAll('tp-yt-iron-overlay-backdrop');
-        for (const b of backdrops) {
-            try { b.remove(); } catch(e) {}
-        }
-
-        // Unlock scrollbars if locked
-        if (document.body && document.body.style.overflow === 'hidden') {
-            document.body.style.overflow = '';
-        }
-
-        // Resume video playback if YouTube paused it due to the interruption
-        if (interrupted) {
-            const video = document.querySelector('video');
-            if (video && video.paused) {
-                video.play().catch(() => {});
-            }
-        }
-    }
-
-    // Run sweep on mutations with debounce
-    let sweepTimer = null;
-    function scheduleSweep() {
-        if (!sweepTimer) {
-            sweepTimer = setTimeout(() => {
-                sweepTimer = null;
-                dismissInterruption();
-            }, 100);
-        }
-    }
-
-    const observer = new MutationObserver(scheduleSweep);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            injectStyles();
-            dismissInterruption();
-        });
-    } else {
-        dismissInterruption();
     }
 })();
 "#;
@@ -846,7 +692,7 @@ fn inject_default_scripts(webview: &ICoreWebView2) {
 
     // Inject instant cosmetic ad-blocking CSS script into all documents
     {
-        let script_hstring = HSTRING::from(COSMETIC_ADBLOCK_CSS_SCRIPT);
+        let script_hstring = HSTRING::from(crate::shield::COSMETIC_SHIELD_CSS_SCRIPT);
         let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
             |_res, _id| Ok(()),
         ));
@@ -858,9 +704,9 @@ fn inject_default_scripts(webview: &ICoreWebView2) {
         }
     }
 
-    // Hide YouTube's "Experiencing interruptions?" popup
+    // Inject YouTube ad stripper, 16x fast-forward skipper, and anti-interruption script
     {
-        let script_hstring = HSTRING::from(YT_HIDE_INTERRUPTIONS_SCRIPT);
+        let script_hstring = HSTRING::from(crate::shield::YOUTUBE_AD_STRIPPER_SCRIPT);
         let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
             |_res, _id| Ok(()),
         ));
@@ -1070,6 +916,7 @@ impl WebViewEngine {
         parent: HWND,
         bounds: RECT,
         initial_url: &str,
+        shield_state: Option<std::sync::Arc<crate::shield::ShieldState>>,
         on_nav_starting: Option<Box<dyn Fn() + Send + 'static>>,
         on_nav_completed: Option<Box<dyn Fn(bool) + Send + 'static>>,
         on_title_changed: Option<Box<dyn Fn(String) + Send + 'static>>,
@@ -1119,6 +966,10 @@ impl WebViewEngine {
             (controller, webview, false)
         };
 
+        let shield = shield_state.unwrap_or_else(|| std::sync::Arc::new(crate::shield::ShieldState::new()));
+        let init_host = crate::shield::extract_host(initial_url).unwrap_or_default();
+        let current_host = std::sync::Arc::new(std::sync::RwLock::new(init_host));
+
         // Set bounds and make visible
         unsafe {
             controller.SetBounds(bounds)?;
@@ -1130,6 +981,59 @@ impl WebViewEngine {
             inject_default_scripts(&webview);
         }
 
+        // Register WebResourceRequested filter for zero-latency ad & tracker blocking
+        let filter_hstring = HSTRING::from("*");
+        unsafe {
+            let _ = webview.AddWebResourceRequestedFilter(
+                PCWSTR::from_raw(filter_hstring.as_ptr()),
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            );
+        }
+
+        let env_req = self.environment.clone();
+        let shield_req = shield.clone();
+        let cur_host_req = current_host.clone();
+        let mut resource_token = 0;
+        let resource_handler = WebResourceRequestedEventHandler::create(Box::new(
+            move |_sender, args| {
+                if let Some(args) = args {
+                    if let Ok(req) = unsafe { args.Request() } {
+                        let mut uri_ptr = windows::core::PWSTR::null();
+                        if unsafe { req.Uri(&mut uri_ptr) }.is_ok() && !uri_ptr.is_null() {
+                            if let Ok(uri) = unsafe { uri_ptr.to_string() } {
+                                unsafe {
+                                    windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.as_ptr() as _));
+                                }
+                                let page_host = cur_host_req.read().map(|h| h.clone()).unwrap_or_default();
+                                let enabled = shield_req.is_enabled();
+                                let is_paused = shield_req.is_paused(&page_host);
+
+                                if crate::shield::should_block_request(&uri, &page_host, enabled, is_paused) {
+                                    let reason = HSTRING::from("Blocked by Shield");
+                                    let headers = HSTRING::from("Content-Length: 0\r\nConnection: close");
+                                    if let Ok(resp) = unsafe {
+                                        env_req.CreateWebResourceResponse(
+                                            None,
+                                            403,
+                                            PCWSTR::from_raw(reason.as_ptr()),
+                                            PCWSTR::from_raw(headers.as_ptr()),
+                                        )
+                                    } {
+                                        let _ = unsafe { args.SetResponse(&resp) };
+                                        shield_req.increment_blocked();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        ));
+        unsafe {
+            let _ = webview.add_WebResourceRequested(&resource_handler, &mut resource_token);
+        }
+
         let title_cb_shared = on_title_changed.map(|cb| std::sync::Arc::new(cb));
         let url_cb_shared = on_url_changed.map(|cb| std::sync::Arc::new(cb));
         let new_win_cb_shared = on_new_window.map(|cb| std::sync::Arc::new(cb));
@@ -1139,6 +1043,7 @@ impl WebViewEngine {
         {
             let meta_title_cb = title_cb_shared.clone();
             let meta_url_cb = url_cb_shared.clone();
+            let cur_host_meta = current_host.clone();
             let search_cb = new_win_cb_shared.clone();
             let zapper_cb = zapper_cb_shared.clone();
             let mut msg_token = 0;
@@ -1163,6 +1068,11 @@ impl WebViewEngine {
                                             }
                                         }
                                         if !u.is_empty() {
+                                            if let Some(h) = crate::shield::extract_host(u) {
+                                                if let Ok(mut lock) = cur_host_meta.write() {
+                                                    *lock = h;
+                                                }
+                                            }
                                             if let Some(ref cb) = meta_url_cb {
                                                 cb(u.to_string());
                                             }
@@ -1219,11 +1129,32 @@ impl WebViewEngine {
             }
         }
 
-        if let Some(start_cb) = on_nav_starting {
+        // Hook navigation starting to update current host and reset blocked count for new page load
+        {
+            let cur_host_nav = current_host.clone();
+            let shield_nav = shield.clone();
             let mut start_token = 0;
             let start_handler = NavigationStartingEventHandler::create(Box::new(
-                move |_sender, _args| {
-                    start_cb();
+                move |_sender, args| {
+                    if let Some(args) = args {
+                        let mut uri_ptr = windows::core::PWSTR::null();
+                        if unsafe { args.Uri(&mut uri_ptr) }.is_ok() && !uri_ptr.is_null() {
+                            if let Ok(uri) = unsafe { uri_ptr.to_string() } {
+                                unsafe {
+                                    windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.as_ptr() as _));
+                                }
+                                if let Some(h) = crate::shield::extract_host(&uri) {
+                                    if let Ok(mut lock) = cur_host_nav.write() {
+                                        *lock = h;
+                                    }
+                                }
+                                shield_nav.reset_blocked();
+                            }
+                        }
+                    }
+                    if let Some(ref start_cb) = on_nav_starting {
+                        start_cb();
+                    }
                     Ok(())
                 },
             ));
@@ -1312,6 +1243,7 @@ impl WebViewEngine {
         if let Some(cb) = url_cb_shared {
             let mut token = 0;
             let webview_clone = webview.clone();
+            let cur_host_source = current_host.clone();
             let handler = SourceChangedEventHandler::create(Box::new(
                 move |_sender, _args| {
                     let mut uri_ptr = windows::core::PWSTR::null();
@@ -1323,6 +1255,11 @@ impl WebViewEngine {
                                 windows::Win32::System::Com::CoTaskMemFree(Some(
                                     uri_ptr.as_ptr() as _,
                                 ));
+                            }
+                            if let Some(h) = crate::shield::extract_host(&uri) {
+                                if let Ok(mut lock) = cur_host_source.write() {
+                                    *lock = h;
+                                }
                             }
                             cb(uri);
                         }
@@ -1490,6 +1427,8 @@ impl WebViewEngine {
             controller,
             webview,
             last_bounds: std::cell::Cell::new((0, 0, 0, 0)),
+            shield_state: shield,
+            current_host,
         })
     }
 }
@@ -1630,6 +1569,12 @@ impl WebViewController {
     }
 
     pub fn navigate(&self, url: &str) -> Result<(), EngineError> {
+        if let Some(h) = crate::shield::extract_host(url) {
+            if let Ok(mut lock) = self.current_host.write() {
+                *lock = h;
+            }
+        }
+        self.shield_state.reset_blocked();
         let url_hstring = HSTRING::from(url);
         unsafe {
             self.webview.Navigate(PCWSTR::from_raw(url_hstring.as_ptr()))?;
@@ -1654,6 +1599,38 @@ impl WebViewController {
     pub fn get_clean_source(&self) -> Result<String, EngineError> {
         let raw = self.get_source()?;
         Ok(crate::clean_link::clean_url(&raw))
+    }
+
+    pub fn shield_state(&self) -> &std::sync::Arc<crate::shield::ShieldState> {
+        &self.shield_state
+    }
+
+    pub fn get_shield_blocked_count(&self) -> u64 {
+        self.shield_state.get_blocked_count()
+    }
+
+    pub fn reset_shield_blocked_count(&self) {
+        self.shield_state.reset_blocked();
+    }
+
+    pub fn set_shield_enabled(&self, enabled: bool) {
+        self.shield_state.set_enabled(enabled);
+    }
+
+    pub fn is_shield_enabled(&self) -> bool {
+        self.shield_state.is_enabled()
+    }
+
+    pub fn set_shield_site_paused(&self, host: &str, paused: bool) {
+        self.shield_state.set_paused(host, paused);
+    }
+
+    pub fn is_shield_site_paused(&self, host: &str) -> bool {
+        self.shield_state.is_paused(host)
+    }
+
+    pub fn get_current_host(&self) -> String {
+        self.current_host.read().map(|h| h.clone()).unwrap_or_default()
     }
 
     pub fn reload(&self) -> Result<(), EngineError> {

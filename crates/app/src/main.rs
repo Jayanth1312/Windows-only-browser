@@ -157,6 +157,8 @@ enum AppEvent {
         tab_id: String,
     },
     RestoreAllHiddenElements,
+    ToggleShield,
+    ToggleSiteShield,
 }
 
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
@@ -209,6 +211,7 @@ struct BrowserApp {
     closed_tabs: Vec<ClosedTab>,
     sidebar_before_fullscreen: Option<bool>,
     last_anim_tick: Instant,
+    shield_state: std::sync::Arc<engine::ShieldState>,
 }
 
 const UBOL_VERSION: &str = "2026.1116.1650";
@@ -498,6 +501,14 @@ impl BrowserApp {
 
         let next_tab_id = max_id_num.max(restored_tabs.len()) + 1;
 
+        let shield_enabled = storage.borrow().get_shield_enabled().unwrap_or(true);
+        let shield_paused = storage.borrow().get_all_shield_paused().unwrap_or_default();
+        let shield_state = std::sync::Arc::new(engine::ShieldState::new());
+        shield_state.set_enabled(shield_enabled);
+        for host in shield_paused {
+            shield_state.set_paused(&host, true);
+        }
+
         let mut app = Self {
             tabs: restored_tabs,
             active_tab_idx,
@@ -517,6 +528,7 @@ impl BrowserApp {
             closed_tabs: Vec::new(),
             sidebar_before_fullscreen: None,
             last_anim_tick: Instant::now(),
+            shield_state,
         };
 
         app.persist_state();
@@ -782,6 +794,7 @@ impl BrowserApp {
             self.window.hwnd(),
             content_rect,
             url,
+            Some(self.shield_state.clone()),
             Some(on_nav_start),
             Some(on_nav_complete),
             Some(on_title),
@@ -1014,6 +1027,7 @@ impl BrowserApp {
             self.window.hwnd(),
             content_rect,
             &url,
+            Some(self.shield_state.clone()),
             Some(on_nav_start),
             Some(on_nav_complete),
             Some(on_title),
@@ -1328,6 +1342,17 @@ impl BrowserApp {
 
         let has_closed = !self.closed_tabs.is_empty();
         self.window.update_sidebar_data(regular_items, pinned_items, folder_items, active, can_back, can_forward, has_closed);
+
+        let (blocked, active_host) = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+            let count = tab.controller.as_ref().map(|c| c.get_shield_blocked_count()).unwrap_or(0);
+            (count, host)
+        } else {
+            (0, String::new())
+        };
+        let enabled = self.shield_state.is_enabled();
+        let is_paused = self.shield_state.is_paused(&active_host);
+        self.window.update_shield_status(enabled, blocked, is_paused);
     }
 
     fn handle_event(&mut self, event: AppEvent) {
@@ -2290,6 +2315,44 @@ impl BrowserApp {
                     }
                 }
             }
+            AppEvent::ToggleShield => {
+                let new_enabled = !self.shield_state.is_enabled();
+                self.shield_state.set_enabled(new_enabled);
+                if let Ok(st) = self.storage.try_borrow() {
+                    let _ = st.set_shield_enabled(new_enabled);
+                }
+                let msg = if new_enabled {
+                    "Shield Active: Ad & Tracker Protection Enabled".to_string()
+                } else {
+                    "Shield Paused: Protection Disabled Globally".to_string()
+                };
+                self.window.show_toast(&msg);
+                self.sync_tabs_ui();
+            }
+            AppEvent::ToggleSiteShield => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() {
+                    self.window.show_toast("No active website to toggle Shield");
+                    return;
+                }
+                let is_currently_paused = self.shield_state.is_paused(&active_host);
+                let new_paused = !is_currently_paused;
+                self.shield_state.set_paused(&active_host, new_paused);
+                if let Ok(st) = self.storage.try_borrow() {
+                    let _ = st.set_shield_paused(&active_host, new_paused);
+                }
+                let msg = if new_paused {
+                    format!("Shield Paused for {}", active_host)
+                } else {
+                    format!("Shield Active for {}", active_host)
+                };
+                self.window.show_toast(&msg);
+                self.sync_tabs_ui();
+            }
         }
     }
 }
@@ -2394,6 +2457,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandAction::ToggleZapper => AppEvent::ToggleZapper,
                 CommandAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
                 CommandAction::CopyCleanLink => AppEvent::CopyCleanLink,
+                CommandAction::ToggleShield => AppEvent::ToggleShield,
+                CommandAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
             };
             let _ = tx_cb.send(ev);
             unsafe {
@@ -2456,6 +2521,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::SelectTabId(tid) => AppEvent::SelectTabId(tid),
             SidebarAction::ToggleZapper => AppEvent::ToggleZapper,
             SidebarAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
+            SidebarAction::ToggleShield => AppEvent::ToggleShield,
+            SidebarAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
         };
         let _ = tx_action.send(ev);
         unsafe {

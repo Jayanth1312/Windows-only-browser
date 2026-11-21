@@ -93,6 +93,8 @@ pub enum SidebarAction {
     SelectTabId(String),
     ToggleZapper,
     RestoreAllHidden,
+    ToggleShield,
+    ToggleSiteShield,
 }
 
 const TAB_ANIM_TIMER_ID: usize = 0x4203;
@@ -305,6 +307,28 @@ impl BrowserWindow {
             if active_changed {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             } else {
+                invalidate_sidebar(self.hwnd, &self.state);
+            }
+        }
+    }
+
+    pub fn update_shield_status(&self, enabled: bool, blocked_count: u64, is_paused: bool) {
+        let changed = {
+            let mut b = self.state.borrow_mut();
+            if b.sidebar_state.shield_enabled != enabled
+                || b.sidebar_state.shield_blocked_count != blocked_count
+                || b.sidebar_state.shield_paused_site != is_paused
+            {
+                b.sidebar_state.shield_enabled = enabled;
+                b.sidebar_state.shield_blocked_count = blocked_count;
+                b.sidebar_state.shield_paused_site = is_paused;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            unsafe {
                 invalidate_sidebar(self.hwnd, &self.state);
             }
         }
@@ -685,6 +709,7 @@ unsafe extern "system" fn wndproc(
                             | SidebarHit::ToggleSidebar
                             | SidebarHit::UrlBar
                             | SidebarHit::ZoomReset
+                            | SidebarHit::Shield
                             | SidebarHit::Downloads
                             | SidebarHit::Settings
                     );
@@ -950,6 +975,12 @@ unsafe extern "system" fn wndproc(
                                 cb(SidebarAction::ZoomReset);
                             }
                         }
+                        SidebarHit::Shield => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::ToggleSiteShield);
+                            }
+                        }
                         SidebarHit::ToggleSidebar => {
                             let on_action = state.borrow().on_action.clone();
                             if let Some(cb) = on_action {
@@ -1104,9 +1135,11 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
                             crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
+                            crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(13, "Element Zapper", Some("Ctrl+Shift+H")),
                             crate::context_menu::ContextMenuItem::item(14, "Restore Hidden Elements", None),
+                            crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(8, "Close Tab", Some("Ctrl+W")),
                             crate::context_menu::ContextMenuItem::item(9, "Close Other Tabs", None),
@@ -1170,6 +1203,7 @@ unsafe extern "system" fn wndproc(
                                         )),
                                         13 => cb(SidebarAction::ToggleZapper),
                                         14 => cb(SidebarAction::RestoreAllHidden),
+                                        16 => cb(SidebarAction::ToggleSiteShield),
                                         _ => {}
                                     }
                                 }
@@ -1291,6 +1325,7 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
                             crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
+                            crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(8, "Close Tab", Some("Ctrl+W")),
                             reopen_item,
@@ -1309,6 +1344,7 @@ unsafe extern "system" fn wndproc(
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::SharePinnedTab(idx)),
                                         15 => cb(SidebarAction::CopyCleanPinnedTab(idx)),
+                                        16 => cb(SidebarAction::ToggleSiteShield),
                                         8 => cb(SidebarAction::ClosePinnedTab(idx)),
                                         10 => cb(SidebarAction::ReopenClosedTab),
                                         _ => {}

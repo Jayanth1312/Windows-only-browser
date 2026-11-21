@@ -130,6 +130,11 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_history_url ON history(url);
             CREATE INDEX IF NOT EXISTS idx_history_visited ON history(visited_at DESC);
+
+            CREATE TABLE IF NOT EXISTS shield_paused (
+                host TEXT PRIMARY KEY,
+                paused_at INTEGER NOT NULL
+            );
             "#,
         )?;
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0", []);
@@ -497,6 +502,57 @@ impl Storage {
         )?;
         Ok(rows)
     }
+
+    pub fn is_shield_paused(&self, host: &str) -> Result<bool, StorageError> {
+        let norm = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare("SELECT 1 FROM shield_paused WHERE host = ?1")?;
+        let exists = stmt.exists(params![norm])?;
+        Ok(exists)
+    }
+
+    pub fn set_shield_paused(&self, host: &str, paused: bool) -> Result<(), StorageError> {
+        let norm = Self::normalize_host(host);
+        if norm.is_empty() {
+            return Ok(());
+        }
+        if paused {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            self.conn.execute(
+                "INSERT INTO shield_paused (host, paused_at) VALUES (?1, ?2) ON CONFLICT(host) DO NOTHING",
+                params![norm, now],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM shield_paused WHERE host = ?1",
+                params![norm],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_all_shield_paused(&self) -> Result<Vec<String>, StorageError> {
+        let mut stmt = self.conn.prepare("SELECT host FROM shield_paused ORDER BY host ASC")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r?);
+        }
+        Ok(result)
+    }
+
+    pub fn get_shield_enabled(&self) -> Result<bool, StorageError> {
+        match self.get_setting("shield_enabled")? {
+            Some(v) => Ok(v != "false" && v != "0"),
+            None => Ok(true),
+        }
+    }
+
+    pub fn set_shield_enabled(&self, enabled: bool) -> Result<(), StorageError> {
+        self.set_setting("shield_enabled", if enabled { "true" } else { "false" })
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +674,36 @@ mod tests {
         let cleared = storage.clear_hidden_elements("youtube.com").expect("clear");
         assert_eq!(cleared, 1);
         assert!(storage.get_hidden_elements("youtube.com").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_shield_persistence() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+
+        // Enabled by default
+        assert!(storage.get_shield_enabled().unwrap());
+
+        // Toggle global shield
+        storage.set_shield_enabled(false).unwrap();
+        assert!(!storage.get_shield_enabled().unwrap());
+        storage.set_shield_enabled(true).unwrap();
+        assert!(storage.get_shield_enabled().unwrap());
+
+        // Per-site pause
+        assert!(!storage.is_shield_paused("nytimes.com").unwrap());
+        assert!(!storage.is_shield_paused("https://www.nytimes.com/section/world").unwrap());
+
+        storage.set_shield_paused("https://www.nytimes.com", true).unwrap();
+        assert!(storage.is_shield_paused("nytimes.com").unwrap());
+        assert!(storage.is_shield_paused("www.nytimes.com").unwrap());
+
+        let paused = storage.get_all_shield_paused().unwrap();
+        assert_eq!(paused, vec!["nytimes.com"]);
+
+        // Resume / unpause
+        storage.set_shield_paused("nytimes.com", false).unwrap();
+        assert!(!storage.is_shield_paused("nytimes.com").unwrap());
+        assert!(storage.get_all_shield_paused().unwrap().is_empty());
     }
 }
 

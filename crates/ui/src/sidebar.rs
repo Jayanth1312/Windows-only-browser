@@ -52,6 +52,7 @@ pub enum SidebarHit {
     ToggleSidebar,
     UrlBar,
     ZoomReset,
+    Shield,
     Pinned(usize),
     Folder(usize),
     FolderIcon(usize),
@@ -273,6 +274,9 @@ pub struct SidebarState {
     pub split_group: Option<(usize, usize)>,
     /// Whether there are closed tabs available to reopen (Ctrl+Shift+T).
     pub has_closed_tabs: bool,
+    pub shield_enabled: bool,
+    pub shield_blocked_count: u64,
+    pub shield_paused_site: bool,
 }
 
 impl Default for SidebarState {
@@ -293,6 +297,9 @@ impl Default for SidebarState {
             selected: Vec::new(),
             split_group: None,
             has_closed_tabs: false,
+            shield_enabled: true,
+            shield_blocked_count: 0,
+            shield_paused_site: false,
         }
     }
 }
@@ -656,6 +663,7 @@ pub struct Layout {
     pub settings: RECT,
     pub footer_toggle: RECT,
     pub zoom_pill: RECT,
+    pub shield_pill: RECT,
     pub jump_to_active_pill: Option<RECT>,
     pub jump_target_scroll: i32,
     pub jump_active_favicon: Option<std::sync::Arc<FaviconData>>,
@@ -748,6 +756,20 @@ impl SidebarRenderer {
             let pill_h = px(22.0);
             let py = url.top + (px(36.0) - pill_h) / 2;
             rc(url.right - pill_w - px(8.0), py, url.right - px(8.0), py + pill_h)
+        } else {
+            rc(0, 0, 0, 0)
+        };
+
+        let shield_pill = if st.shield_blocked_count > 0 || st.shield_paused_site || !st.shield_enabled {
+            let pill_w = if !st.shield_enabled || st.shield_paused_site { px(48.0) } else { px(42.0) };
+            let pill_h = px(22.0);
+            let py = url.top + (px(36.0) - pill_h) / 2;
+            let pr = if zoom_pill.right > zoom_pill.left {
+                zoom_pill.left - px(5.0)
+            } else {
+                url.right - px(8.0)
+            };
+            rc(pr - pill_w, py, pr, py + pill_h)
         } else {
             rc(0, 0, 0, 0)
         };
@@ -940,7 +962,7 @@ impl SidebarRenderer {
         }
 
         let layout = Layout {
-            back, forward, reload, toggle_sidebar, url, zoom_pill, pinned, divider_y, list_clip,
+            back, forward, reload, toggle_sidebar, url, zoom_pill, shield_pill, pinned, divider_y, list_clip,
             folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, new_tab,
             footer_top, downloads, settings, footer_toggle,
             jump_to_active_pill, jump_target_scroll, jump_active_favicon,
@@ -1013,6 +1035,7 @@ impl SidebarRenderer {
             return SidebarHit::Caption(c);
         }
 
+        if l.shield_pill.right > l.shield_pill.left && contains(&l.shield_pill, x, y) { return SidebarHit::Shield; }
         if l.zoom_pill.right > l.zoom_pill.left && contains(&l.zoom_pill, x, y) { return SidebarHit::ZoomReset; }
         if contains(&l.url, x, y) { return SidebarHit::UrlBar; }
         if contains(&l.downloads, x, y) { return SidebarHit::Downloads; }
@@ -1198,7 +1221,9 @@ impl SidebarRenderer {
 
             SelectObject(mem_dc, ui.into());
             let label = active_item.map(|a| host_of(&a.url)).filter(|h| !h.is_empty()).unwrap_or("Search or enter address");
-            let right_limit = if l.zoom_pill.right > l.zoom_pill.left {
+            let right_limit = if l.shield_pill.right > l.shield_pill.left {
+                l.shield_pill.left - px(6.0)
+            } else if l.zoom_pill.right > l.zoom_pill.left {
                 l.zoom_pill.left - px(6.0)
             } else {
                 l.url.right - px(12.0)
@@ -1218,6 +1243,33 @@ impl SidebarRenderer {
                 text(mem_dc, &zoom_str, l.zoom_pill,
                      DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0,
                      if hov { t.text } else { rgb(200, 205, 220) });
+            }
+
+            // Shield status badge
+            if l.shield_pill.right > l.shield_pill.left {
+                let hov = st.hovered == SidebarHit::Shield;
+                let (bg_alpha, border_alpha) = if hov { (0.24, 0.35) } else { (0.12, 0.20) };
+                let is_off = !st.shield_enabled || st.shield_paused_site;
+                let accent_col = if is_off {
+                    rgb(239, 68, 68)
+                } else {
+                    rgb(56, 189, 248)
+                };
+                cv.fill_round(&l.shield_pill, px(5.0), accent_col, bg_alpha);
+                cv.stroke_round(&l.shield_pill, px(5.0), accent_col, border_alpha, 1.0);
+
+                let icon_rc = rc(l.shield_pill.left + px(3.0), l.shield_pill.top, l.shield_pill.left + px(18.0), l.shield_pill.bottom);
+                SelectObject(mem_dc, icon.into());
+                text(mem_dc, "\u{EA18}", icon_rc, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, accent_col);
+
+                let label_rc = rc(l.shield_pill.left + px(16.0), l.shield_pill.top, l.shield_pill.right - px(3.0), l.shield_pill.bottom);
+                let text_str = if is_off {
+                    "Off".to_string()
+                } else {
+                    format!("{}", st.shield_blocked_count)
+                };
+                SelectObject(mem_dc, ui_semi.into());
+                text(mem_dc, &text_str, label_rc, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, if hov { t.text } else { rgb(210, 215, 230) });
             }
 
             // ── Pinned rectangular tiles with authentic website favicons ──

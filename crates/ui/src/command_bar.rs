@@ -57,6 +57,8 @@ pub enum CommandAction {
     ToggleZapper,
     RestoreAllHidden,
     CopyCleanLink,
+    ToggleShield,
+    ToggleSiteShield,
 }
 
 #[derive(Debug, Clone)]
@@ -779,6 +781,30 @@ fn get_action_items(
             icon_glyph: 0xE8C8,
             icon_accent: rgb(52, 211, 153),
             action: CommandAction::CopyCleanLink,
+        });
+    }
+    if "shield".contains(&q_lower) || "adblock".contains(&q_lower) || "ads".contains(&q_lower) || "blocker".contains(&q_lower) || "trackers".contains(&q_lower) {
+        items.push(CommandItem {
+            primary: "Shield: Toggle Ad & Tracker Protection".to_string(),
+            secondary: "Global protection".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xEA18,
+            icon_accent: rgb(56, 189, 248),
+            action: CommandAction::ToggleShield,
+        });
+        items.push(CommandItem {
+            primary: "Shield: Toggle for Current Site".to_string(),
+            secondary: "Whitelist host".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xEA18,
+            icon_accent: rgb(245, 158, 11),
+            action: CommandAction::ToggleSiteShield,
         });
     }
 
