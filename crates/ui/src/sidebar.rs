@@ -43,6 +43,14 @@ pub enum CaptionButton {
 
 /// Everything the sidebar can be hovering / clicking on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SitePermissionKind {
+    Notifications,
+    Camera,
+    Microphone,
+    Location,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarHit {
     None,
     Caption(CaptionButton),
@@ -50,6 +58,9 @@ pub enum SidebarHit {
     Forward,
     Reload,
     ToggleSidebar,
+    CleanLinkBtn,
+    SiteSettings,
+    PermissionIcon(usize),
     UrlBar,
     ZoomReset,
     Shield,
@@ -215,6 +226,98 @@ pub fn draw_sidebar_icon(cv: &Canvas, r: &RECT, color: COLORREF, a: f32, px: imp
     cv.fill_rect(&rc(dot_x, dot2_y, dot_x + dot_w, dot2_y + dot_h), color, a);
 }
 
+pub const LINK_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>"##;
+
+pub const TUNE_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="8" x2="21" y2="8"/><circle cx="9" cy="8" r="2.6" fill="#1b1b1f" stroke="__COLOR__" stroke-width="2"/><line x1="3" y1="16" x2="21" y2="16"/><circle cx="15" cy="16" r="2.6" fill="#1b1b1f" stroke="__COLOR__" stroke-width="2"/></svg>"##;
+
+pub const BELL_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>"##;
+
+pub const CAMERA_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>"##;
+
+pub const MIC_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>"##;
+
+pub const LOCATION_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>"##;
+
+pub fn draw_svg_icon(cv: &Canvas, r: &RECT, svg: &str, color_hex: &str) {
+    let w = (r.right - r.left).max(1) as u32;
+    let h = (r.bottom - r.top).max(1) as u32;
+    let colored = svg.replace("__COLOR__", color_hex);
+    let opt = resvg::usvg::Options::default();
+    if let Ok(rtree) = resvg::usvg::Tree::from_str(&colored, &opt) {
+        if let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(w, h) {
+            let sx = w as f32 / rtree.size().width();
+            let sy = h as f32 / rtree.size().height();
+            let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
+            resvg::render(&rtree, transform, &mut pixmap.as_mut());
+            cv.draw_image_scaled(r, pixmap.data(), w, h);
+        }
+    }
+}
+
+/// Renders the sleek settings/sliders/tune icon in the search bar matching modern browser omniboxes.
+pub fn draw_tune_icon(cv: &Canvas, r: &RECT, color: COLORREF, a: f32, s: f32) {
+    let cx = (r.left + r.right) as f32 / 2.0;
+    let cy = (r.top + r.bottom) as f32 / 2.0;
+
+    let dy = 3.6 * s;
+    let y_top = cy - dy;
+    let y_bot = cy + dy;
+
+    let offset_x = 4.2 * s;
+    let cx_top = cx - offset_x;
+    let cx_bot = cx + offset_x;
+
+    let r_out = 2.4 * s;
+    let r_in = 0.9 * s;
+    let r_mid = (r_out + r_in) * 0.5;
+    let half_thick = (r_out - r_in) * 0.5;
+
+    // 1. Ring for top circle (on left)
+    let min_x_top = (cx_top - r_out - 1.0).floor() as i32;
+    let max_x_top = (cx_top + r_out + 1.0).ceil() as i32;
+    let min_y_top = (y_top - r_out - 1.0).floor() as i32;
+    let max_y_top = (y_top + r_out + 1.0).ceil() as i32;
+
+    for y in min_y_top..=max_y_top {
+        for x in min_x_top..=max_x_top {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dist = ((px - cx_top) * (px - cx_top) + (py - y_top) * (py - y_top)).sqrt();
+            let d_ring = (dist - r_mid).abs();
+            let cov = (half_thick + 0.5 - d_ring).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                cv.blend(x, y, color, a * cov);
+            }
+        }
+    }
+
+    // 2. Horizontal line for top row (extending right from top circle)
+    let line_stroke = (1.5 * s).max(1.4);
+    cv.draw_line_aa(cx_top + r_out - 0.5 * s, y_top, cx + 5.8 * s, y_top, color, a, line_stroke);
+
+    // 3. Horizontal line for bottom row (from left up to bottom circle)
+    cv.draw_line_aa(cx - 5.8 * s, y_bot, cx_bot - r_out + 0.5 * s, y_bot, color, a, line_stroke);
+
+    // 4. Ring for bottom circle (on right)
+    let min_x_bot = (cx_bot - r_out - 1.0).floor() as i32;
+    let max_x_bot = (cx_bot + r_out + 1.0).ceil() as i32;
+    let min_y_bot = (y_bot - r_out - 1.0).floor() as i32;
+    let max_y_bot = (y_bot + r_out + 1.0).ceil() as i32;
+
+    for y in min_y_bot..=max_y_bot {
+        for x in min_x_bot..=max_x_bot {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dist = ((px - cx_bot) * (px - cx_bot) + (py - y_bot) * (py - y_bot)).sqrt();
+            let d_ring = (dist - r_mid).abs();
+            let cov = (half_thick + 0.5 - d_ring).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                cv.blend(x, y, color, a * cov);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TabItem {
     pub id: String,
@@ -277,6 +380,8 @@ pub struct SidebarState {
     pub shield_enabled: bool,
     pub shield_blocked_count: u64,
     pub shield_paused_site: bool,
+    pub pending_permissions: Vec<SitePermissionKind>,
+    pub is_mouse_over_sidebar: bool,
 }
 
 impl Default for SidebarState {
@@ -300,6 +405,8 @@ impl Default for SidebarState {
             shield_enabled: true,
             shield_blocked_count: 0,
             shield_paused_site: false,
+            pending_permissions: Vec::new(),
+            is_mouse_over_sidebar: false,
         }
     }
 }
@@ -646,6 +753,9 @@ pub struct Layout {
     pub reload: RECT,
     pub toggle_sidebar: RECT,
     pub url: RECT,
+    pub clean_link_btn: RECT,
+    pub site_settings: RECT,
+    pub pending_permissions: Vec<(SitePermissionKind, RECT)>,
     pub pinned: Vec<RECT>,
     pub divider_y: i32,
     pub list_clip: RECT,
@@ -751,24 +861,43 @@ impl SidebarRenderer {
         let url_top = cap_h + px(8.0);
         let url = rc(lp, url_top, width - rp, url_top + px(36.0));
 
+        let btn_sz = px(24.0);
+        let btn_y = url.top + (px(36.0) - btn_sz) / 2;
+        let mut cur_right = url.right - px(6.0);
+
+        let mut pending_permissions = Vec::new();
+        for perm in &st.pending_permissions {
+            let r = rc(cur_right - btn_sz, btn_y, cur_right, btn_y + btn_sz);
+            cur_right = r.left - px(4.0);
+            pending_permissions.push((*perm, r));
+        }
+
+        let (site_settings, clean_link_btn) = if st.is_mouse_over_sidebar {
+            let s_r = rc(cur_right - btn_sz, btn_y, cur_right, btn_y + btn_sz);
+            cur_right = s_r.left - px(4.0);
+            let c_r = rc(cur_right - btn_sz, btn_y, cur_right, btn_y + btn_sz);
+            cur_right = c_r.left - px(4.0);
+            (s_r, c_r)
+        } else {
+            (rc(0, 0, 0, 0), rc(0, 0, 0, 0))
+        };
+
         let zoom_pill = if (st.zoom - 1.0).abs() > 0.01 {
-            let pill_w = px(54.0);
+            let pill_w = px(50.0);
             let pill_h = px(22.0);
             let py = url.top + (px(36.0) - pill_h) / 2;
-            rc(url.right - pill_w - px(8.0), py, url.right - px(8.0), py + pill_h)
+            let pr = cur_right - px(4.0);
+            cur_right = pr - pill_w;
+            rc(pr - pill_w, py, pr, py + pill_h)
         } else {
             rc(0, 0, 0, 0)
         };
 
         let shield_pill = if st.shield_blocked_count > 0 || st.shield_paused_site || !st.shield_enabled {
-            let pill_w = if !st.shield_enabled || st.shield_paused_site { px(48.0) } else { px(42.0) };
+            let pill_w = if !st.shield_enabled || st.shield_paused_site { px(46.0) } else { px(40.0) };
             let pill_h = px(22.0);
             let py = url.top + (px(36.0) - pill_h) / 2;
-            let pr = if zoom_pill.right > zoom_pill.left {
-                zoom_pill.left - px(5.0)
-            } else {
-                url.right - px(8.0)
-            };
+            let pr = cur_right - px(4.0);
             rc(pr - pill_w, py, pr, py + pill_h)
         } else {
             rc(0, 0, 0, 0)
@@ -962,7 +1091,7 @@ impl SidebarRenderer {
         }
 
         let layout = Layout {
-            back, forward, reload, toggle_sidebar, url, zoom_pill, shield_pill, pinned, divider_y, list_clip,
+            back, forward, reload, toggle_sidebar, url, clean_link_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, divider_y, list_clip,
             folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, new_tab,
             footer_top, downloads, settings, footer_toggle,
             jump_to_active_pill, jump_target_scroll, jump_active_favicon,
@@ -1035,8 +1164,13 @@ impl SidebarRenderer {
             return SidebarHit::Caption(c);
         }
 
+        for (i, (_perm, r)) in l.pending_permissions.iter().enumerate() {
+            if contains(r, x, y) { return SidebarHit::PermissionIcon(i); }
+        }
         if l.shield_pill.right > l.shield_pill.left && contains(&l.shield_pill, x, y) { return SidebarHit::Shield; }
         if l.zoom_pill.right > l.zoom_pill.left && contains(&l.zoom_pill, x, y) { return SidebarHit::ZoomReset; }
+        if contains(&l.site_settings, x, y) { return SidebarHit::SiteSettings; }
+        if contains(&l.clean_link_btn, x, y) { return SidebarHit::CleanLinkBtn; }
         if contains(&l.url, x, y) { return SidebarHit::UrlBar; }
         if contains(&l.downloads, x, y) { return SidebarHit::Downloads; }
         if contains(&l.settings, x, y) { return SidebarHit::Settings; }
@@ -1202,21 +1336,46 @@ impl SidebarRenderer {
                 && !active_url.starts_with("browser:")
                 && !active_url.starts_with("https://");
 
-            SelectObject(mem_dc, icon.into());
-            let lock = rc(l.url.left + px(13.0), l.url.top, l.url.left + px(31.0), l.url.bottom);
-            let lock_col = if is_insecure { rgb(235, 87, 87) } else { t.text_dim };
-            text(mem_dc, "\u{E72E}", lock, DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, lock_col);
+            // ── Pending Permission Buttons (e.g. Notifications Bell, Camera, Mic, Pin) ──
+            for (i, (perm, perm_r)) in l.pending_permissions.iter().enumerate() {
+                let is_perm_hov = st.hovered == SidebarHit::PermissionIcon(i);
+                if is_perm_hov {
+                    cv.fill_round(perm_r, px(5.0), t.white, 0.14);
+                }
+                let perm_hex = if is_perm_hov { "#ffffff" } else { "#e2e8f0" };
+                let svg_data = match perm {
+                    SitePermissionKind::Notifications => BELL_ICON_SVG,
+                    SitePermissionKind::Camera => CAMERA_ICON_SVG,
+                    SitePermissionKind::Microphone => MIC_ICON_SVG,
+                    SitePermissionKind::Location => LOCATION_ICON_SVG,
+                };
+                let perm_pad = px(4.0);
+                let icon_r = rc(perm_r.left + perm_pad, perm_r.top + perm_pad, perm_r.right - perm_pad, perm_r.bottom - perm_pad);
+                draw_svg_icon(&cv, &icon_r, svg_data, perm_hex);
+            }
 
-            if is_insecure {
-                cv.sync();
-                let cx = lock.left as f32 + px(6.0) as f32;
-                let cy = (lock.top + lock.bottom) as f32 / 2.0;
-                let slash_sz = 6.5 * s;
-                let stroke = (1.6 * s).max(1.5);
-                // Subtle dark background outline around strike
-                cv.draw_line_aa(cx - slash_sz, cy + slash_sz, cx + slash_sz, cy - slash_sz, rgb(28, 28, 34), 0.85, stroke + 1.2);
-                // Crisp warning red diagonal strike line
-                cv.draw_line_aa(cx - slash_sz, cy + slash_sz, cx + slash_sz, cy - slash_sz, rgb(235, 87, 87), 1.0, stroke);
+            // ── Clean Link Button (🔗) ──
+            if l.clean_link_btn.right > l.clean_link_btn.left {
+                let is_link_hov = st.hovered == SidebarHit::CleanLinkBtn;
+                if is_link_hov {
+                    cv.fill_round(&l.clean_link_btn, px(5.0), t.white, 0.14);
+                }
+                let link_hex = if is_link_hov { "#ffffff" } else { "#959bb0" };
+                let link_pad = px(4.0);
+                let link_r = rc(l.clean_link_btn.left + link_pad, l.clean_link_btn.top + link_pad, l.clean_link_btn.right - link_pad, l.clean_link_btn.bottom - link_pad);
+                draw_svg_icon(&cv, &link_r, LINK_ICON_SVG, link_hex);
+            }
+
+            // ── Settings / Site Info Tune Button (🎛️, borderless matching Zen) ──
+            if l.site_settings.right > l.site_settings.left {
+                let is_btn_hover = st.hovered == SidebarHit::SiteSettings;
+                if is_btn_hover {
+                    cv.fill_round(&l.site_settings, px(5.0), t.white, 0.14);
+                }
+                let tune_hex = if is_btn_hover { "#ffffff" } else if is_insecure { "#ef4444" } else { "#959bb0" };
+                let tune_pad = px(4.0);
+                let tune_r = rc(l.site_settings.left + tune_pad, l.site_settings.top + tune_pad, l.site_settings.right - tune_pad, l.site_settings.bottom - tune_pad);
+                draw_svg_icon(&cv, &tune_r, TUNE_ICON_SVG, tune_hex);
             }
 
             SelectObject(mem_dc, ui.into());
@@ -1225,10 +1384,16 @@ impl SidebarRenderer {
                 l.shield_pill.left - px(6.0)
             } else if l.zoom_pill.right > l.zoom_pill.left {
                 l.zoom_pill.left - px(6.0)
+            } else if l.clean_link_btn.right > l.clean_link_btn.left {
+                l.clean_link_btn.left - px(6.0)
+            } else if l.site_settings.right > l.site_settings.left {
+                l.site_settings.left - px(6.0)
+            } else if let Some((_, last_r)) = l.pending_permissions.last() {
+                last_r.left - px(6.0)
             } else {
-                l.url.right - px(12.0)
+                l.url.right - px(8.0)
             };
-            let label_rect = rc(l.url.left + px(36.0), l.url.top, right_limit, l.url.bottom);
+            let label_rect = rc(l.url.left + px(12.0), l.url.top, right_limit, l.url.bottom);
             text(mem_dc, label, label_rect,
                  DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
                  if active_item.is_some() { t.text } else { t.text_dim });

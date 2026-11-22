@@ -59,6 +59,7 @@ pub enum CommandAction {
     CopyCleanLink,
     ToggleShield,
     ToggleSiteShield,
+    ToggleSiteCard,
 }
 
 #[derive(Debug, Clone)]
@@ -805,6 +806,17 @@ fn get_action_items(
             icon_glyph: 0xEA18,
             icon_accent: rgb(245, 158, 11),
             action: CommandAction::ToggleSiteShield,
+        });
+        items.push(CommandItem {
+            primary: "Site Information & Permissions".to_string(),
+            secondary: "View security, permissions & shields".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE713,
+            icon_accent: rgb(96, 165, 250),
+            action: CommandAction::ToggleSiteCard,
         });
     }
 

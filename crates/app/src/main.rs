@@ -12,7 +12,7 @@ use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use ui::{
     accent_for_url, friendly_title_for_url, BrowserWindow, CommandAction, CommandBar,
-    CommandBarMode, SidebarAction, TabItem, WindowConfig,
+    CommandBarMode, SidebarAction, SiteCardAction, SiteCardData, TabItem, WindowConfig,
 };
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -82,6 +82,7 @@ struct Tab {
     last_active: Instant,
     anim_progress: f32,
     is_closing: bool,
+    pending_permissions: Vec<ui::SitePermissionKind>,
 }
 
 enum AppEvent {
@@ -159,6 +160,51 @@ enum AppEvent {
     RestoreAllHiddenElements,
     ToggleShield,
     ToggleSiteShield,
+    ToggleSiteCard,
+    #[allow(dead_code)]
+    ToggleSiteKeepAwake,
+    #[allow(dead_code)]
+    ToggleSiteAutoplay,
+    #[allow(dead_code)]
+    SetSitePermission { perm: String, state: u8 },
+    ClearSiteData,
+    ConfirmClearSiteData,
+    AcceptPermission(usize),
+    CaptureScreenshot,
+    ShareCurrentPage,
+}
+
+fn show_windows_share_ui(hwnd: HWND, title: &str, url: &str) -> windows::core::Result<()> {
+    use windows::ApplicationModel::DataTransfer::{DataTransferManager, DataRequestedEventArgs};
+    use windows::Win32::UI::Shell::IDataTransferManagerInterop;
+    use windows::Foundation::TypedEventHandler;
+    use windows::core::HSTRING;
+
+    unsafe {
+        let interop: IDataTransferManagerInterop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()?;
+        let dtm: DataTransferManager = interop.GetForWindow(hwnd)?;
+
+        let title_h = HSTRING::from(title);
+        let url_h = HSTRING::from(url);
+
+        let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(move |_sender, args| {
+            if let Some(args) = args.as_ref() {
+                let req = args.Request()?;
+                let data = req.Data()?;
+                let props = data.Properties()?;
+                let _ = props.SetTitle(&title_h);
+                if let Ok(uri) = windows::Foundation::Uri::CreateUri(&url_h) {
+                    let _ = data.SetWebLink(&uri);
+                }
+                let _ = data.SetText(&url_h);
+            }
+            Ok(())
+        });
+
+        let _token = dtm.DataRequested(&handler)?;
+        interop.ShowShareUIForWindow(hwnd)?;
+    }
+    Ok(())
 }
 
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
@@ -187,6 +233,40 @@ fn copy_to_clipboard(hwnd: HWND, text: &str) {
                     let _ = SetClipboardData(13 /* CF_UNICODETEXT */, Some(windows::Win32::Foundation::HANDLE(handle.0)));
                 }
             }
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+fn capture_screenshot_to_clipboard(hwnd: HWND) {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, ReleaseDC,
+            SelectObject, SRCCOPY,
+        };
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        let mut wr = RECT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut wr);
+        let w = wr.right - wr.left;
+        let h = wr.bottom - wr.top;
+        if w <= 0 || h <= 0 { return; }
+
+        let hdc_window = GetDC(Some(hwnd));
+        let hdc_mem = CreateCompatibleDC(Some(hdc_window));
+        let hbmp = CreateCompatibleBitmap(hdc_window, w, h);
+        let old_bmp = SelectObject(hdc_mem, hbmp.into());
+
+        let _ = BitBlt(hdc_mem, 0, 0, w, h, Some(hdc_window), 0, 0, SRCCOPY);
+
+        SelectObject(hdc_mem, old_bmp);
+        let _ = DeleteDC(hdc_mem);
+        let _ = ReleaseDC(Some(hwnd), hdc_window);
+
+        if OpenClipboard(Some(hwnd)).is_ok() {
+            let _ = EmptyClipboard();
+            let _ = SetClipboardData(2 /* CF_BITMAP */, Some(windows::Win32::Foundation::HANDLE(hbmp.0)));
             let _ = CloseClipboard();
         }
     }
@@ -490,6 +570,7 @@ impl BrowserApp {
                 last_active: Instant::now(),
                 anim_progress: 1.0,
                 is_closing: false,
+                pending_permissions: Vec::new(),
             });
         }
 
@@ -848,6 +929,7 @@ impl BrowserApp {
             last_active: Instant::now(),
             anim_progress: if is_pinned { 1.0 } else { 0.05 },
             is_closing: false,
+            pending_permissions: Vec::new(),
         });
 
         if !is_pinned {
@@ -1353,6 +1435,13 @@ impl BrowserApp {
         let enabled = self.shield_state.is_enabled();
         let is_paused = self.shield_state.is_paused(&active_host);
         self.window.update_shield_status(enabled, blocked, is_paused);
+
+        let pending_perms = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            tab.pending_permissions.clone()
+        } else {
+            Vec::new()
+        };
+        self.window.set_pending_permissions(pending_perms);
     }
 
     fn handle_event(&mut self, event: AppEvent) {
@@ -1490,6 +1579,7 @@ impl BrowserApp {
                             last_active: Instant::now(),
                             anim_progress: 1.0,
                             is_closing: false,
+                            pending_permissions: Vec::new(),
                         });
                         self.next_tab_id += 1;
                     }
@@ -1678,20 +1768,54 @@ impl BrowserApp {
                 let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
                 if let Some(pos) = target {
                     let tab = &self.tabs[pos];
+                    let title = if tab.title.trim().is_empty() {
+                        "Share link".to_string()
+                    } else {
+                        tab.title.clone()
+                    };
                     let live_url = tab.controller.as_ref().and_then(|c| c.get_source().ok()).unwrap_or_default();
-                    let to_copy = if !live_url.is_empty() && live_url != "about:blank" {
+                    let to_share = if !live_url.is_empty() && live_url != "about:blank" {
                         live_url
                     } else {
                         tab.url.clone()
                     };
-                    copy_to_clipboard(self.window.hwnd(), &to_copy);
-                    self.window.show_toast("Link copied to clipboard!");
+                    let clean = engine::clean_url(&to_share);
+                    if let Err(e) = show_windows_share_ui(self.window.hwnd(), &title, &clean) {
+                        tracing::warn!("Native Windows share UI failed: {:?}; copying link to clipboard", e);
+                        copy_to_clipboard(self.window.hwnd(), &clean);
+                        self.window.show_toast("Link copied to clipboard!");
+                    }
                 }
             }
             AppEvent::SharePinnedTab(idx) => {
                 if let Some(sc) = self.pinned_shortcuts.get(idx) {
-                    copy_to_clipboard(self.window.hwnd(), &sc.url);
-                    self.window.show_toast("Link copied to clipboard!");
+                    let clean = engine::clean_url(&sc.url);
+                    if let Err(e) = show_windows_share_ui(self.window.hwnd(), &sc.title, &clean) {
+                        tracing::warn!("Native Windows share UI failed: {:?}; copying link to clipboard", e);
+                        copy_to_clipboard(self.window.hwnd(), &clean);
+                        self.window.show_toast("Link copied to clipboard!");
+                    }
+                }
+            }
+            AppEvent::ShareCurrentPage => {
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    let title = if tab.title.trim().is_empty() {
+                        "Share link".to_string()
+                    } else {
+                        tab.title.clone()
+                    };
+                    let live_url = tab.controller.as_ref().and_then(|c| c.get_source().ok()).unwrap_or_default();
+                    let to_share = if !live_url.is_empty() && live_url != "about:blank" {
+                        live_url
+                    } else {
+                        tab.url.clone()
+                    };
+                    let clean = engine::clean_url(&to_share);
+                    if let Err(e) = show_windows_share_ui(self.window.hwnd(), &title, &clean) {
+                        tracing::warn!("Native Windows share UI failed: {:?}; copying link to clipboard", e);
+                        copy_to_clipboard(self.window.hwnd(), &clean);
+                        self.window.show_toast("Link copied to clipboard!");
+                    }
                 }
             }
             AppEvent::CopyCleanTab(idx) => {
@@ -1982,10 +2106,15 @@ impl BrowserApp {
                 if is_active {
                     self.window.set_loading(false, 1.0);
                 }
-                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     let domain = ui::domain_of(&tab.url);
                     if !domain.is_empty() {
+                        tab.pending_permissions.clear();
                         if let Ok(st) = self.storage.try_borrow() {
+                            let notif_perm = st.get_site_permission(&domain, "notifications").unwrap_or(0);
+                            if notif_perm == 0 && (domain.contains("youtube.com") || domain.contains("twitter.com") || domain.contains("x.com") || domain.contains("reddit.com")) {
+                                tab.pending_permissions.push(ui::SitePermissionKind::Notifications);
+                            }
                             if let Ok(css) = st.get_hidden_elements_css(&domain, None) {
                                 if !css.is_empty() {
                                     if let Some(ref ctrl) = tab.controller {
@@ -1995,6 +2124,9 @@ impl BrowserApp {
                             }
                         }
                     }
+                }
+                if is_active {
+                    self.sync_tabs_ui();
                 }
             }
             AppEvent::HardReload => {
@@ -2353,6 +2485,174 @@ impl BrowserApp {
                 self.window.show_toast(&msg);
                 self.sync_tabs_ui();
             }
+            AppEvent::ToggleSiteCard => {
+                if self.window.is_site_card_visible_or_recently_closed() {
+                    self.window.hide_site_card();
+                    return;
+                }
+                let (active_url, active_host, is_secure) = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    let host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+                    let is_sec = tab.url.starts_with("https://");
+                    (tab.url.clone(), host, is_sec)
+                } else {
+                    return;
+                };
+
+                let shield_paused = self.shield_state.is_paused(&active_host);
+                let shield_enabled = self.shield_state.is_enabled();
+                let blocked_count = self.shield_state.get_blocked_count() as u32;
+                let is_bookmarked = self.tabs.get(self.active_tab_idx).map(|t| t.is_pinned).unwrap_or(false);
+                let (hidden_count, _) = if let Ok(st) = self.storage.try_borrow() {
+                    let h_cnt = st.get_hidden_elements(&active_host).map(|l| l.len()).unwrap_or(0);
+                    (h_cnt, ())
+                } else {
+                    (0, ())
+                };
+
+                let card_data = SiteCardData {
+                    url: active_url,
+                    host: active_host,
+                    is_secure,
+                    is_bookmarked,
+                    shield_enabled,
+                    shield_paused_for_site: shield_paused,
+                    trackers_blocked_count: blocked_count,
+                    hidden_elements_count: hidden_count,
+                };
+
+                let rect = self.window.get_url_screen_rect();
+                let sender = self.event_tx.clone();
+                let main_hwnd = self.window.hwnd();
+                let on_action = Box::new(move |action: SiteCardAction| {
+                    let ev = match action {
+                        SiteCardAction::Share => AppEvent::ShareCurrentPage,
+                        SiteCardAction::Bookmark => AppEvent::TogglePinCurrentTab,
+                        SiteCardAction::LaunchElementZapper => AppEvent::ToggleZapper,
+                        SiteCardAction::Screenshot => AppEvent::CaptureScreenshot,
+                        SiteCardAction::RestoreHiddenElements => AppEvent::RestoreAllHiddenElements,
+                        SiteCardAction::ToggleShield => AppEvent::ToggleSiteShield,
+                        SiteCardAction::ClearSiteData => AppEvent::ClearSiteData,
+                        SiteCardAction::Close => return,
+                    };
+                    let _ = sender.send(ev);
+                    unsafe {
+                        let _ = PostMessageW(Some(main_hwnd), WM_APP, WPARAM(0), LPARAM(0));
+                    }
+                });
+
+                self.window.show_site_card(rect.right, rect.bottom + 4, card_data, on_action);
+            }
+            AppEvent::ToggleSiteKeepAwake => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() { return; }
+                if let Ok(st) = self.storage.try_borrow() {
+                    let current = st.get_site_keep_awake(&active_host).unwrap_or(false);
+                    let new_val = !current;
+                    let _ = st.set_site_keep_awake(&active_host, new_val);
+                    let msg = if new_val {
+                        format!("Keep Awake enabled for {}", active_host)
+                    } else {
+                        format!("Keep Awake disabled for {}", active_host)
+                    };
+                    self.window.show_toast(&msg);
+                }
+            }
+            AppEvent::ToggleSiteAutoplay => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() { return; }
+                if let Ok(st) = self.storage.try_borrow() {
+                    let current = st.get_site_autoplay(&active_host).unwrap_or(true);
+                    let new_val = !current;
+                    let _ = st.set_site_autoplay(&active_host, new_val);
+                    let msg = if new_val {
+                        format!("Sound Autoplay allowed for {}", active_host)
+                    } else {
+                        format!("Sound Autoplay blocked for {}", active_host)
+                    };
+                    self.window.show_toast(&msg);
+                }
+            }
+            AppEvent::SetSitePermission { perm, state } => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() { return; }
+                if let Ok(st) = self.storage.try_borrow() {
+                    let _ = st.set_site_permission(&active_host, &perm, state);
+                    let state_str = match state {
+                        1 => "Allowed",
+                        2 => "Blocked",
+                        _ => "Ask",
+                    };
+                    self.window.show_toast(&format!("{}: {} for {}", perm, state_str, active_host));
+                }
+            }
+            AppEvent::ClearSiteData => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() { return; }
+
+                let sender = self.event_tx.clone();
+                let main_hwnd = self.window.hwnd();
+                self.window.show_clear_data_dialog(&active_host, Box::new(move |confirmed| {
+                    if confirmed {
+                        let _ = sender.send(AppEvent::ConfirmClearSiteData);
+                        unsafe {
+                            let _ = PostMessageW(Some(main_hwnd), WM_APP, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }));
+            }
+            AppEvent::ConfirmClearSiteData => {
+                let active_host = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                if active_host.is_empty() { return; }
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref ctrl) = tab.controller {
+                        let _ = ctrl.clear_site_data(&active_host);
+                    }
+                }
+                self.window.show_toast(&format!("Cookies and site data cleared for {}", active_host));
+            }
+            AppEvent::AcceptPermission(idx) => {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                    if idx < tab.pending_permissions.len() {
+                        let perm = tab.pending_permissions.remove(idx);
+                        let host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+                        let (perm_name, label) = match perm {
+                            ui::SitePermissionKind::Notifications => ("notifications", "Notifications"),
+                            ui::SitePermissionKind::Camera => ("camera", "Camera"),
+                            ui::SitePermissionKind::Microphone => ("microphone", "Microphone"),
+                            ui::SitePermissionKind::Location => ("location", "Location"),
+                        };
+                        if let Ok(st) = self.storage.try_borrow() {
+                            let _ = st.set_site_permission(&host, perm_name, 1);
+                        }
+                        self.window.show_toast(&format!("{} allowed for {}", label, host));
+                        self.sync_tabs_ui();
+                    }
+                }
+            }
+            AppEvent::CaptureScreenshot => {
+                capture_screenshot_to_clipboard(self.window.hwnd());
+                self.window.show_toast("Screenshot copied to clipboard");
+            }
         }
     }
 }
@@ -2459,6 +2759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandAction::CopyCleanLink => AppEvent::CopyCleanLink,
                 CommandAction::ToggleShield => AppEvent::ToggleShield,
                 CommandAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
+                CommandAction::ToggleSiteCard => AppEvent::ToggleSiteCard,
             };
             let _ = tx_cb.send(ev);
             unsafe {
@@ -2523,6 +2824,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
             SidebarAction::ToggleShield => AppEvent::ToggleShield,
             SidebarAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
+            SidebarAction::ToggleSiteCard => AppEvent::ToggleSiteCard,
+            SidebarAction::AcceptPermission(idx) => AppEvent::AcceptPermission(idx),
         };
         let _ = tx_action.send(ev);
         unsafe {

@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use thiserror::Error;
 use webview2_com::{
     AcceleratorKeyPressedEventHandler, AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    ClearBrowsingDataCompletedHandler,
     ContainsFullScreenElementChangedEventHandler,
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
@@ -1565,6 +1566,93 @@ impl WebViewController {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn clear_site_data(&self, host: &str) -> Result<(), EngineError> {
+        // 1. Delete cookies via ICoreWebView2_2 CookieManager
+        if let Ok(wv2) = self.webview.cast::<ICoreWebView2_2>() {
+            unsafe {
+                if let Ok(cookie_mgr) = wv2.CookieManager() {
+                    let name_h = HSTRING::from("");
+                    let path_h = HSTRING::from("/");
+                    for domain in &[
+                        host.to_string(),
+                        format!(".{}", host.trim_start_matches('.')),
+                        format!("www.{}", host.trim_start_matches('.').trim_start_matches("www.")),
+                    ] {
+                        let domain_h = HSTRING::from(domain);
+                        let _ = cookie_mgr.DeleteCookiesWithDomainAndPath(
+                            PCWSTR::from_raw(name_h.as_ptr()),
+                            PCWSTR::from_raw(domain_h.as_ptr()),
+                            PCWSTR::from_raw(path_h.as_ptr()),
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Clear profile browsing data via ICoreWebView2Profile2
+        if let Ok(wv13) = self.webview.cast::<ICoreWebView2_13>() {
+            unsafe {
+                if let Ok(profile) = wv13.Profile() {
+                    if let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() {
+                        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_COOKIES
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_DOM_STORAGE
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_CACHE_STORAGE
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_INDEXED_DB
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_LOCAL_STORAGE
+                            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS;
+                        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(|_| Ok(())));
+                        let _ = profile2.ClearBrowsingData(kinds, &handler);
+                    }
+                }
+            }
+        }
+
+        // 3. Clear DOM storage in active page
+        let js = r#"
+            try { localStorage.clear(); } catch(e){}
+            try { sessionStorage.clear(); } catch(e){}
+            try {
+                if (window.indexedDB && indexedDB.databases) {
+                    indexedDB.databases().then(dbs => {
+                        for (let db of dbs) { try { indexedDB.deleteDatabase(db.name); } catch(e){} }
+                    }).catch(()=>{});
+                }
+            } catch(e){}
+            try {
+                if (window.caches && caches.keys) {
+                    caches.keys().then(keys => { for (let k of keys) caches.delete(k); }).catch(()=>{});
+                }
+            } catch(e){}
+            try {
+                if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+                    navigator.serviceWorker.getRegistrations().then(regs => { for (let r of regs) r.unregister(); }).catch(()=>{});
+                }
+            } catch(e){}
+            try {
+                let cookies = document.cookie.split(";");
+                for (let i = 0; i < cookies.length; i++) {
+                    let cookie = cookies[i];
+                    let eqPos = cookie.indexOf("=");
+                    let name = eqPos > -1 ? cookie.substr(0, eqPos).trim() : cookie.trim();
+                    document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
+                    document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=" + location.hostname;
+                    let parts = location.hostname.split('.');
+                    while (parts.length > 1) {
+                        document.cookie = name + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=." + parts.join('.');
+                        parts.shift();
+                    }
+                }
+            } catch(e){}
+        "#;
+        let _ = self.execute_script(js);
+
+        // 4. Reload page cleanly
+        let _ = self.reload();
+
         Ok(())
     }
 

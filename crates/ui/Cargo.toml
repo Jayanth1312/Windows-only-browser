@@ -12,3 +12,4 @@ storage = { path = "../storage" }
 engine = { path = "../engine" }
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
 resvg = "0.50.0"
+iconflow = "2.1.0"

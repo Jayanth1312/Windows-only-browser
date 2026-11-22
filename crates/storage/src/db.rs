@@ -135,6 +135,22 @@ impl Storage {
                 host TEXT PRIMARY KEY,
                 paused_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS site_permissions (
+                host TEXT NOT NULL,
+                permission TEXT NOT NULL,
+                state INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(host, permission)
+            );
+
+            CREATE TABLE IF NOT EXISTS site_settings (
+                host TEXT PRIMARY KEY,
+                zoom REAL DEFAULT 1.0,
+                keep_awake INTEGER NOT NULL DEFAULT 0,
+                autoplay INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL
+            );
             "#,
         )?;
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0", []);
@@ -553,6 +569,123 @@ impl Storage {
     pub fn set_shield_enabled(&self, enabled: bool) -> Result<(), StorageError> {
         self.set_setting("shield_enabled", if enabled { "true" } else { "false" })
     }
+
+    pub fn get_site_permission(&self, host: &str, perm: &str) -> Result<u8, StorageError> {
+        let norm = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare("SELECT state FROM site_permissions WHERE host = ?1 AND permission = ?2")?;
+        let mut rows = stmt.query(params![norm, perm])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(0) // Default: 0 = Ask
+        }
+    }
+
+    pub fn set_site_permission(&self, host: &str, perm: &str, state: u8) -> Result<(), StorageError> {
+        let norm = Self::normalize_host(host);
+        if norm.is_empty() {
+            return Ok(());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            r#"
+            INSERT INTO site_permissions (host, permission, state, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(host, permission) DO UPDATE SET
+                state = excluded.state,
+                updated_at = excluded.updated_at
+            "#,
+            params![norm, perm, state as i32, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_all_site_permissions(&self, host: &str) -> Result<std::collections::HashMap<String, u8>, StorageError> {
+        let norm = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare("SELECT permission, state FROM site_permissions WHERE host = ?1")?;
+        let rows = stmt.query_map(params![norm], |row| {
+            let perm: String = row.get(0)?;
+            let state: i32 = row.get(1)?;
+            Ok((perm, state as u8))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    pub fn get_site_keep_awake(&self, host: &str) -> Result<bool, StorageError> {
+        let norm = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare("SELECT keep_awake FROM site_settings WHERE host = ?1")?;
+        let mut rows = stmt.query(params![norm])?;
+        if let Some(row) = rows.next()? {
+            let val: i32 = row.get(0)?;
+            Ok(val != 0)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn set_site_keep_awake(&self, host: &str, keep_awake: bool) -> Result<(), StorageError> {
+        let norm = Self::normalize_host(host);
+        if norm.is_empty() {
+            return Ok(());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            r#"
+            INSERT INTO site_settings (host, keep_awake, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(host) DO UPDATE SET
+                keep_awake = excluded.keep_awake,
+                updated_at = excluded.updated_at
+            "#,
+            params![norm, if keep_awake { 1 } else { 0 }, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_site_autoplay(&self, host: &str) -> Result<bool, StorageError> {
+        let norm = Self::normalize_host(host);
+        let mut stmt = self.conn.prepare("SELECT autoplay FROM site_settings WHERE host = ?1")?;
+        let mut rows = stmt.query(params![norm])?;
+        if let Some(row) = rows.next()? {
+            let val: i32 = row.get(0)?;
+            Ok(val != 0)
+        } else {
+            Ok(true) // Autoplay allowed by default
+        }
+    }
+
+    pub fn set_site_autoplay(&self, host: &str, allow: bool) -> Result<(), StorageError> {
+        let norm = Self::normalize_host(host);
+        if norm.is_empty() {
+            return Ok(());
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            r#"
+            INSERT INTO site_settings (host, autoplay, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(host) DO UPDATE SET
+                autoplay = excluded.autoplay,
+                updated_at = excluded.updated_at
+            "#,
+            params![norm, if allow { 1 } else { 0 }, now],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +837,36 @@ mod tests {
         storage.set_shield_paused("nytimes.com", false).unwrap();
         assert!(!storage.is_shield_paused("nytimes.com").unwrap());
         assert!(storage.get_all_shield_paused().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_site_permissions_and_settings() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+
+        // Default permission is 0 (Ask)
+        assert_eq!(storage.get_site_permission("kissasian.cam", "camera").unwrap(), 0);
+        assert_eq!(storage.get_site_permission("kissasian.cam", "notifications").unwrap(), 0);
+
+        // Set permission (1 = Allow, 2 = Block)
+        storage.set_site_permission("kissasian.cam", "camera", 1).unwrap();
+        storage.set_site_permission("https://kissasian.cam/watch", "microphone", 2).unwrap();
+
+        assert_eq!(storage.get_site_permission("kissasian.cam", "camera").unwrap(), 1);
+        assert_eq!(storage.get_site_permission("kissasian.cam", "microphone").unwrap(), 2);
+
+        let perms = storage.get_all_site_permissions("kissasian.cam").unwrap();
+        assert_eq!(perms.get("camera"), Some(&1));
+        assert_eq!(perms.get("microphone"), Some(&2));
+
+        // Keep awake default is false
+        assert!(!storage.get_site_keep_awake("kissasian.cam").unwrap());
+        storage.set_site_keep_awake("kissasian.cam", true).unwrap();
+        assert!(storage.get_site_keep_awake("kissasian.cam").unwrap());
+
+        // Autoplay default is true
+        assert!(storage.get_site_autoplay("kissasian.cam").unwrap());
+        storage.set_site_autoplay("kissasian.cam", false).unwrap();
+        assert!(!storage.get_site_autoplay("kissasian.cam").unwrap());
     }
 }
 

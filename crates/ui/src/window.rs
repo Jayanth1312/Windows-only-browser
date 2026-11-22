@@ -95,6 +95,8 @@ pub enum SidebarAction {
     RestoreAllHidden,
     ToggleShield,
     ToggleSiteShield,
+    ToggleSiteCard,
+    AcceptPermission(usize),
 }
 
 const TAB_ANIM_TIMER_ID: usize = 0x4203;
@@ -143,6 +145,8 @@ struct WindowState {
     toast_overlay: Option<crate::toast::ToastOverlay>,
     folder_flyout: Option<crate::folder_flyout::FolderFlyout>,
     icon_picker: Option<crate::icon_picker::IconPicker>,
+    site_card: Option<crate::site_card::SiteCard>,
+    clear_data_dialog: Option<crate::confirm_dialog::ClearDataDialog>,
 }
 
 #[inline]
@@ -199,6 +203,8 @@ impl BrowserWindow {
                 toast_overlay: None,
                 folder_flyout: None,
                 icon_picker: None,
+                site_card: None,
+                clear_data_dialog: None,
             }));
 
             let raw_state = Rc::into_raw(state.clone()) as *mut _;
@@ -233,6 +239,12 @@ impl BrowserWindow {
 
             let picker = crate::icon_picker::IconPicker::new(hwnd).ok();
             state.borrow_mut().icon_picker = picker;
+
+            let sc = crate::site_card::SiteCard::new(hwnd).ok();
+            state.borrow_mut().site_card = sc;
+
+            let cdd = crate::confirm_dialog::ClearDataDialog::new(hwnd).ok();
+            state.borrow_mut().clear_data_dialog = cdd;
 
             Ok(Self { hwnd, state })
         }
@@ -472,10 +484,89 @@ impl BrowserWindow {
         }
     }
 
+    pub fn set_pending_permissions(&self, perms: Vec<crate::sidebar::SitePermissionKind>) {
+        self.state.borrow_mut().sidebar_state.pending_permissions = perms;
+        unsafe {
+            invalidate_sidebar(self.hwnd, &self.state);
+        }
+    }
+
     pub fn show_toast(&self, message: &str) {
         if let Some(ref t) = self.state.borrow().toast_overlay {
             t.show(message);
         }
+    }
+
+    pub fn show_site_card(
+        &self,
+        anchor_x: i32,
+        anchor_y: i32,
+        data: crate::site_card::SiteCardData,
+        on_action: Box<dyn Fn(crate::site_card::SiteCardAction)>,
+    ) {
+        if let Some(ref sc) = self.state.borrow().site_card {
+            sc.show(anchor_x, anchor_y, data, on_action);
+        }
+    }
+
+    pub fn update_site_card(&self, data: crate::site_card::SiteCardData) {
+        if let Some(ref sc) = self.state.borrow().site_card {
+            sc.update_data(data);
+        }
+    }
+
+    pub fn hide_site_card(&self) {
+        if let Some(ref sc) = self.state.borrow().site_card {
+            sc.hide();
+        }
+    }
+
+    pub fn is_site_card_visible(&self) -> bool {
+        self.state
+            .borrow()
+            .site_card
+            .as_ref()
+            .map(|sc| sc.is_visible())
+            .unwrap_or(false)
+    }
+
+    pub fn is_site_card_visible_or_recently_closed(&self) -> bool {
+        self.state
+            .borrow()
+            .site_card
+            .as_ref()
+            .map(|sc| sc.is_visible_or_recently_closed())
+            .unwrap_or(false)
+    }
+
+    pub fn show_clear_data_dialog(&self, domain: &str, on_choice: Box<dyn Fn(bool)>) {
+        if let Some(ref dlg) = self.state.borrow().clear_data_dialog {
+            dlg.show(domain, on_choice);
+        }
+    }
+
+    pub fn hide_clear_data_dialog(&self) {
+        if let Some(ref dlg) = self.state.borrow().clear_data_dialog {
+            dlg.hide();
+        }
+    }
+
+    pub fn get_url_screen_rect(&self) -> RECT {
+        let st = self.state.borrow();
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut wr);
+        }
+        let (_, sidebar_rect) = compute_layout_rects(self.hwnd, &self.state);
+        let s = SidebarRenderer::scale(self.hwnd);
+        let sw = sidebar_rect.right - sidebar_rect.left;
+        let l = st.sidebar.compute_layout(s, sw, wr.bottom - wr.top, &st.sidebar_state);
+        crate::sidebar::rc(
+            wr.left + sidebar_rect.left + l.url.left,
+            wr.top + sidebar_rect.top + l.url.top,
+            wr.left + sidebar_rect.left + l.url.right,
+            wr.top + sidebar_rect.top + l.url.bottom,
+        )
     }
 
     pub fn show(&self) {
@@ -707,6 +798,9 @@ unsafe extern "system" fn wndproc(
                             | SidebarHit::Forward
                             | SidebarHit::Reload
                             | SidebarHit::ToggleSidebar
+                            | SidebarHit::CleanLinkBtn
+                            | SidebarHit::SiteSettings
+                            | SidebarHit::PermissionIcon(_)
                             | SidebarHit::UrlBar
                             | SidebarHit::ZoomReset
                             | SidebarHit::Shield
@@ -855,9 +949,29 @@ unsafe extern "system" fn wndproc(
                 state.borrow_mut().is_tracking_mouse = true;
             }
 
+            let (_, sidebar_rect) = compute_layout_rects(hwnd, state);
+            let is_over_sidebar = x >= sidebar_rect.left && x <= sidebar_rect.right && y >= sidebar_rect.top && y <= sidebar_rect.bottom;
+            let over_changed = {
+                let mut b = state.borrow_mut();
+                if b.sidebar_state.is_mouse_over_sidebar != is_over_sidebar {
+                    b.sidebar_state.is_mouse_over_sidebar = is_over_sidebar;
+                    true
+                } else {
+                    false
+                }
+            };
+
             let hit = hit_at(hwnd, state, x, y);
-            if hit != state.borrow().sidebar_state.hovered {
-                state.borrow_mut().sidebar_state.hovered = hit;
+            let hit_changed = {
+                let mut b = state.borrow_mut();
+                if hit != b.sidebar_state.hovered {
+                    b.sidebar_state.hovered = hit;
+                    true
+                } else {
+                    false
+                }
+            };
+            if over_changed || hit_changed {
                 invalidate_sidebar(hwnd, state);
             }
             return LRESULT(0);
@@ -866,13 +980,14 @@ unsafe extern "system" fn wndproc(
             state.borrow_mut().is_tracking_mouse = false;
             let changed = {
                 let b = state.borrow();
-                b.sidebar_state.hovered != SidebarHit::None || b.pressed_hit != SidebarHit::None
+                b.sidebar_state.hovered != SidebarHit::None || b.pressed_hit != SidebarHit::None || b.sidebar_state.is_mouse_over_sidebar
             };
             if changed {
                 {
                     let mut b = state.borrow_mut();
                     b.sidebar_state.hovered = SidebarHit::None;
                     b.pressed_hit = SidebarHit::None;
+                    b.sidebar_state.is_mouse_over_sidebar = false;
                 }
                 invalidate_sidebar(hwnd, state);
             }
@@ -1003,6 +1118,24 @@ unsafe extern "system" fn wndproc(
                             let on_action = state.borrow().on_action.clone();
                             if let Some(cb) = on_action {
                                 cb(SidebarAction::NavReload);
+                            }
+                        }
+                        SidebarHit::CleanLinkBtn => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::CopyCleanLinkActive);
+                            }
+                        }
+                        SidebarHit::PermissionIcon(idx) => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::AcceptPermission(idx));
+                            }
+                        }
+                        SidebarHit::SiteSettings => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::ToggleSiteCard);
                             }
                         }
                         SidebarHit::UrlBar => {
