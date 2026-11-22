@@ -88,6 +88,7 @@ pub struct FolderItem {
 pub enum InlineEditTarget {
     Folder(String),
     Tab(usize),
+    PinnedLetter(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,59 @@ pub struct InlineEditState {
 pub enum ActiveTab {
     Pinned(usize),
     Tab(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragSource {
+    Tab(usize),
+    Pinned(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DragTarget {
+    Favorites(usize),
+    Folder(usize),
+    FolderInsert { folder_idx: usize, insert_idx: usize },
+    PinnedSection(usize),
+    NormalTabs(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabDropDestination {
+    Favorites(usize),
+    Folder(String),
+    FolderInsert { folder_id: String, insert_idx: usize },
+    PinnedSection(usize),
+    NormalTabs(usize),
+}
+
+#[derive(Debug, Clone)]
+pub struct DragCarriedItem {
+    pub title: String,
+    pub url: String,
+    pub accent: COLORREF,
+    pub favicon: Option<std::sync::Arc<FaviconData>>,
+    pub is_loaded: bool,
+    pub custom_letter: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DragState {
+    pub source: DragSource,
+    pub item: DragCarriedItem,
+    pub start_x: i32,
+    pub start_y: i32,
+    pub cur_x: i32,
+    pub cur_y: i32,
+    pub target: Option<DragTarget>,
+    pub folder_hover_start: Option<(usize, std::time::Instant)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DragCandidate {
+    pub source: DragSource,
+    pub start_x: i32,
+    pub start_y: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +391,8 @@ pub struct TabItem {
     pub is_closing: bool,
     /// Optional folder ID if this tab belongs to a folder.
     pub folder_id: Option<String>,
+    /// Optional single capital custom letter assigned to the tab.
+    pub custom_letter: Option<String>,
 }
 
 impl TabItem {
@@ -352,6 +408,7 @@ impl TabItem {
             anim_progress: 1.0,
             is_closing: false,
             folder_id: None,
+            custom_letter: None,
         }
     }
 }
@@ -382,6 +439,7 @@ pub struct SidebarState {
     pub shield_paused_site: bool,
     pub pending_permissions: Vec<SitePermissionKind>,
     pub is_mouse_over_sidebar: bool,
+    pub drag_state: Option<DragState>,
 }
 
 impl Default for SidebarState {
@@ -407,6 +465,7 @@ impl Default for SidebarState {
             shield_paused_site: false,
             pending_permissions: Vec::new(),
             is_mouse_over_sidebar: false,
+            drag_state: None,
         }
     }
 }
@@ -757,6 +816,7 @@ pub struct Layout {
     pub site_settings: RECT,
     pub pending_permissions: Vec<(SitePermissionKind, RECT)>,
     pub pinned: Vec<RECT>,
+    pub ghost_pinned: Option<RECT>,
     pub divider_y: i32,
     pub list_clip: RECT,
     pub folders: Vec<RECT>,
@@ -903,32 +963,82 @@ impl SidebarRenderer {
             rc(0, 0, 0, 0)
         };
 
-        // Pinned grid (Dynamic columns matching Zen: 1 pinned -> full width, 2 pinned -> 2 columns, >=3 pinned -> 3 columns)
+        // Pinned grid (Dynamic columns: up to 4 tabs fit in 1 row; 5+ tabs split into 3-column rows)
         let total_pinned = st.pinned.len();
-        let cols = match total_pinned {
-            0 | 1 => 1,
-            2 => 2,
-            _ => 3,
-        };
         let gap = px(8.0);
-        let tile_w = if cols == 1 {
-            width - lp - rp
-        } else {
-            (width - lp - rp - gap * (cols - 1)) / cols
-        };
         let tile_h = px(44.0);
         let pinned_top = url.bottom + px(12.0);
-        let pinned: Vec<RECT> = (0..total_pinned as i32)
-            .map(|i| {
-                let (c, r) = (i % cols, i / cols);
-                let l = lp + c * (tile_w + gap);
-                let t = pinned_top + r * (tile_h + gap);
-                rc(l, t, l + tile_w, t + tile_h)
-            })
-            .collect();
-        let pinned_bottom = pinned.last().map(|r| r.bottom).unwrap_or(url.bottom);
 
-        let divider_y = if st.pinned.is_empty() {
+        let calc_pinned_cells = |count: usize| -> Vec<RECT> {
+            if count == 0 {
+                return Vec::new();
+            }
+            let cols = if count <= 4 {
+                count.max(1)
+            } else {
+                3
+            };
+            let tile_w = ((width - lp - rp - gap * (cols as i32 - 1)) / (cols as i32)).max(20);
+            (0..count as i32)
+                .map(|i| {
+                    let (c, r) = if count <= 4 {
+                        (i, 0)
+                    } else {
+                        (i % 3, i / 3)
+                    };
+                    let l = lp + c * (tile_w + gap);
+                    let t = pinned_top + r * (tile_h + gap);
+                    rc(l, t, l + tile_w, t + tile_h)
+                })
+                .collect::<Vec<RECT>>()
+        };
+
+        let mut ghost_pinned: Option<RECT> = None;
+        let mut pinned: Vec<RECT> = vec![rc(0, 0, 0, 0); total_pinned];
+
+        // Check if there is an active drag targeting the Favorites grid -> shift existing tabs sideways
+        if let Some(ref drag) = st.drag_state {
+            if let Some(DragTarget::Favorites(target_slot)) = drag.target {
+                match drag.source {
+                    DragSource::Pinned(fav_idx) => {
+                        let all_cells = calc_pinned_cells(total_pinned);
+                        let s = target_slot.min(total_pinned.saturating_sub(1));
+                        let other_indices: Vec<usize> = (0..total_pinned).filter(|&j| j != fav_idx).collect();
+                        for (k, &orig_i) in other_indices.iter().enumerate() {
+                            let cell_idx = if k < s { k } else { k + 1 };
+                            if cell_idx < all_cells.len() {
+                                pinned[orig_i] = all_cells[cell_idx];
+                            }
+                        }
+                        if s < all_cells.len() {
+                            pinned[fav_idx] = all_cells[s];
+                            ghost_pinned = Some(all_cells[s]);
+                        }
+                    }
+                    DragSource::Tab(_) => {
+                        let all_cells = calc_pinned_cells(total_pinned + 1);
+                        let s = target_slot.min(total_pinned);
+                        for i in 0..total_pinned {
+                            let cell_idx = if i < s { i } else { i + 1 };
+                            if cell_idx < all_cells.len() {
+                                pinned[i] = all_cells[cell_idx];
+                            }
+                        }
+                        if s < all_cells.len() {
+                            ghost_pinned = Some(all_cells[s]);
+                        }
+                    }
+                }
+            } else {
+                pinned = calc_pinned_cells(total_pinned);
+            }
+        } else {
+            pinned = calc_pinned_cells(total_pinned);
+        }
+
+        let pinned_bottom = pinned.iter().chain(ghost_pinned.as_ref()).map(|r| r.bottom).max().unwrap_or(url.bottom);
+
+        let divider_y = if st.pinned.is_empty() && ghost_pinned.is_none() {
             url.bottom
         } else {
             pinned_bottom + px(14.0)
@@ -943,15 +1053,13 @@ impl SidebarRenderer {
         let settings = rc(width - rp - fb, fy, width - rp, fy + fb);
         let footer_toggle = rc(0, 0, 0, 0);
 
-        // Scrollable area, split into two sections:
-        //   top    = folders + pinned tabs (own clip + own scroll, height capped)
-        //   bottom = "+ New Tab" + normal tabs (scrolls with `scroll`)
-        let list_top = if st.pinned.is_empty() {
+        // Unified scrollable area below the fixed Favorites grid:
+        // Folders, Pinned tabs, "+ New Tab", and Normal tabs all scroll together!
+        let list_top = if st.pinned.is_empty() && ghost_pinned.is_none() {
             url.bottom + px(12.0)
         } else {
             pinned_bottom + px(10.0)
         };
-        let avail_h = (footer_top - list_top).max(0);
 
         let row_l = lp - px(4.0);
         let row_r = width - rp + px(4.0);
@@ -965,9 +1073,10 @@ impl SidebarRenderer {
         let mut folder_icons = Vec::with_capacity(st.folders.len());
         let mut tabs = vec![rc(0, 0, 0, 0); st.tabs.len()];
 
-        // ── Top section: folders (accordion) ──
-        let mut y = list_top - st.scroll_top;
+        let list_clip = rc(0, list_top, width, footer_top);
+        let mut y = list_top - st.scroll;
 
+        // 1. Folders (accordion)
         for f in &st.folders {
             let r = rc(row_l, y, row_r, y + folder_row_h);
             let icon_w = px(28.0);
@@ -998,7 +1107,7 @@ impl SidebarRenderer {
             }
         }
 
-        // ── Top section: pinned tabs (under the folders) ──
+        // 2. Pinned tabs section (under the folders)
         let mut any_pinned_tab = false;
         for (i, tab_item) in st.tabs.iter().enumerate() {
             if tab_item.folder_id.as_deref() != Some(PINNED_SECTION_ID) {
@@ -1018,28 +1127,22 @@ impl SidebarRenderer {
             y += row_h + row_gap;
         }
 
-        // The top section never grows past half of the list area; it scrolls inside its own box.
-        let top_content_h = ((y + st.scroll_top) - list_top).max(0);
-        let max_top_h = ((avail_h as f32) * 0.5).round() as i32;
-        let top_h = top_content_h.min(max_top_h);
-        let top_clip = rc(0, list_top, width, list_top + top_h);
-
-        let (folder_divider, b_top) = if top_h > 0 {
-            let dy = list_top + top_h + px(6.0);
+        // 3. Subtle separator divider before "+ New Tab" if there are folders or pinned tabs
+        let (folder_divider, b_top) = if !st.folders.is_empty() || any_pinned_tab {
+            let dy = y + px(6.0);
             let dh = px(1.0).max(1);
-            (Some(rc(row_l, dy, row_r, dy + dh)), dy + dh + px(8.0))
+            let r = rc(row_l, dy, row_r, dy + dh);
+            y = dy + dh + px(8.0);
+            (Some(r), y)
         } else {
-            (None, list_top)
+            (None, y)
         };
 
-        // ── Bottom section: "+ New Tab" then normal tabs ──
-        let list_clip = rc(0, b_top, width, footer_top);
-        let mut y = b_top - st.scroll;
-
+        // 4. "+ New Tab" then normal tabs
         let new_tab = rc(lp - px(4.0), y, width - rp + px(4.0), y + full_row_h);
         y += full_row_h + full_row_gap + px(4.0);
 
-        // Normal open tabs (UNDER "+ New Tab" button)
+        // 5. Normal open tabs (UNDER "+ New Tab" button)
         let group = st.split_group.filter(|g| g.1 == g.0 + 1);
         for (i, tab_item) in st.tabs.iter().enumerate() {
             if tab_item.folder_id.is_none() {
@@ -1065,8 +1168,11 @@ impl SidebarRenderer {
             }
         }
 
-        let list_content_h = (y + st.scroll) - b_top;
+        let list_content_h = ((y + st.scroll) - list_top).max(0);
         let max_scroll = (list_content_h - (list_clip.bottom - list_clip.top)).max(0);
+
+        let top_clip = list_clip;
+        let top_content_h = list_content_h;
 
         let mut jump_to_active_pill = None;
         let mut jump_target_scroll = 0;
@@ -1091,7 +1197,7 @@ impl SidebarRenderer {
         }
 
         let layout = Layout {
-            back, forward, reload, toggle_sidebar, url, clean_link_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, divider_y, list_clip,
+            back, forward, reload, toggle_sidebar, url, clean_link_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, ghost_pinned, divider_y, list_clip,
             folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, new_tab,
             footer_top, downloads, settings, footer_toggle,
             jump_to_active_pill, jump_target_scroll, jump_active_favicon,
@@ -1209,7 +1315,7 @@ impl SidebarRenderer {
             None
         };
 
-        if l.top_clip.bottom > l.top_clip.top && contains(&l.top_clip, x, y) {
+        if contains(&l.list_clip, x, y) {
             for (i, r) in l.folders.iter().enumerate() {
                 if contains(r, x, y) {
                     return SidebarHit::Folder(i);
@@ -1218,15 +1324,156 @@ impl SidebarRenderer {
             if let Some(h) = hit_tab(true) {
                 return h;
             }
-        }
-
-        if contains(&l.list_clip, x, y) {
             if contains(&l.new_tab, x, y) { return SidebarHit::NewTab; }
             if let Some(h) = hit_tab(false) {
                 return h;
             }
         }
         SidebarHit::None
+    }
+
+    pub fn compute_drag_target(
+        &self,
+        hwnd: HWND,
+        st: &SidebarState,
+        cur_x: i32,
+        cur_y: i32,
+        sidebar_rect: RECT,
+    ) -> Option<DragTarget> {
+        let width = sidebar_rect.right - sidebar_rect.left;
+        let height = sidebar_rect.bottom - sidebar_rect.top;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let s = Self::scale(hwnd);
+        let px = |v: f32| (v * s).round() as i32;
+        let l = self.compute_layout(s, width, height, st);
+
+        let sx = cur_x - sidebar_rect.left;
+        let sy = cur_y - sidebar_rect.top;
+
+        // 1. Top region: Favorites grid
+        let pinned_bottom = l.pinned.iter().chain(l.ghost_pinned.as_ref()).map(|r| r.bottom).max().unwrap_or(l.url.bottom);
+        let fav_zone_bottom = if st.pinned.is_empty() && l.ghost_pinned.is_none() {
+            l.url.bottom + px(24.0)
+        } else {
+            pinned_bottom + px(12.0)
+        };
+
+        if sy <= fav_zone_bottom {
+            let total = st.pinned.len();
+            if total == 0 {
+                return Some(DragTarget::Favorites(0));
+            }
+            let ghost_total = if matches!(st.drag_state.as_ref().map(|d| d.source), Some(DragSource::Tab(_))) {
+                total + 1
+            } else {
+                total
+            };
+            let lp = px(4.0);
+            let rp = px(12.0);
+            let gap = px(8.0);
+            let tile_h = px(44.0);
+            let pinned_top = l.url.bottom + px(12.0);
+            let cols = if ghost_total <= 4 { ghost_total.max(1) } else { 3 };
+            let tile_w = ((width - lp - rp - gap * (cols as i32 - 1)) / (cols as i32)).max(20);
+            let all_cells: Vec<RECT> = (0..ghost_total as i32)
+                .map(|i| {
+                    let (c, r) = if ghost_total <= 4 { (i, 0) } else { (i % 3, i / 3) };
+                    let cell_l = lp + c * (tile_w + gap);
+                    let cell_t = pinned_top + r * (tile_h + gap);
+                    rc(cell_l, cell_t, cell_l + tile_w, cell_t + tile_h)
+                })
+                .collect();
+
+            let best = all_cells.iter().enumerate().min_by_key(|(_, r)| {
+                let mx = (r.left + r.right) / 2;
+                let my = (r.top + r.bottom) / 2;
+                (mx - sx).pow(2) + (my - sy).pow(2)
+            });
+            if let Some((i, _)) = best {
+                return Some(DragTarget::Favorites(i));
+            }
+            return Some(DragTarget::Favorites(0));
+        }
+
+        // 2. Middle region: Folders & Pinned section
+        if sy < l.new_tab.top {
+            // Over a folder header?
+            for (i, r) in l.folders.iter().enumerate() {
+                if sy >= r.top && sy < r.bottom {
+                    return Some(DragTarget::Folder(i));
+                }
+            }
+
+            // Inside an open folder's items?
+            for (f_idx, f) in st.folders.iter().enumerate() {
+                if f.open_progress > 0.001 {
+                    let folder_tabs: Vec<usize> = st.tabs.iter().enumerate()
+                        .filter(|(_, t)| t.folder_id.as_deref() == Some(&f.id))
+                        .map(|(idx, _)| idx)
+                        .collect();
+                    if !folder_tabs.is_empty() {
+                        let first_top = l.tabs[folder_tabs[0]].top;
+                        let last_bottom = l.tabs[*folder_tabs.last().unwrap()].bottom;
+                        if sy >= first_top - px(4.0) && sy <= last_bottom + px(4.0) {
+                            let mut slot = folder_tabs.len();
+                            for (insert_idx, &t_idx) in folder_tabs.iter().enumerate() {
+                                let tr = l.tabs[t_idx];
+                                if sy < (tr.top + tr.bottom) / 2 {
+                                    slot = insert_idx;
+                                    break;
+                                }
+                            }
+                            return Some(DragTarget::FolderInsert {
+                                folder_idx: f_idx,
+                                insert_idx: slot,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // In the pinned tabs section (under folders)
+            let pinned_tabs: Vec<usize> = st.tabs.iter().enumerate()
+                .filter(|(_, t)| t.folder_id.as_deref() == Some(PINNED_SECTION_ID))
+                .map(|(idx, _)| idx)
+                .collect();
+            if pinned_tabs.is_empty() {
+                return Some(DragTarget::PinnedSection(0));
+            }
+            let mut slot = pinned_tabs.len();
+            for (insert_idx, &t_idx) in pinned_tabs.iter().enumerate() {
+                let tr = l.tabs[t_idx];
+                if sy < (tr.top + tr.bottom) / 2 {
+                    slot = insert_idx;
+                    break;
+                }
+            }
+            return Some(DragTarget::PinnedSection(slot));
+        }
+
+        // 3. Bottom region: Normal tabs
+        let normal_tabs: Vec<usize> = st.tabs.iter().enumerate()
+            .filter(|(_, t)| t.folder_id.is_none())
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if sy < l.new_tab.bottom + px(4.0) {
+            return Some(DragTarget::NormalTabs(0));
+        }
+        if normal_tabs.is_empty() {
+            return Some(DragTarget::NormalTabs(0));
+        }
+        let mut slot = normal_tabs.len();
+        for (insert_idx, &t_idx) in normal_tabs.iter().enumerate() {
+            let tr = l.tabs[t_idx];
+            if tr.bottom > tr.top && sy < (tr.top + tr.bottom) / 2 {
+                slot = insert_idx;
+                break;
+            }
+        }
+        Some(DragTarget::NormalTabs(slot))
     }
 
     // ───────────────────────── Rendering ─────────────────────────
@@ -1442,11 +1689,12 @@ impl SidebarRenderer {
             let border_w = (1.5 * s).round().max(1.0);
 
             for (i, r) in l.pinned.iter().enumerate() {
+                let is_drag_source = matches!(st.drag_state.as_ref(), Some(d) if d.source == DragSource::Pinned(i));
                 let is_active = st.active == Some(ActiveTab::Pinned(i));
                 let is_hover = st.hovered == SidebarHit::Pinned(i);
                 let is_loaded = st.pinned.get(i).map_or(false, |p| p.is_loaded);
 
-                let a = if is_active {
+                let mut a = if is_active {
                     if is_hover {
                         (t.active_a + 0.035).min(0.20)
                     } else {
@@ -1466,6 +1714,39 @@ impl SidebarRenderer {
                         0.02
                     }
                 };
+
+                if is_drag_source {
+                    a *= 0.25;
+                }
+
+                let is_editing = match st.inline_edit {
+                    Some(ref ed) => ed.target == InlineEditTarget::PinnedLetter(i),
+                    None => false,
+                };
+
+                if is_editing {
+                    let ed = st.inline_edit.as_ref().unwrap();
+                    cv.fill_round(r, tile_rad, t.white, 0.15);
+                    cv.stroke_round(r, tile_rad, rgb(110, 165, 255), 0.95, 2.0);
+
+                    let fav = px(22.0);
+                    let cx = (r.left + r.right) / 2;
+                    let cy = (r.top + r.bottom) / 2;
+                    let fav_rect = rc(cx - fav / 2, cy - fav / 2, cx + fav / 2, cy + fav / 2);
+
+                    let letter_font = make_font(w!("Segoe UI"), px(18.0), FW_SEMIBOLD.0 as i32, ANTIALIASED_QUALITY);
+                    let old = SelectObject(mem_dc, letter_font.into());
+                    text(mem_dc, &ed.text, fav_rect, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, rgb(255, 255, 255));
+                    if ed.caret_visible {
+                        let tw = text_w(mem_dc, &ed.text);
+                        let caret_x = cx + tw / 2 + px(1.0);
+                        let caret_r = rc(caret_x, fav_rect.top + px(2.0), caret_x + px(1.5), fav_rect.bottom - px(2.0));
+                        cv.fill_rect(&caret_r, rgb(255, 255, 255), 0.95);
+                    }
+                    SelectObject(mem_dc, old);
+                    let _ = DeleteObject(letter_font.into());
+                    continue;
+                }
 
                 if is_active {
                     let palette = get_pinned_tab_palette(&st.pinned[i]);
@@ -1518,42 +1799,183 @@ impl SidebarRenderer {
                 }
             }
 
-            // ── Two clipped sections: top (folders + pinned tabs), bottom (New Tab + normal tabs) ──
-            for pass in 0..2 {
+            // ── Unified scrollable area below the fixed Favorites grid ──
             cv.reset_clip();
-            let sect_clip = if pass == 0 { l.top_clip } else { l.list_clip };
-            if sect_clip.bottom <= sect_clip.top {
-                continue;
-            }
-            cv.set_clip(sect_clip);
+            if l.list_clip.bottom > l.list_clip.top {
+                cv.set_clip(l.list_clip);
 
-            // Folders list
-            for (i, r) in l.folders.iter().enumerate() {
-                if pass != 0 || r.bottom < sect_clip.top || r.top > sect_clip.bottom {
-                    continue;
+                // 1. Folders list (accordion)
+                for (i, r) in l.folders.iter().enumerate() {
+                    if r.bottom < l.list_clip.top || r.top > l.list_clip.bottom {
+                        continue;
+                    }
+                    if let Some(folder) = st.folders.get(i) {
+                        let is_hover = matches!(st.hovered, SidebarHit::Folder(idx) | SidebarHit::FolderIcon(idx) if idx == i);
+                        if is_hover {
+                            cv.fill_round(r, px(6.0), t.white, t.hover_a);
+                        }
+
+                        // Folder icon badge (Image 1, 4)
+                        if let Some(ir) = l.folder_icons.get(i) {
+                            draw_folder_icon(&cv, mem_dc, ir, folder.is_open, folder.open_progress, &folder.icon, is_hover, px);
+                        }
+
+                        let is_editing = match st.inline_edit {
+                            Some(ref ed) => ed.target == InlineEditTarget::Folder(folder.id.clone()),
+                            None => false,
+                        };
+
+                        let text_x = r.left + px(44.0);
+                        let text_r = rc(text_x, r.top, r.right - px(8.0), r.bottom);
+
+                        if is_editing {
+                            let ed = st.inline_edit.as_ref().unwrap();
+                            SelectObject(mem_dc, ui_semi.into());
+                            if let Some((sel_s, sel_e)) = ed.selection {
+                                let s_idx = sel_s.min(ed.text.len());
+                                let e_idx = sel_e.min(ed.text.len());
+                                let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                                let prefix = &ed.text[..min_i];
+                                let sel_text = &ed.text[min_i..max_i];
+                                let prefix_w = text_w(mem_dc, prefix);
+                                let sel_w = text_w(mem_dc, sel_text);
+                                let max_r = text_r.right - px(4.0);
+                                let box_l = (text_x + prefix_w).min(max_r);
+                                let box_r = (text_x + prefix_w + sel_w).min(max_r);
+                                if box_r > box_l {
+                                    let sel_box = rc(box_l, r.top + px(6.0), box_r, r.bottom - px(6.0));
+                                    cv.fill_round(&sel_box, px(2.0), rgb(43, 108, 176), 0.95);
+                                }
+                            }
+                            text(
+                                mem_dc,
+                                &ed.text,
+                                text_r,
+                                DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
+                                rgb(255, 255, 255),
+                            );
+                            if ed.selection.is_none() && ed.caret_visible {
+                                let cursor_idx = ed.cursor.min(ed.text.len());
+                                let text_up_to_cursor = &ed.text[..cursor_idx];
+                                let cw = text_w(mem_dc, text_up_to_cursor);
+                                let caret_x = (text_x + cw).min(text_r.right - px(4.0));
+                                let caret_y0 = r.top + px(8.0);
+                                let caret_y1 = r.bottom - px(8.0);
+                                cv.fill_rect(&rc(caret_x, caret_y0, caret_x + px(1.5).max(1), caret_y1), rgb(255, 255, 255), 1.0);
+                            }
+                        } else {
+                            SelectObject(mem_dc, ui_semi.into());
+                            text(
+                                mem_dc,
+                                &folder.name,
+                                text_r,
+                                DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
+                                if is_hover { rgb(245, 245, 250) } else { rgb(220, 222, 232) },
+                            );
+                        }
+                    }
                 }
-                if let Some(folder) = st.folders.get(i) {
-                    let is_hover = matches!(st.hovered, SidebarHit::Folder(idx) | SidebarHit::FolderIcon(idx) if idx == i);
-                    if is_hover {
-                        cv.fill_round(r, px(6.0), t.white, t.hover_a);
+
+                // 2. Divider between folders/pinned tabs and "+ New Tab"
+                if let Some(ref div) = l.folder_divider {
+                    if div.bottom >= l.list_clip.top && div.top <= l.list_clip.bottom {
+                        cv.fill_rect(div, rgb(255, 255, 255), 0.12);
+                    }
+                }
+
+                // 3. "+ New Tab" row
+                let nt = l.new_tab;
+                if nt.bottom >= l.list_clip.top && nt.top <= l.list_clip.bottom {
+                    let is_new_hover = st.hovered == SidebarHit::NewTab;
+                    if is_new_hover {
+                        cv.fill_round(&nt, px(7.0), t.white, t.hover_a);
+                    }
+                    SelectObject(mem_dc, icon.into());
+                    text(mem_dc, "\u{E710}", rc(nt.left + px(8.0), nt.top, nt.left + px(34.0), nt.bottom),
+                         DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
+                    SelectObject(mem_dc, ui.into());
+                    text(mem_dc, "New Tab", rc(nt.left + px(42.0), nt.top, nt.right, nt.bottom),
+                         DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
+                }
+
+                // 4. Stitched background for tabs that are split together
+                if let Some((ga, gb)) = st.split_group.filter(|g| g.1 == g.0 + 1) {
+                    if let (Some(ra), Some(rb)) = (l.tabs.get(ga), l.tabs.get(gb)) {
+                        let combined = rc(ra.left, ra.top, rb.right, rb.bottom);
+                        cv.fill_round(&combined, px(7.0), t.white, t.surface_a);
+                        cv.stroke_round(&combined, px(7.0), t.white, t.stroke_a, 1.0);
+                        let mx = (ra.right + rb.left) / 2;
+                        cv.fill_rect(&rc(mx, ra.top + px(8.0), mx + 1, ra.bottom - px(8.0)), t.white, 0.12);
+                    }
+                }
+
+                // 5. Tabs list (all tabs: folder children, pinned section tabs, normal tabs)
+                for (i, r) in l.tabs.iter().enumerate() {
+                    if r.bottom < l.list_clip.top || r.top > l.list_clip.bottom {
+                        continue;
+                    }
+                    let tab_item = &st.tabs[i];
+                    let progress = tab_item.anim_progress.clamp(0.0, 1.0);
+                    if progress <= 0.001 || (r.bottom - r.top) < px(6.0) {
+                        continue;
+                    }
+                    let ease = 1.0 - (1.0 - progress).powi(3);
+
+                    let is_drag_source = matches!(st.drag_state.as_ref(), Some(d) if d.source == DragSource::Tab(i));
+                    let alpha_mult = if is_drag_source { 0.25 } else { 1.0 };
+                    let is_active = st.active == Some(ActiveTab::Tab(i));
+                    let is_hover = matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == i);
+                    if st.selected.contains(&i) {
+                        cv.fill_round(r, px(7.0), t.accent, 0.28 * ease * alpha_mult);
+                        cv.stroke_round(r, px(7.0), t.accent, 0.8 * ease * alpha_mult, 1.0);
+                    }
+                    if is_active {
+                        cv.fill_round(r, px(7.0), t.white, t.active_a * ease * alpha_mult);
+                        cv.stroke_round(r, px(7.0), t.white, t.stroke_a * ease * alpha_mult, 1.0);
+                    } else if is_hover {
+                        cv.fill_round(r, px(7.0), t.white, t.hover_a * ease * alpha_mult);
                     }
 
-                    // Folder icon badge (Image 1, 4)
-                    if let Some(ir) = l.folder_icons.get(i) {
-                        draw_folder_icon(&cv, mem_dc, ir, folder.is_open, folder.open_progress, &folder.icon, is_hover, px);
+                    if (r.bottom - r.top) < px(14.0) {
+                        continue;
                     }
+
+                    let fav = px(15.0);
+                    let fx = r.left + px(10.0);
+                    let fy = r.top + (r.bottom - r.top - fav) / 2;
+                    let fav_rect = rc(fx, fy, fx + fav, fy + fav);
+                    draw_webapp_icon(&cv, &fav_rect, &st.tabs[i], px(7.0), px);
+
+                    let show_close = is_hover || is_active;
+                    let cb = px(20.0);
+                    let is_muted = st.tabs[i].is_muted;
+                    let right_limit = if show_close && is_muted {
+                        r.right - cb * 2 - px(14.0)
+                    } else if show_close || is_muted {
+                        r.right - cb - px(12.0)
+                    } else {
+                        r.right - px(10.0)
+                    };
+                    let is_loaded = st.tabs[i].is_loaded;
+                    let text_color = if is_active {
+                        t.text
+                    } else if is_loaded {
+                        t.text_dim
+                    } else {
+                        rgb(125, 130, 142) // Sleeping tab title color
+                    };
 
                     let is_editing = match st.inline_edit {
-                        Some(ref ed) => ed.target == InlineEditTarget::Folder(folder.id.clone()),
+                        Some(ref ed) => ed.target == InlineEditTarget::Tab(i),
                         None => false,
                     };
 
-                    let text_x = r.left + px(44.0);
-                    let text_r = rc(text_x, r.top, r.right - px(8.0), r.bottom);
+                    let text_left = fx + fav + px(10.0);
+                    let title_rect = rc(text_left, r.top, right_limit, r.bottom);
 
                     if is_editing {
                         let ed = st.inline_edit.as_ref().unwrap();
-                        SelectObject(mem_dc, ui_semi.into());
+                        SelectObject(mem_dc, ui.into());
                         if let Some((sel_s, sel_e)) = ed.selection {
                             let s_idx = sel_s.min(ed.text.len());
                             let e_idx = sel_e.min(ed.text.len());
@@ -1562,9 +1984,9 @@ impl SidebarRenderer {
                             let sel_text = &ed.text[min_i..max_i];
                             let prefix_w = text_w(mem_dc, prefix);
                             let sel_w = text_w(mem_dc, sel_text);
-                            let max_r = text_r.right - px(4.0);
-                            let box_l = (text_x + prefix_w).min(max_r);
-                            let box_r = (text_x + prefix_w + sel_w).min(max_r);
+                            let max_r = right_limit - px(4.0);
+                            let box_l = (text_left + prefix_w).min(max_r);
+                            let box_r = (text_left + prefix_w + sel_w).min(max_r);
                             if box_r > box_l {
                                 let sel_box = rc(box_l, r.top + px(6.0), box_r, r.bottom - px(6.0));
                                 cv.fill_round(&sel_box, px(2.0), rgb(43, 108, 176), 0.95);
@@ -1573,7 +1995,7 @@ impl SidebarRenderer {
                         text(
                             mem_dc,
                             &ed.text,
-                            text_r,
+                            title_rect,
                             DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
                             rgb(255, 255, 255),
                         );
@@ -1581,185 +2003,42 @@ impl SidebarRenderer {
                             let cursor_idx = ed.cursor.min(ed.text.len());
                             let text_up_to_cursor = &ed.text[..cursor_idx];
                             let cw = text_w(mem_dc, text_up_to_cursor);
-                            let caret_x = (text_x + cw).min(text_r.right - px(4.0));
+                            let caret_x = (text_left + cw).min(right_limit - px(4.0));
                             let caret_y0 = r.top + px(8.0);
                             let caret_y1 = r.bottom - px(8.0);
                             cv.fill_rect(&rc(caret_x, caret_y0, caret_x + px(1.5).max(1), caret_y1), rgb(255, 255, 255), 1.0);
                         }
                     } else {
-                        SelectObject(mem_dc, ui_semi.into());
+                        SelectObject(mem_dc, ui.into());
                         text(
                             mem_dc,
-                            &folder.name,
-                            text_r,
-                            DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0 | DT_END_ELLIPSIS.0,
-                            if is_hover { rgb(245, 245, 250) } else { rgb(220, 222, 232) },
+                            &st.tabs[i].title,
+                            title_rect,
+                            DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
+                            text_color,
                         );
                     }
-                }
-            }
 
-            // (section divider is drawn after both clipped passes)
+                    let cy = r.top + (r.bottom - r.top - cb) / 2;
 
-            // Stitched background for tabs that are split together
-            if let Some((ga, gb)) = st.split_group.filter(|g| g.1 == g.0 + 1) {
-                if let (Some(ra), Some(rb)) = (l.tabs.get(ga), l.tabs.get(gb)) {
-                    let combined = rc(ra.left, ra.top, rb.right, rb.bottom);
-                    cv.fill_round(&combined, px(7.0), t.white, t.surface_a);
-                    cv.stroke_round(&combined, px(7.0), t.white, t.stroke_a, 1.0);
-                    let mx = (ra.right + rb.left) / 2;
-                    cv.fill_rect(&rc(mx, ra.top + px(8.0), mx + 1, ra.bottom - px(8.0)), t.white, 0.12);
-                }
-            }
-            for (i, r) in l.tabs.iter().enumerate() {
-                if r.bottom < sect_clip.top || r.top > sect_clip.bottom {
-                    continue;
-                }
-                let tab_item = &st.tabs[i];
-                if tab_item.folder_id.is_some() != (pass == 0) {
-                    continue;
-                }
-                let progress = tab_item.anim_progress.clamp(0.0, 1.0);
-                if progress <= 0.001 || (r.bottom - r.top) < px(6.0) {
-                    continue;
-                }
-                let ease = 1.0 - (1.0 - progress).powi(3);
+                    if is_muted {
+                        let mx = if show_close { r.right - cb * 2 - px(10.0) } else { r.right - cb - px(8.0) };
+                        let mute_r = rc(mx, cy, mx + cb, cy + cb);
+                        SelectObject(mem_dc, icon_cap.into());
+                        text(mem_dc, "\u{E74F}", mute_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(255, 130, 130));
+                    }
 
-                let is_active = st.active == Some(ActiveTab::Tab(i));
-                let is_hover = matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == i);
-                if st.selected.contains(&i) {
-                    cv.fill_round(r, px(7.0), t.accent, 0.28 * ease);
-                    cv.stroke_round(r, px(7.0), t.accent, 0.8 * ease, 1.0);
-                }
-                if is_active {
-                    cv.fill_round(r, px(7.0), t.white, t.active_a * ease);
-                    cv.stroke_round(r, px(7.0), t.white, t.stroke_a * ease, 1.0);
-                } else if is_hover {
-                    cv.fill_round(r, px(7.0), t.white, t.hover_a * ease);
-                }
-
-                if (r.bottom - r.top) < px(14.0) {
-                    continue;
-                }
-
-                let fav = px(15.0);
-                let fx = r.left + px(10.0);
-                let fy = r.top + (r.bottom - r.top - fav) / 2;
-                let fav_rect = rc(fx, fy, fx + fav, fy + fav);
-                draw_webapp_icon(&cv, &fav_rect, &st.tabs[i], px(7.0), px);
-
-                let show_close = is_hover || is_active;
-                let cb = px(20.0);
-                let is_muted = st.tabs[i].is_muted;
-                let right_limit = if show_close && is_muted {
-                    r.right - cb * 2 - px(14.0)
-                } else if show_close || is_muted {
-                    r.right - cb - px(12.0)
-                } else {
-                    r.right - px(10.0)
-                };
-                let is_loaded = st.tabs[i].is_loaded;
-                let text_color = if is_active {
-                    t.text
-                } else if is_loaded {
-                    t.text_dim
-                } else {
-                    rgb(125, 130, 142) // Sleeping tab title color (subtly dimmer)
-                };
-
-                let is_editing = match st.inline_edit {
-                    Some(ref ed) => ed.target == InlineEditTarget::Tab(i),
-                    None => false,
-                };
-
-                let text_left = fx + fav + px(10.0);
-                let title_rect = rc(text_left, r.top, right_limit, r.bottom);
-
-                if is_editing {
-                    let ed = st.inline_edit.as_ref().unwrap();
-                    SelectObject(mem_dc, ui.into());
-                    if let Some((sel_s, sel_e)) = ed.selection {
-                        let s_idx = sel_s.min(ed.text.len());
-                        let e_idx = sel_e.min(ed.text.len());
-                        let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
-                        let prefix = &ed.text[..min_i];
-                        let sel_text = &ed.text[min_i..max_i];
-                        let prefix_w = text_w(mem_dc, prefix);
-                        let sel_w = text_w(mem_dc, sel_text);
-                        let max_r = right_limit - px(4.0);
-                        let box_l = (text_left + prefix_w).min(max_r);
-                        let box_r = (text_left + prefix_w + sel_w).min(max_r);
-                        if box_r > box_l {
-                            let sel_box = rc(box_l, r.top + px(6.0), box_r, r.bottom - px(6.0));
-                            cv.fill_round(&sel_box, px(2.0), rgb(43, 108, 176), 0.95);
+                    if show_close {
+                        let close = rc(r.right - cb - px(8.0), cy, r.right - px(8.0), cy + cb);
+                        if st.hovered == SidebarHit::TabClose(i) {
+                            cv.fill_round(&close, px(6.0), t.white, t.active_a);
                         }
+                        SelectObject(mem_dc, icon_cap.into());
+                        text(mem_dc, "\u{E711}", close, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text);
                     }
-                    text(
-                        mem_dc,
-                        &ed.text,
-                        title_rect,
-                        DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
-                        rgb(255, 255, 255),
-                    );
-                    if ed.selection.is_none() && ed.caret_visible {
-                        let cursor_idx = ed.cursor.min(ed.text.len());
-                        let text_up_to_cursor = &ed.text[..cursor_idx];
-                        let cw = text_w(mem_dc, text_up_to_cursor);
-                        let caret_x = (text_left + cw).min(right_limit - px(4.0));
-                        let caret_y0 = r.top + px(8.0);
-                        let caret_y1 = r.bottom - px(8.0);
-                        cv.fill_rect(&rc(caret_x, caret_y0, caret_x + px(1.5).max(1), caret_y1), rgb(255, 255, 255), 1.0);
-                    }
-                } else {
-                    SelectObject(mem_dc, ui.into());
-                    text(
-                        mem_dc,
-                        &st.tabs[i].title,
-                        title_rect,
-                        DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0 | DT_NOPREFIX.0,
-                        text_color,
-                    );
-                }
-
-                let cy = r.top + (r.bottom - r.top - cb) / 2;
-
-                if is_muted {
-                    let mx = if show_close { r.right - cb * 2 - px(10.0) } else { r.right - cb - px(8.0) };
-                    let mute_r = rc(mx, cy, mx + cb, cy + cb);
-                    SelectObject(mem_dc, icon_cap.into());
-                    text(mem_dc, "\u{E74F}", mute_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(255, 130, 130));
-                }
-
-                if show_close {
-                    let close = rc(r.right - cb - px(8.0), cy, r.right - px(8.0), cy + cb);
-                    if st.hovered == SidebarHit::TabClose(i) {
-                        cv.fill_round(&close, px(6.0), t.white, t.active_a);
-                    }
-                    SelectObject(mem_dc, icon_cap.into());
-                    text(mem_dc, "\u{E711}", close, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text);
                 }
             }
-
-            if pass == 1 {
-            // New tab row
-            let nt = l.new_tab;
-            if st.hovered == SidebarHit::NewTab {
-                cv.fill_round(&nt, px(7.0), t.white, t.hover_a);
-            }
-            SelectObject(mem_dc, icon.into());
-            text(mem_dc, "\u{E710}", rc(nt.left + px(8.0), nt.top, nt.left + px(34.0), nt.bottom),
-                 DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
-            SelectObject(mem_dc, ui.into());
-            text(mem_dc, "New Tab", rc(nt.left + px(42.0), nt.top, nt.right, nt.bottom),
-                 DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
-            }
-            } // end section pass
             cv.reset_clip();
-
-            // Divider between the top section (folders + pinned tabs) and the normal tabs
-            if let Some(ref div) = l.folder_divider {
-                cv.fill_rect(div, rgb(255, 255, 255), 0.12);
-            }
 
             // Floating Jump to Active Tab pill
             if let Some(ref pill) = l.jump_to_active_pill {
@@ -1835,6 +2114,190 @@ impl SidebarRenderer {
             text(mem_dc, max_glyph, max_r, fmt, glyph_col);
             let close_active = hovered_button == CaptionButton::Close || pressed_button == CaptionButton::Close;
             text(mem_dc, "\u{E8BB}", close_r, fmt, if close_active { rgb(255, 255, 255) } else { glyph_col });
+
+            // ── Drag & Drop Overlay ──
+            if let Some(ref drag) = st.drag_state {
+                cv.reset_clip();
+
+                let lp = px(14.0);
+                let rp = px(14.0);
+                let row_l = lp - px(4.0);
+                let row_r = width - rp + px(4.0);
+
+                // 1. Draw destination indicator
+                match drag.target {
+                    Some(DragTarget::Favorites(_)) => {
+                        if let Some(ref ghost_r) = l.ghost_pinned {
+                            let tile_rad = px(8.0);
+                            cv.fill_round(ghost_r, tile_rad, t.white, 0.08);
+                            cv.stroke_round(ghost_r, tile_rad, rgb(180, 190, 255), 0.45, 1.2);
+                            if let Some(ref letter) = drag.item.custom_letter {
+                                let letter_font = make_font(w!("Segoe UI"), px(16.0), FW_SEMIBOLD.0 as i32, ANTIALIASED_QUALITY);
+                                let old = SelectObject(mem_dc, letter_font.into());
+                                text(mem_dc, letter, *ghost_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, rgb(180, 190, 220));
+                                SelectObject(mem_dc, old);
+                                let _ = DeleteObject(letter_font.into());
+                            } else if let Some(ref fav) = drag.item.favicon {
+                                let fav_sz = px(18.0);
+                                let fx = (ghost_r.left + ghost_r.right - fav_sz) / 2;
+                                let fy = (ghost_r.top + ghost_r.bottom - fav_sz) / 2;
+                                let fr = rc(fx, fy, fx + fav_sz, fy + fav_sz);
+                                cv.draw_image_scaled_custom(&fr, &fav.rgba, fav.width, fav.height, 0.45, false);
+                            }
+                        }
+                    }
+                    Some(DragTarget::Folder(f_idx)) => {
+                        if let Some(fr) = l.folders.get(f_idx) {
+                            let rad = px(8.0);
+                            cv.fill_round(fr, rad, rgb(130, 140, 230), 0.30);
+                            cv.stroke_round(fr, rad, rgb(180, 195, 255), 0.85, 1.5);
+                        }
+                    }
+                    Some(DragTarget::FolderInsert { folder_idx, insert_idx }) => {
+                        let folder_tabs: Vec<usize> = st.tabs.iter().enumerate()
+                            .filter(|(_, t)| t.folder_id.as_deref() == Some(&st.folders[folder_idx].id))
+                            .map(|(idx, _)| idx)
+                            .collect();
+                        let indent_l = row_l + px(16.0);
+                        let y_insert = if folder_tabs.is_empty() {
+                            l.folders[folder_idx].bottom + px(4.0)
+                        } else if insert_idx == 0 {
+                            l.tabs[folder_tabs[0]].top - px(2.0)
+                        } else if insert_idx < folder_tabs.len() {
+                            (l.tabs[folder_tabs[insert_idx - 1]].bottom + l.tabs[folder_tabs[insert_idx]].top) / 2
+                        } else {
+                            l.tabs[*folder_tabs.last().unwrap()].bottom + px(2.0)
+                        };
+                        draw_drag_insertion_line(&cv, indent_l, row_r, y_insert, px);
+                    }
+                    Some(DragTarget::PinnedSection(slot)) => {
+                        let pinned_tabs: Vec<usize> = st.tabs.iter().enumerate()
+                            .filter(|(_, t)| t.folder_id.as_deref() == Some(PINNED_SECTION_ID))
+                            .map(|(idx, _)| idx)
+                            .collect();
+                        let y_insert = if pinned_tabs.is_empty() {
+                            let top = l.folders.last().map(|r| r.bottom).unwrap_or(l.list_clip.top);
+                            let bottom = l.folder_divider.map(|d| d.top).unwrap_or(l.new_tab.top);
+                            (top + bottom) / 2
+                        } else if slot == 0 {
+                            let top_bound = l.folders.last().map(|r| r.bottom).unwrap_or(l.list_clip.top);
+                            (top_bound + l.tabs[pinned_tabs[0]].top) / 2
+                        } else if slot < pinned_tabs.len() {
+                            (l.tabs[pinned_tabs[slot - 1]].bottom + l.tabs[pinned_tabs[slot]].top) / 2
+                        } else {
+                            let bot_bound = l.folder_divider.map(|d| d.top).unwrap_or(l.new_tab.top);
+                            (l.tabs[*pinned_tabs.last().unwrap()].bottom + bot_bound) / 2
+                        };
+                        draw_drag_insertion_line(&cv, row_l, row_r, y_insert, px);
+                    }
+                    Some(DragTarget::NormalTabs(slot)) => {
+                        let normal_tabs: Vec<usize> = st.tabs.iter().enumerate()
+                            .filter(|(_, t)| t.folder_id.is_none())
+                            .map(|(idx, _)| idx)
+                            .collect();
+                        let y_insert = if normal_tabs.is_empty() {
+                            l.new_tab.bottom + px(6.0)
+                        } else if slot == 0 {
+                            (l.new_tab.bottom + l.tabs[normal_tabs[0]].top) / 2
+                        } else if slot < normal_tabs.len() {
+                            (l.tabs[normal_tabs[slot - 1]].bottom + l.tabs[normal_tabs[slot]].top) / 2
+                        } else {
+                            l.tabs[*normal_tabs.last().unwrap()].bottom + px(2.0)
+                        };
+                        draw_drag_insertion_line(&cv, row_l, row_r, y_insert, px);
+                    }
+                    None => {}
+                }
+
+                // 2. Draw floating carried item preview following cursor
+                let sx = drag.cur_x - sidebar_rect.left;
+                let sy = drag.cur_y - sidebar_rect.top;
+                let is_fav_preview = matches!(drag.target, Some(DragTarget::Favorites(_)));
+
+                if is_fav_preview {
+                    // Square Favorite Tile (Image 0)
+                    let sz = px(44.0);
+                    let left = sx - sz / 2;
+                    let top = sy - sz / 2;
+                    let r = rc(left, top, left + sz, top + sz);
+                    let rad = px(8.0);
+
+                    // Soft drop shadow
+                    let shadow_r = rc(left - px(3.0), top - px(1.0), left + sz + px(3.0), top + sz + px(5.0));
+                    cv.fill_round(&shadow_r, rad + px(2.0), rgb(0, 0, 0), 0.45);
+
+                    // Elevated white / light grey card
+                    cv.fill_round(&r, rad, rgb(228, 229, 235), 0.98);
+                    cv.stroke_round(&r, rad, rgb(180, 182, 195), 0.90, 1.2);
+
+                    // Centered Favicon or Letter
+                    if let Some(ref letter) = drag.item.custom_letter {
+                        let font = make_font(w!("Segoe UI"), px(18.0), FW_SEMIBOLD.0 as i32, CLEARTYPE_QUALITY);
+                        let old_f = SelectObject(mem_dc, font.into());
+                        text(mem_dc, letter, r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, rgb(20, 20, 25));
+                        SelectObject(mem_dc, old_f);
+                        let _ = DeleteObject(font.into());
+                    } else if let Some(ref fav) = drag.item.favicon {
+                        let fav_sz = px(22.0);
+                        let fx = left + (sz - fav_sz) / 2;
+                        let fy = top + (sz - fav_sz) / 2;
+                        let fav_r = rc(fx, fy, fx + fav_sz, fy + fav_sz);
+                        draw_favicon_to_canvas(&cv, fav, &fav_r);
+                    } else {
+                        let letter = drag.item.title
+                            .chars()
+                            .find(|c| c.is_alphanumeric())
+                            .map(|c| c.to_uppercase().to_string())
+                            .unwrap_or_else(|| "W".to_string());
+                        let font = make_font(w!("Segoe UI"), px(18.0), FW_SEMIBOLD.0 as i32, CLEARTYPE_QUALITY);
+                        let old_f = SelectObject(mem_dc, font.into());
+                        text(mem_dc, &letter, r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, rgb(20, 20, 25));
+                        SelectObject(mem_dc, old_f);
+                        let _ = DeleteObject(font.into());
+                    }
+                } else {
+                    // Carried Tab Card (Image 1 & Image 2)
+                    let card_w = (width - px(24.0)).min(px(240.0));
+                    let card_h = px(34.0);
+                    let left = (sx - px(40.0)).clamp(px(8.0), (width - card_w - px(8.0)).max(px(8.0)));
+                    let top = (sy - card_h - px(8.0)).max(px(8.0));
+                    let r = rc(left, top, left + card_w, top + card_h);
+                    let rad = px(8.0);
+
+                    // Soft shadow
+                    let shadow_r = rc(left - px(4.0), top - px(1.0), left + card_w + px(4.0), top + card_h + px(5.0));
+                    cv.fill_round(&shadow_r, rad + px(2.0), rgb(0, 0, 0), 0.40);
+
+                    // Elevated translucent card (matching Arc style: semi-transparent, frosted white outline)
+                    cv.fill_round(&r, rad, rgb(48, 52, 64), 0.88);
+                    cv.stroke_round(&r, rad, rgb(255, 255, 255), 0.35, 1.2);
+
+                    // Favicon on left
+                    let fav_sz = px(16.0);
+                    let fx = left + px(10.0);
+                    let fy = top + (card_h - fav_sz) / 2;
+                    let fav_r = rc(fx, fy, fx + fav_sz, fy + fav_sz);
+                    if let Some(ref fav) = drag.item.favicon {
+                        draw_favicon_to_canvas(&cv, fav, &fav_r);
+                    } else {
+                        let icon_font = make_font(w!("Segoe Fluent Icons"), px(12.0), FW_NORMAL.0 as i32, ANTIALIASED_QUALITY);
+                        let old_f = SelectObject(mem_dc, icon_font.into());
+                        text(mem_dc, "\u{E774}", fav_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(140, 144, 156));
+                        SelectObject(mem_dc, old_f);
+                        let _ = DeleteObject(icon_font.into());
+                    }
+
+                    // Title
+                    let title_r = rc(left + px(32.0), top, left + card_w - px(26.0), top + card_h);
+                    SelectObject(mem_dc, ui.into());
+                    text(mem_dc, &drag.item.title, title_r, DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_END_ELLIPSIS.0, rgb(235, 238, 248));
+
+                    // Close 'x' icon
+                    let close_r = rc(left + card_w - px(24.0), top, left + card_w - px(8.0), top + card_h);
+                    SelectObject(mem_dc, icon_cap.into());
+                    text(mem_dc, "\u{E8BB}", close_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(160, 165, 180));
+                }
+            }
 
             // Blit + cleanup
             let _ = GdiFlush();
@@ -2542,7 +3005,7 @@ pub unsafe fn text_w(dc: HDC, s: &str) -> i32 {
     sz.cx
 }
 
-/// Renders authentic website favicons with crisp alpha downsampling.
+/// Renders authentic website favicons or custom letter glyphs.
 pub unsafe fn draw_webapp_icon<F>(cv: &Canvas, r: &RECT, item: &TabItem, _radius: i32, px: F)
 where
     F: Fn(f32) -> i32,
@@ -2553,13 +3016,36 @@ where
         (0.35f32, true)
     };
 
-    // 1. If a real website favicon is available, render it directly with no background square!
+    // 1. If a custom letter is assigned, render that capital letter instead of the favicon!
+    if let Some(ref letter) = item.custom_letter {
+        let letter_font = make_font(w!("Segoe UI"), px(17.0), FW_SEMIBOLD.0 as i32, ANTIALIASED_QUALITY);
+        let old = SelectObject(cv.dc, letter_font.into());
+        let color = if item.is_loaded { rgb(240, 240, 245) } else { rgb(150, 154, 166) };
+        text(cv.dc, letter, *r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, color);
+        SelectObject(cv.dc, old);
+        let _ = DeleteObject(letter_font.into());
+        return;
+    }
+
+    // 2. If a real website favicon is available, render it directly with no background square!
     if let Some(ref fav) = item.favicon {
         cv.draw_image_scaled_custom(r, &fav.rgba, fav.width, fav.height, opacity, grayscale);
         return;
     }
 
-    // 2. Default clean fallback: subtle muted globe icon with NO background square, NO letter
+    // 3. Fallback: single capital letter from title if available
+    let letter = item.title.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string());
+    if let Some(ref l) = letter {
+        let letter_font = make_font(w!("Segoe UI"), px(15.0), FW_SEMIBOLD.0 as i32, ANTIALIASED_QUALITY);
+        let old = SelectObject(cv.dc, letter_font.into());
+        let color = if item.is_loaded { rgb(180, 184, 196) } else { rgb(110, 114, 126) };
+        text(cv.dc, l, *r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0, color);
+        SelectObject(cv.dc, old);
+        let _ = DeleteObject(letter_font.into());
+        return;
+    }
+
+    // 4. Default clean fallback: subtle muted globe icon
     let icon_font = make_font(w!("Segoe Fluent Icons"), px(12.0), FW_NORMAL.0 as i32, ANTIALIASED_QUALITY);
     let old = SelectObject(cv.dc, icon_font.into());
     let color = if item.is_loaded { rgb(140, 144, 156) } else { rgb(75, 78, 86) };
@@ -2570,6 +3056,29 @@ where
 
 pub fn draw_favicon_to_canvas(cv: &Canvas, fav: &FaviconData, r: &RECT) {
     cv.draw_image_scaled_custom(r, &fav.rgba, fav.width, fav.height, 1.0, false);
+}
+
+pub fn draw_drag_insertion_line<F>(cv: &Canvas, left: i32, right: i32, y: i32, px: F)
+where
+    F: Fn(f32) -> i32,
+{
+    let dot_r = px(4.0).max(4);
+    let line_h = px(2.0).max(2);
+    let cx = left + dot_r + px(2.0);
+    let cy = y;
+
+    // Outer glow for extra visibility
+    let glow_r = rc(cx - dot_r - px(2.0), cy - line_h / 2 - px(3.0), right, cy + line_h / 2 + px(3.0));
+    cv.fill_round(&glow_r, px(4.0), COLORREF(0x00ffffff), 0.12);
+
+    // Circle ring on left: open circle (dark background fill, crisp white 1.8px border)
+    let dot_rect = rc(cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r);
+    cv.fill_round(&dot_rect, dot_r, rgb(28, 30, 36), 1.0);
+    cv.stroke_round(&dot_rect, dot_r, rgb(255, 255, 255), 1.0, 1.8);
+
+    // Horizontal line extending across the row to the right edge
+    let line_rect = rc(cx + dot_r, cy - line_h / 2, right - px(4.0), cy + line_h / 2);
+    cv.fill_round(&line_rect, line_h / 2, rgb(255, 255, 255), 0.95);
 }
 
 const CLOSED_FOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><path fill="#1c1f28" stroke="#OUTLINE_COLOR#" stroke-width="1.4" stroke-linejoin="round" d="M21 15.8v-4.79c0-.683 0-1.22-.03-1.66c-.03-.444-.093-.817-.237-1.16a3.5 3.5 0 0 0-1.89-1.89c-.347-.144-.72-.206-1.16-.237c-.435-.03-.974-.03-1.66-.03h-3.81c-.657 0-.882-.005-1.08-.064a1.5 1.5 0 0 1-.517-.276c-.158-.13-.287-.314-.652-.861l-.14-.212c-.309-.462-.52-.781-.809-1.02a2.5 2.5 0 0 0-.86-.461c-.357-.108-.74-.108-1.29-.108h-1.58c-.822 0-1.47 0-1.99.042c-.532.044-.976.134-1.38.34a3.52 3.52 0 0 0-1.53 1.53c-.206.402-.297.846-.34 1.38c-.042.52-.042 1.17-.042 1.99v7.44c0 .82 0 1.47.042 1.99c.044.53.134.974.34 1.38c.335.658.87 1.19 1.53 1.53c.402.204.846.295 1.38.338c.52.043 1.17.043 1.99.043h10.5c.797 0 1.43 0 1.93-.04c.516-.042.948-.127 1.34-.322c.69-.34 1.25-.9 1.59-1.59c.193-.394.28-.826.32-1.34c.04-.506.04-1.14.04-1.93z"/></svg>"##;

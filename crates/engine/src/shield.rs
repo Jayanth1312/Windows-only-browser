@@ -254,7 +254,15 @@ impl ShieldState {
         }
         let clean = host.trim_start_matches("www.").to_ascii_lowercase();
         if let Ok(guard) = self.paused_hosts.read() {
-            guard.contains(&clean) || guard.contains(host)
+            if guard.contains(&clean) || guard.contains(host) {
+                return true;
+            }
+            for paused in guard.iter() {
+                if host_matches_domain(&clean, paused) {
+                    return true;
+                }
+            }
+            false
         } else {
             false
         }
@@ -292,11 +300,24 @@ impl ShieldState {
 pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
 (() => {
     'use strict';
+    if (window !== window.top) return;
     const hosts = [
         "youtube.com", "www.youtube.com", "m.youtube.com",
         "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"
     ];
     if (!hosts.some(h => location.hostname === h || location.hostname.endsWith('.' + h))) return;
+
+    function isShieldDisabled() {
+        try {
+            if (window.__BROWSER_SHIELD_PAUSED__ === true) return true;
+            if (window.__BROWSER_SHIELD_ENABLED__ === false) return true;
+            if (localStorage.getItem('__browser_shield_paused') === 'true') return true;
+            if (localStorage.getItem('__browser_shield_global_enabled') === 'false') return true;
+        } catch(e) {}
+        return false;
+    }
+
+    if (isShieldDisabled()) return;
 
     // ──────────────── 1. In-Page Player Data Pruning ────────────────
     // Intercepts and prunes ad schedule objects before YouTube player initializes
@@ -374,6 +395,16 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
         var stateMap = new WeakMap();
 
         function handleVideo(event) {
+            if (isShieldDisabled()) {
+                var v = event.target || document.querySelector('video');
+                if (v instanceof HTMLVideoElement) {
+                    if (v.playbackRate === 16) {
+                        v.playbackRate = 1.0;
+                    }
+                    v.muted = false;
+                }
+                return;
+            }
             var video = event.target || document.querySelector('video');
             if (!(video instanceof HTMLVideoElement)) return;
             var player = video.closest('.html5-video-player') || document.querySelector('.html5-video-player');
@@ -390,6 +421,12 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
                         stateMap.set(video, prev);
                         video.muted = true;
                     }
+                    // Instant skip: jump to end of ad if duration is finite and valid
+                    if (isFinite(video.duration) && video.duration > 0 && video.currentTime < video.duration - 0.1) {
+                        try {
+                            video.currentTime = video.duration;
+                        } catch(e) {}
+                    }
                     if (video.playbackRate !== 16) {
                         video.playbackRate = 16;
                     }
@@ -399,7 +436,7 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
                     }
                     // Auto-click skip button if rendered
                     var skipBtn = document.querySelector(
-                        '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button'
+                        '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-container button, button.ytp-ad-skip-button-modern, .ytp-ad-overlay-close-button'
                     );
                     if (skipBtn) {
                         skipBtn.click();
@@ -412,12 +449,66 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
             } catch(e) {}
         }
 
+        function dismissInterruptionDialogs() {
+            try {
+                // Remove enforcement message dialogs ("Experiencing interruptions?")
+                const dialogs = document.querySelectorAll(
+                    'ytd-enforcement-message-view-model, tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), #error-screen:has(ytd-enforcement-message-view-model)'
+                );
+                for (let i = 0; i < dialogs.length; i++) {
+                    dialogs[i].remove();
+                }
+                const backdrops = document.querySelectorAll('tp-yt-iron-overlay-backdrop');
+                for (let i = 0; i < backdrops.length; i++) {
+                    backdrops[i].remove();
+                }
+                const dismissBtn = document.querySelector(
+                    'ytd-enforcement-message-view-model button, tp-yt-paper-dialog #dismiss-button button, button[aria-label="Dismiss"]'
+                );
+                if (dismissBtn) {
+                    try { dismissBtn.click(); } catch (e) {}
+                }
+                var v = document.querySelector('video');
+                if (v && v.paused && !document.hidden) {
+                    var player = v.closest('.html5-video-player');
+                    if (player && !player.classList.contains('ad-showing')) {
+                        v.play().catch(() => {});
+                    }
+                }
+            } catch(e) {}
+        }
+
+        function neutralizeYtConfig() {
+            try {
+                if (window.yt && window.yt.config_) {
+                    window.yt.config_.EXPERIENCE_INTERRUPTIONS_MODE = false;
+                    if (window.yt.config_.EXPERIMENT_FLAGS) {
+                        window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_rsp_cl = false;
+                        window.yt.config_.EXPERIMENT_FLAGS.web_enable_ab_reg_app = false;
+                    }
+                    if (window.yt.config_.openPopupConfig && window.yt.config_.openPopupConfig.supportedPopups) {
+                        window.yt.config_.openPopupConfig.supportedPopups.adBlockMessageViewModel = false;
+                    }
+                }
+            } catch(e) {}
+        }
+
         ['playing', 'timeupdate', 'durationchange', 'emptied'].forEach(function(type) {
             document.addEventListener(type, handleVideo, true);
         });
 
         // Periodic watchdog in case events are throttled
         setInterval(function() {
+            if (isShieldDisabled()) {
+                var v = document.querySelector('video');
+                if (v && v.playbackRate === 16) {
+                    v.playbackRate = 1.0;
+                    v.muted = false;
+                }
+                return;
+            }
+            neutralizeYtConfig();
+            dismissInterruptionDialogs();
             var v = document.querySelector('video');
             if (v) handleVideo({ target: v });
         }, 200);
@@ -443,8 +534,16 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
 /// Ports `Shield.slots`, `Shield.slotsBySite`, and `Shield.reddit` from macOS Search.
 pub const COSMETIC_SHIELD_CSS_SCRIPT: &str = r#"
 (() => {
+    if (window !== window.top) return;
     // Exclude YouTube so we don't interfere with its custom polymer layout
     if (location.hostname.endsWith('youtube.com')) return;
+
+    try {
+        if (window.__BROWSER_SHIELD_PAUSED__ === true) return;
+        if (window.__BROWSER_SHIELD_ENABLED__ === false) return;
+        if (localStorage.getItem('__browser_shield_paused') === 'true') return;
+        if (localStorage.getItem('__browser_shield_global_enabled') === 'false') return;
+    } catch(e) {}
 
     const css = `
         /* Generic ad slots and ad container identifiers */
@@ -585,12 +684,18 @@ mod tests {
             false,
         ));
 
-        // YouTube ad endpoints blocked on YouTube
+        // YouTube ad endpoints blocked on YouTube when active, but allowed when paused
         assert!(should_block_request(
             "https://www.youtube.com/api/stats/ads?v=test",
             "youtube.com",
             true,
             false,
+        ));
+        assert!(!should_block_request(
+            "https://www.youtube.com/api/stats/ads?v=test",
+            "youtube.com",
+            true,
+            true,
         ));
     }
 
@@ -611,8 +716,16 @@ mod tests {
         state.set_paused("www.nytimes.com", true);
         assert!(state.is_paused("nytimes.com"));
         assert!(state.is_paused("www.nytimes.com"));
+        assert!(state.is_paused("sub.nytimes.com"));
+
+        state.set_paused("youtube.com", true);
+        assert!(state.is_paused("youtube.com"));
+        assert!(state.is_paused("www.youtube.com"));
+        assert!(state.is_paused("m.youtube.com"));
+        assert!(state.is_paused("music.youtube.com"));
 
         state.set_paused("nytimes.com", false);
         assert!(!state.is_paused("nytimes.com"));
+        assert!(!state.is_paused("sub.nytimes.com"));
     }
 }

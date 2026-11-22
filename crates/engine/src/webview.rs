@@ -1,6 +1,4 @@
-use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::rc::Rc;
 use std::string::FromUtf16Error;
 use std::sync::mpsc;
 use thiserror::Error;
@@ -14,7 +12,7 @@ use webview2_com::{
     FaviconChangedEventHandler, GetFaviconCompletedHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
-    ProfileAddBrowserExtensionCompletedHandler, SourceChangedEventHandler,
+    SourceChangedEventHandler,
     TrySuspendCompletedHandler, WebMessageReceivedEventHandler,
     WebResourceRequestedEventHandler,
 };
@@ -84,8 +82,6 @@ pub fn init_com() -> Result<(), EngineError> {
 
 pub struct WebViewEngine {
     environment: ICoreWebView2Environment,
-    spare_controller: Rc<RefCell<Option<(ICoreWebView2Controller, ICoreWebView2)>>>,
-    is_prewarming: Rc<Cell<bool>>,
 }
 
 pub struct WebViewController {
@@ -148,6 +144,7 @@ const MODERN_SCROLLBAR_CSS_SCRIPT: &str = r#"
 
 const PAGE_META_OBSERVER_SCRIPT: &str = r#"
 (() => {
+    if (window !== window.top) return;
     let curTitle = '';
     let curUrl = '';
 
@@ -202,6 +199,7 @@ const PAGE_META_OBSERVER_SCRIPT: &str = r#"
 
 const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
 (function() {
+    if (window !== window.top) return;
     if (window.__zenSearchPopupInjected) return;
     window.__zenSearchPopupInjected = true;
 
@@ -422,6 +420,7 @@ const SELECTION_SEARCH_POPUP_SCRIPT: &str = r#"
 
 const ELEMENT_ZAPPER_SCRIPT: &str = r#"
 (() => {
+    if (window !== window.top) return;
     if (window.__officeVeil) return;
 
     var frame = null;
@@ -676,7 +675,76 @@ const ELEMENT_ZAPPER_SCRIPT: &str = r#"
 })();
 "#;
 
-fn inject_default_scripts(webview: &ICoreWebView2) {
+fn inject_default_scripts(webview: &ICoreWebView2, shield: Option<&crate::shield::ShieldState>) {
+    // Inject dynamic shield config script before any other content scripts
+    {
+        let mut paused_json = String::from("[");
+        let mut is_enabled = true;
+        if let Some(st) = shield {
+            is_enabled = st.is_enabled();
+            if let Ok(guard) = st.paused_hosts.read() {
+                for (i, h) in guard.iter().enumerate() {
+                    if i > 0 {
+                        paused_json.push(',');
+                    }
+                    paused_json.push('"');
+                    paused_json.push_str(h);
+                    paused_json.push('"');
+                }
+            }
+        }
+        paused_json.push(']');
+
+        let config_script = format!(
+            r#"
+(() => {{
+    if (window !== window.top) return;
+    try {{
+        let isGlobalEnabled = {is_enabled};
+        const localGlobal = localStorage.getItem('__browser_shield_global_enabled');
+        if (localGlobal === 'false') {{
+            isGlobalEnabled = false;
+        }} else if (localGlobal === 'true') {{
+            isGlobalEnabled = true;
+        }}
+        window.__BROWSER_SHIELD_ENABLED__ = isGlobalEnabled;
+
+        const pausedList = {paused_json};
+        const curHost = location.hostname.toLowerCase();
+        const isPausedInList = pausedList.some(h => curHost === h || curHost.endsWith('.' + h));
+        const localPaused = localStorage.getItem('__browser_shield_paused');
+
+        let isPaused = false;
+        if (localPaused === 'true') {{
+            isPaused = true;
+        }} else if (localPaused === 'false') {{
+            isPaused = false;
+        }} else {{
+            isPaused = isPausedInList;
+        }}
+
+        window.__BROWSER_SHIELD_PAUSED__ = isPaused;
+        if (isPaused) {{
+            try {{ localStorage.setItem('__browser_shield_paused', 'true'); }} catch(e) {{}}
+        }} else {{
+            try {{ localStorage.removeItem('__browser_shield_paused'); }} catch(e) {{}}
+        }}
+    }} catch(e) {{}}
+}})();
+"#
+        );
+        let script_hstring = HSTRING::from(config_script);
+        let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+            |_res, _id| Ok(()),
+        ));
+        unsafe {
+            let _ = webview.AddScriptToExecuteOnDocumentCreated(
+                PCWSTR::from_raw(script_hstring.as_ptr()),
+                &handler,
+            );
+        }
+    }
+
     // Inject modern minimal overlay scrollbar script into all documents
     {
         let script_hstring = HSTRING::from(MODERN_SCROLLBAR_CSS_SCRIPT);
@@ -828,10 +896,11 @@ impl WebViewEngine {
             None => PCWSTR::null(),
         };
 
-        // Enable Windows 11 Fluent Overlay Scrollbars & smooth modern scrolling with performance flags & extension support
+        // Enable Windows 11 Fluent Overlay Scrollbars & smooth modern scrolling with performance flags
         let options_raw = CoreWebView2EnvironmentOptions::default();
         unsafe {
-            options_raw.set_are_browser_extensions_enabled(true);
+            // Extensions disabled to evaluate native Ad Shielding & YouTube fast-forwarding performance
+            options_raw.set_are_browser_extensions_enabled(false);
             options_raw.set_scroll_bar_style(COREWEBVIEW2_SCROLLBAR_STYLE_FLUENT_OVERLAY);
             options_raw.set_additional_browser_arguments(
                 "--enable-features=OverlayScrollbar,FluentOverlayScrollbar,FluentScrollbar --disable-features=CalculateNativeWinOcclusion".to_string(),
@@ -874,42 +943,7 @@ impl WebViewEngine {
 
         Ok(Self {
             environment,
-            spare_controller: Rc::new(RefCell::new(None)),
-            is_prewarming: Rc::new(Cell::new(false)),
         })
-    }
-
-    pub fn prewarm(&self, parent: HWND) {
-        if self.spare_controller.borrow().is_some() || self.is_prewarming.get() {
-            return;
-        }
-        self.is_prewarming.set(true);
-
-        let env = self.environment.clone();
-        let spare_cell = self.spare_controller.clone();
-        let prewarm_flag = self.is_prewarming.clone();
-
-        let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |error_code, ctrl| {
-            prewarm_flag.set(false);
-            if error_code.is_ok() {
-                if let Some(controller) = ctrl {
-                    if let Ok(webview) = unsafe { controller.CoreWebView2() } {
-                        unsafe {
-                            let _ = controller.SetIsVisible(false);
-                        }
-                        configure_webview_settings(&webview);
-                        inject_default_scripts(&webview);
-                        *spare_cell.borrow_mut() = Some((controller, webview));
-                        tracing::info!("Pre-warmed spare WebView2 controller ready");
-                    }
-                }
-            }
-            Ok(())
-        }));
-
-        unsafe {
-            let _ = env.CreateCoreWebView2Controller(parent, &handler);
-        }
     }
 
     pub fn create_controller(
@@ -928,13 +962,16 @@ impl WebViewEngine {
         on_fullscreen_changed: Option<Box<dyn Fn(bool) + Send + 'static>>,
         on_zapper_message: Option<Box<dyn Fn(ZapperMessage) + Send + 'static>>,
     ) -> Result<WebViewController, EngineError> {
-        let (controller, webview, is_spare) = if let Some((ctrl, wv)) = self.spare_controller.borrow_mut().take() {
-            (ctrl, wv, true)
-        } else {
+        let mut controller_opt = None;
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 5;
+
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
             let (tx, rx) = mpsc::channel();
             let env_clone = self.environment.clone();
 
-            CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
+            let wait_res = CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
                 Box::new(move |handler| unsafe {
                     env_clone
                         .CreateCoreWebView2Controller(parent, &handler)
@@ -957,15 +994,76 @@ impl WebViewEngine {
                     }
                     Ok(())
                 }),
-            )?;
+            );
 
-            let controller = rx
-                .recv()
-                .map_err(|e| EngineError::Channel(e.to_string()))??;
+            match wait_res {
+                Ok(()) => {
+                    match rx.recv().map_err(|e| EngineError::Channel(e.to_string()))? {
+                        Ok(ctrl) => {
+                            controller_opt = Some(ctrl);
+                            break;
+                        }
+                        Err(EngineError::Windows(e)) if e.code() == windows::core::HRESULT(0x800700AAu32 as i32) && attempts < MAX_ATTEMPTS => {
+                            tracing::warn!("CreateCoreWebView2Controller returned 0x800700AA (BUSY), retrying attempt {}...", attempts);
+                            let delay_ms = 60 * attempts as u64;
+                            let start = std::time::Instant::now();
+                            while start.elapsed() < std::time::Duration::from_millis(delay_ms) {
+                                let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+                                unsafe {
+                                    if windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                                        &mut msg,
+                                        None,
+                                        0,
+                                        0,
+                                        windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                                    ).as_bool() {
+                                        let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                                        windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                                    } else {
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
+                Err(webview2_com::Error::WindowsError(e)) if e.code() == windows::core::HRESULT(0x800700AAu32 as i32) && attempts < MAX_ATTEMPTS => {
+                    tracing::warn!("CreateCoreWebView2Controller synchronous call returned 0x800700AA (BUSY), retrying attempt {}...", attempts);
+                    let delay_ms = 60 * attempts as u64;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_millis(delay_ms) {
+                        let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+                        unsafe {
+                            if windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                                &mut msg,
+                                None,
+                                0,
+                                0,
+                                windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                            ).as_bool() {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+                                windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => return Err(EngineError::WebView2(e)),
+            }
+        }
 
-            let webview = unsafe { controller.CoreWebView2()? };
-            (controller, webview, false)
-        };
+        let controller = controller_opt.ok_or_else(|| {
+            EngineError::Windows(windows::core::Error::new(
+                windows::core::HRESULT(0x800700AAu32 as i32),
+                "CreateCoreWebView2Controller timed out or remained busy",
+            ))
+        })?;
+
+        let webview = unsafe { controller.CoreWebView2()? };
 
         let shield = shield_state.unwrap_or_else(|| std::sync::Arc::new(crate::shield::ShieldState::new()));
         let init_host = crate::shield::extract_host(initial_url).unwrap_or_default();
@@ -977,10 +1075,8 @@ impl WebViewEngine {
             controller.SetIsVisible(true)?;
         }
 
-        if !is_spare {
-            configure_webview_settings(&webview);
-            inject_default_scripts(&webview);
-        }
+        configure_webview_settings(&webview);
+        inject_default_scripts(&webview, Some(&shield));
 
         // Register WebResourceRequested filter for zero-latency ad & tracker blocking
         let filter_hstring = HSTRING::from("*");
@@ -994,6 +1090,7 @@ impl WebViewEngine {
         let env_req = self.environment.clone();
         let shield_req = shield.clone();
         let cur_host_req = current_host.clone();
+        let webview_req = webview.clone();
         let mut resource_token = 0;
         let resource_handler = WebResourceRequestedEventHandler::create(Box::new(
             move |_sender, args| {
@@ -1005,17 +1102,45 @@ impl WebViewEngine {
                                 unsafe {
                                     windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.as_ptr() as _));
                                 }
-                                let page_host = cur_host_req.read().map(|h| h.clone()).unwrap_or_default();
+                                let page_host = {
+                                    let mut src_ptr = windows::core::PWSTR::null();
+                                    if unsafe { webview_req.Source(&mut src_ptr) }.is_ok() && !src_ptr.is_null() {
+                                        let s = unsafe { src_ptr.to_string().unwrap_or_default() };
+                                        unsafe {
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(src_ptr.as_ptr() as _));
+                                        }
+                                        crate::shield::extract_host(&s).unwrap_or_else(|| {
+                                            cur_host_req.read().map(|h| h.clone()).unwrap_or_default()
+                                        })
+                                    } else {
+                                        cur_host_req.read().map(|h| h.clone()).unwrap_or_default()
+                                    }
+                                };
                                 let enabled = shield_req.is_enabled();
                                 let is_paused = shield_req.is_paused(&page_host);
 
                                 if crate::shield::should_block_request(&uri, &page_host, enabled, is_paused) {
-                                    let reason = HSTRING::from("Blocked by Shield");
-                                    let headers = HSTRING::from("Content-Length: 0\r\nConnection: close");
+                                    let is_yt = crate::shield::is_youtube_ad_url(&uri);
+                                    let (code, reason, headers, stream) = if is_yt {
+                                        let s = unsafe { windows::Win32::UI::Shell::SHCreateMemStream(Some(b"{}")) };
+                                        (
+                                            200,
+                                            HSTRING::from("OK"),
+                                            HSTRING::from("Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close"),
+                                            s,
+                                        )
+                                    } else {
+                                        (
+                                            403,
+                                            HSTRING::from("Blocked by Shield"),
+                                            HSTRING::from("Content-Length: 0\r\nConnection: close"),
+                                            None,
+                                        )
+                                    };
                                     if let Ok(resp) = unsafe {
                                         env_req.CreateWebResourceResponse(
-                                            None,
-                                            403,
+                                            stream.as_ref(),
+                                            code,
                                             PCWSTR::from_raw(reason.as_ptr()),
                                             PCWSTR::from_raw(headers.as_ptr()),
                                         )
@@ -1421,9 +1546,6 @@ impl WebViewEngine {
             webview.Navigate(PCWSTR::from_raw(url_hstring.as_ptr()))?;
         }
 
-        // Asynchronously pre-warm the next spare controller for instant tab creation!
-        self.prewarm(parent);
-
         Ok(WebViewController {
             controller,
             webview,
@@ -1431,16 +1553,6 @@ impl WebViewEngine {
             shield_state: shield,
             current_host,
         })
-    }
-}
-
-impl Drop for WebViewEngine {
-    fn drop(&mut self) {
-        if let Some((ctrl, _)) = self.spare_controller.borrow_mut().take() {
-            unsafe {
-                let _ = ctrl.Close();
-            }
-        }
     }
 }
 
@@ -1537,34 +1649,6 @@ impl WebViewController {
     pub fn focus(&self) -> Result<(), EngineError> {
         unsafe {
             let _ = self.controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-        }
-        Ok(())
-    }
-
-    pub fn load_extension(&self, extension_path: &Path) -> Result<(), EngineError> {
-        if let Ok(wv13) = self.webview.cast::<ICoreWebView2_13>() {
-            if let Ok(profile) = unsafe { wv13.Profile() } {
-                if let Ok(profile7) = profile.cast::<ICoreWebView2Profile7>() {
-                    let path_str = extension_path.to_string_lossy().to_string();
-                    let path_hstring = HSTRING::from(path_str);
-                    let handler = ProfileAddBrowserExtensionCompletedHandler::create(Box::new(
-                        |res, _ext| {
-                            if let Err(e) = res {
-                                tracing::warn!("Failed to load browser extension: {:?}", e);
-                            } else {
-                                tracing::info!("Browser extension loaded successfully!");
-                            }
-                            Ok(())
-                        },
-                    ));
-                    unsafe {
-                        let _ = profile7.AddBrowserExtension(
-                            PCWSTR::from_raw(path_hstring.as_ptr()),
-                            &handler,
-                        );
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -1718,6 +1802,13 @@ impl WebViewController {
     }
 
     pub fn get_current_host(&self) -> String {
+        if let Ok(url) = self.get_url() {
+            if let Some(h) = crate::shield::extract_host(&url) {
+                if !h.is_empty() {
+                    return h;
+                }
+            }
+        }
         self.current_host.read().map(|h| h.clone()).unwrap_or_default()
     }
 
@@ -1914,6 +2005,40 @@ impl Drop for WebViewController {
     fn drop(&mut self) {
         unsafe {
             let _ = self.controller.Close();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_multiple_controllers() {
+        init_com().unwrap();
+        let class = HSTRING::from("STATIC");
+        let title = HSTRING::from("TestWindow");
+        let hwnd = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+                PCWSTR::from_raw(class.as_ptr()),
+                PCWSTR::from_raw(title.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WS_OVERLAPPEDWINDOW,
+                0, 0, 800, 600,
+                None, None, None, None,
+            ).unwrap()
+        };
+        let app_data = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("Browser").join("WebView2Data");
+        let engine = WebViewEngine::new(Some(&app_data)).unwrap();
+        let bounds = RECT { left: 0, top: 0, right: 800, bottom: 600 };
+        for i in 1..=6 {
+            println!("Creating controller {}...", i);
+            let res = engine.create_controller(hwnd, bounds, "https://www.google.com", None, None, None, None, None, None, None, None, None, None);
+            println!("Controller {} result: {:?}", i, res.as_ref().map(|_| "OK"));
+            if let Err(e) = res {
+                println!("Controller {} ERROR: {:?}", i, e);
+                panic!("Failed controller {}: {:?}", i, e);
+            }
         }
     }
 }

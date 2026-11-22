@@ -1092,6 +1092,7 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<CommandBarState>) {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: None,
                 };
                 crate::sidebar::draw_webapp_icon(&cv, &badge, &tab_item, px(4.0), px);
             } else {

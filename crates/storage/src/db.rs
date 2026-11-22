@@ -38,6 +38,7 @@ pub struct SavedTab {
     pub is_pinned: bool,
     pub custom_title: bool,
     pub folder_id: Option<String>,
+    pub custom_letter: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,7 @@ impl Storage {
         )?;
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0", []);
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN folder_id TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_letter TEXT", []);
         let _ = self.conn.execute("ALTER TABLE folders ADD COLUMN is_open INTEGER NOT NULL DEFAULT 1", []);
         Ok(())
     }
@@ -324,7 +326,7 @@ impl Storage {
             .unwrap_or(0);
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tabs (id, title, url, position, is_pinned, custom_title, space_id, created_at, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', ?7, ?8)"
+                "INSERT INTO tabs (id, title, url, position, is_pinned, custom_title, space_id, created_at, folder_id, custom_letter) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', ?7, ?8, ?9)"
             )?;
             for t in tabs {
                 stmt.execute(params![
@@ -336,6 +338,7 @@ impl Storage {
                     if t.custom_title { 1 } else { 0 },
                     now,
                     t.folder_id,
+                    t.custom_letter,
                 ])?;
             }
         }
@@ -349,7 +352,7 @@ impl Storage {
 
     pub fn get_saved_tabs(&self) -> Result<Vec<SavedTab>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, url, position, is_pinned, custom_title, folder_id FROM tabs WHERE space_id = 'default' ORDER BY position ASC"
+            "SELECT id, title, url, position, is_pinned, custom_title, folder_id, custom_letter FROM tabs WHERE space_id = 'default' ORDER BY position ASC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SavedTab {
@@ -360,6 +363,7 @@ impl Storage {
                 is_pinned: row.get::<_, i32>(4)? != 0,
                 custom_title: row.get::<_, i32>(5).unwrap_or(0) != 0,
                 folder_id: row.get(6).ok(),
+                custom_letter: row.get(7).ok(),
             })
         })?;
         let mut res = Vec::new();
@@ -704,6 +708,7 @@ mod tests {
                 is_pinned: true,
                 custom_title: false,
                 folder_id: None,
+                custom_letter: Some("M".into()),
             },
             SavedTab {
                 id: "pin-custom".into(),
@@ -713,6 +718,7 @@ mod tests {
                 is_pinned: true,
                 custom_title: true,
                 folder_id: Some("f-work".into()),
+                custom_letter: None,
             },
             SavedTab {
                 id: "tab-1".into(),
@@ -722,6 +728,7 @@ mod tests {
                 is_pinned: false,
                 custom_title: false,
                 folder_id: None,
+                custom_letter: None,
             },
         ];
 

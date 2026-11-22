@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, IDC_ARROW, IDC_HAND, IDC_SIZEWE, MSG, SWP_FRAMECHANGED, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     WM_APP, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
     WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
 };
@@ -59,6 +59,7 @@ pub enum SidebarAction {
     DuplicateTab(usize),
     PromptRenameTab(usize),
     RenameTab(usize, String),
+    SetPinnedLetter(usize, String),
     CopyUrl,
     CopyCleanLink(usize),
     CopyCleanPinnedTab(usize),
@@ -97,10 +98,16 @@ pub enum SidebarAction {
     ToggleSiteShield,
     ToggleSiteCard,
     AcceptPermission(usize),
+    DropTab {
+        source: crate::sidebar::DragSource,
+        destination: crate::sidebar::TabDropDestination,
+    },
+    OpenFolder(usize),
 }
 
 const TAB_ANIM_TIMER_ID: usize = 0x4203;
 const INLINE_CARET_TIMER_ID: usize = 0x4301;
+const DRAG_HOVER_TIMER_ID: usize = 0x4205;
 
 pub struct WindowConfig {
     pub title: String,
@@ -147,6 +154,7 @@ struct WindowState {
     icon_picker: Option<crate::icon_picker::IconPicker>,
     site_card: Option<crate::site_card::SiteCard>,
     clear_data_dialog: Option<crate::confirm_dialog::ClearDataDialog>,
+    drag_candidate: Option<crate::sidebar::DragCandidate>,
 }
 
 #[inline]
@@ -205,6 +213,7 @@ impl BrowserWindow {
                 icon_picker: None,
                 site_card: None,
                 clear_data_dialog: None,
+                drag_candidate: None,
             }));
 
             let raw_state = Rc::into_raw(state.clone()) as *mut _;
@@ -371,6 +380,23 @@ impl BrowserWindow {
                 text: current_title.to_string(),
                 cursor: current_title.len(),
                 selection: Some((0, current_title.len())),
+                caret_visible: true,
+            });
+        }
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), INLINE_CARET_TIMER_ID, 500, None);
+            invalidate_sidebar(self.hwnd, &self.state);
+        }
+    }
+
+    pub fn start_inline_letter_pinned(&self, pinned_idx: usize, current_letter: &str) {
+        {
+            let mut b = self.state.borrow_mut();
+            b.sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                target: crate::sidebar::InlineEditTarget::PinnedLetter(pinned_idx),
+                text: current_letter.to_string(),
+                cursor: current_letter.len(),
+                selection: Some((0, current_letter.len())),
                 caret_visible: true,
             });
         }
@@ -774,6 +800,11 @@ unsafe extern "system" fn wndproc(
         WM_SETCURSOR => {
             let hit_test = (lparam.0 & 0xffff) as i16 as u32;
             if hit_test == HTCLIENT {
+                if state.borrow().sidebar_state.drag_state.is_some() {
+                    let arrow_c = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+                    let _ = SetCursor(Some(arrow_c));
+                    return LRESULT(1);
+                }
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
@@ -938,6 +969,121 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(0);
             }
 
+            // Check if starting or continuing a drag
+            let start_drag_info = {
+                let b = state.borrow();
+                if b.sidebar_state.drag_state.is_none() {
+                    if let Some(cand) = b.drag_candidate {
+                        let dist = (((x - cand.start_x).pow(2) + (y - cand.start_y).pow(2)) as f32).sqrt();
+                        if dist >= 4.0 {
+                            let item = match cand.source {
+                                crate::sidebar::DragSource::Tab(idx) => {
+                                    b.sidebar_state.tabs.get(idx).map(|t| crate::sidebar::DragCarriedItem {
+                                        title: t.title.clone(),
+                                        url: t.url.clone(),
+                                        accent: t.accent,
+                                        favicon: t.favicon.clone(),
+                                        is_loaded: t.is_loaded,
+                                        custom_letter: t.custom_letter.clone(),
+                                    })
+                                }
+                                crate::sidebar::DragSource::Pinned(idx) => {
+                                    b.sidebar_state.pinned.get(idx).map(|p| crate::sidebar::DragCarriedItem {
+                                        title: p.title.clone(),
+                                        url: p.url.clone(),
+                                        accent: p.accent,
+                                        favicon: p.favicon.clone(),
+                                        is_loaded: p.is_loaded,
+                                        custom_letter: p.custom_letter.clone(),
+                                    })
+                                }
+                            };
+                            item.map(|it| (cand.source, cand.start_x, cand.start_y, it))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some((src, sx, sy, it)) = start_drag_info {
+                let mut b = state.borrow_mut();
+                b.sidebar_state.drag_state = Some(crate::sidebar::DragState {
+                    source: src,
+                    item: it,
+                    start_x: sx,
+                    start_y: sy,
+                    cur_x: x,
+                    cur_y: y,
+                    target: None,
+                    folder_hover_start: None,
+                });
+                let _ = SetCapture(hwnd);
+            }
+
+            let is_dragging = state.borrow().sidebar_state.drag_state.is_some();
+            if is_dragging {
+                let (_, sidebar_rect) = compute_layout_rects(hwnd, state);
+                let target = {
+                    let b = state.borrow();
+                    b.sidebar.compute_drag_target(hwnd, &b.sidebar_state, x, y, sidebar_rect)
+                };
+
+                let folder_to_open = {
+                    let mut b = state.borrow_mut();
+                    let SidebarState { ref mut drag_state, ref folders, .. } = b.sidebar_state;
+                    if let Some(ref mut ds) = drag_state {
+                        ds.cur_x = x;
+                        ds.cur_y = y;
+                        ds.target = target;
+
+                        // Check folder hover auto-open
+                        if let Some(crate::sidebar::DragTarget::Folder(f_idx)) = ds.target {
+                            let is_closed = folders.get(f_idx).map_or(false, |f| !f.is_open);
+                            if is_closed {
+                                match ds.folder_hover_start {
+                                    Some((idx, start)) if idx == f_idx => {
+                                        if start.elapsed() >= std::time::Duration::from_millis(200) {
+                                            ds.folder_hover_start = None;
+                                            Some(f_idx)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => {
+                                        ds.folder_hover_start = Some((f_idx, std::time::Instant::now()));
+                                        unsafe { let _ = SetTimer(Some(hwnd), DRAG_HOVER_TIMER_ID, 60, None); }
+                                        None
+                                    }
+                                }
+                            } else {
+                                ds.folder_hover_start = None;
+                                None
+                            }
+                        } else {
+                            ds.folder_hover_start = None;
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(f_idx) = folder_to_open {
+                    let on_action = state.borrow().on_action.clone();
+                    if let Some(ref cb) = on_action {
+                        cb(SidebarAction::OpenFolder(f_idx));
+                    }
+                }
+
+                invalidate_sidebar(hwnd, state);
+                return LRESULT(0);
+            }
+
             if !state.borrow().is_tracking_mouse {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -993,7 +1139,7 @@ unsafe extern "system" fn wndproc(
             }
             return LRESULT(0);
         }
-        WM_LBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             if let Some(ref menu) = state.borrow().context_menu {
                 if menu.is_visible() {
                     menu.hide();
@@ -1021,6 +1167,9 @@ unsafe extern "system" fn wndproc(
                             crate::sidebar::InlineEditTarget::Tab(idx) => {
                                 cb(SidebarAction::RenameTab(idx, trimmed));
                             }
+                            crate::sidebar::InlineEditTarget::PinnedLetter(idx) => {
+                                cb(SidebarAction::SetPinnedLetter(idx, trimmed));
+                            }
                         }
                     }
                 }
@@ -1044,7 +1193,44 @@ unsafe extern "system" fn wndproc(
             }
 
             let hit = hit_at(hwnd, state, x, y);
+            if msg == WM_LBUTTONDBLCLK {
+                if let SidebarHit::Pinned(i) = hit {
+                    state.borrow_mut().drag_candidate = None;
+                    let cur_letter = state.borrow().sidebar_state.pinned.get(i).and_then(|p| p.custom_letter.clone()).unwrap_or_default();
+                    state.borrow_mut().sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                        target: crate::sidebar::InlineEditTarget::PinnedLetter(i),
+                        text: cur_letter.clone(),
+                        cursor: cur_letter.len(),
+                        selection: Some((0, cur_letter.len())),
+                        caret_visible: true,
+                    });
+                    unsafe {
+                        let _ = SetTimer(Some(hwnd), INLINE_CARET_TIMER_ID, 500, None);
+                        invalidate_sidebar(hwnd, state);
+                    }
+                    return LRESULT(0);
+                }
+            }
             if hit != SidebarHit::None {
+                match hit {
+                    SidebarHit::Tab(i) => {
+                        state.borrow_mut().drag_candidate = Some(crate::sidebar::DragCandidate {
+                            source: crate::sidebar::DragSource::Tab(i),
+                            start_x: x,
+                            start_y: y,
+                        });
+                    }
+                    SidebarHit::Pinned(i) => {
+                        state.borrow_mut().drag_candidate = Some(crate::sidebar::DragCandidate {
+                            source: crate::sidebar::DragSource::Pinned(i),
+                            start_x: x,
+                            start_y: y,
+                        });
+                    }
+                    _ => {
+                        state.borrow_mut().drag_candidate = None;
+                    }
+                }
                 state.borrow_mut().pressed_hit = hit;
                 let _ = SetCapture(hwnd);
                 invalidate_sidebar(hwnd, state);
@@ -1059,6 +1245,59 @@ unsafe extern "system" fn wndproc(
                 state.borrow_mut().is_resizing_sidebar = false;
                 let _ = ReleaseCapture();
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                return LRESULT(0);
+            }
+
+            let drag = {
+                let mut b = state.borrow_mut();
+                b.drag_candidate = None;
+                b.sidebar_state.drag_state.take()
+            };
+
+            if let Some(drag) = drag {
+                let _ = ReleaseCapture();
+                unsafe { let _ = KillTimer(Some(hwnd), DRAG_HOVER_TIMER_ID); }
+                state.borrow_mut().pressed_hit = SidebarHit::None;
+
+                if let Some(target) = drag.target {
+                    let dest = {
+                        let b = state.borrow();
+                        match target {
+                            crate::sidebar::DragTarget::Favorites(slot) => {
+                                Some(crate::sidebar::TabDropDestination::Favorites(slot))
+                            }
+                            crate::sidebar::DragTarget::Folder(f_idx) => {
+                                b.sidebar_state.folders.get(f_idx).map(|f| crate::sidebar::TabDropDestination::Folder(f.id.clone()))
+                            }
+                            crate::sidebar::DragTarget::FolderInsert { folder_idx, insert_idx } => {
+                                b.sidebar_state.folders.get(folder_idx).map(|f| {
+                                    crate::sidebar::TabDropDestination::FolderInsert {
+                                        folder_id: f.id.clone(),
+                                        insert_idx,
+                                    }
+                                })
+                            }
+                            crate::sidebar::DragTarget::PinnedSection(slot) => {
+                                Some(crate::sidebar::TabDropDestination::PinnedSection(slot))
+                            }
+                            crate::sidebar::DragTarget::NormalTabs(slot) => {
+                                Some(crate::sidebar::TabDropDestination::NormalTabs(slot))
+                            }
+                        }
+                    };
+
+                    if let Some(destination) = dest {
+                        let on_action = state.borrow().on_action.clone();
+                        if let Some(ref cb) = on_action {
+                            cb(SidebarAction::DropTab {
+                                source: drag.source,
+                                destination,
+                            });
+                        }
+                    }
+                }
+
+                invalidate_sidebar(hwnd, state);
                 return LRESULT(0);
             }
 
@@ -1447,11 +1686,20 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item_disabled(10, "Reopen Closed Tab", Some("Ctrl+Shift+T"))
                         };
 
-                        let items = vec![
+                        let has_custom_letter = pin.custom_letter.is_some();
+                        let letter_label = if has_custom_letter { "Change Letter..." } else { "Assign Letter..." };
+
+                        let mut items = vec![
                             crate::context_menu::ContextMenuItem::item(1, "Reload Tab", Some("Ctrl+R")),
                             crate::context_menu::ContextMenuItem::item(2, mute_label, None),
                             crate::context_menu::ContextMenuItem::item(3, "Unfavourite Tab", Some("Ctrl+Shift+X")),
                             crate::context_menu::ContextMenuItem::separator(),
+                            crate::context_menu::ContextMenuItem::item(17, letter_label, None),
+                        ];
+                        if has_custom_letter {
+                            items.push(crate::context_menu::ContextMenuItem::item(18, "Reset to Website Favicon", None));
+                        }
+                        items.extend(vec![
                             crate::context_menu::ContextMenuItem::item(4, "Change Label...", None),
                             crate::context_menu::ContextMenuItem::separator(),
                             unload_item,
@@ -1462,7 +1710,7 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::separator(),
                             crate::context_menu::ContextMenuItem::item(8, "Close Tab", Some("Ctrl+W")),
                             reopen_item,
-                        ];
+                        ]);
 
                         let on_action = state.borrow().on_action.clone();
                         if let Some(ref menu) = state.borrow().context_menu {
@@ -1473,6 +1721,21 @@ unsafe extern "system" fn wndproc(
                                         2 => cb(SidebarAction::ToggleMutePinnedTab(idx)),
                                         3 => cb(SidebarAction::UnpinTab(idx)),
                                         4 => cb(SidebarAction::PromptRenameTab(idx)),
+                                        17 => {
+                                            let cur_letter = state.borrow().sidebar_state.pinned.get(idx).and_then(|p| p.custom_letter.clone()).unwrap_or_default();
+                                            state.borrow_mut().sidebar_state.inline_edit = Some(crate::sidebar::InlineEditState {
+                                                target: crate::sidebar::InlineEditTarget::PinnedLetter(idx),
+                                                text: cur_letter.clone(),
+                                                cursor: cur_letter.len(),
+                                                selection: Some((0, cur_letter.len())),
+                                                caret_visible: true,
+                                            });
+                                            unsafe {
+                                                let _ = SetTimer(Some(hwnd), INLINE_CARET_TIMER_ID, 500, None);
+                                                invalidate_sidebar(hwnd, state);
+                                            }
+                                        }
+                                        18 => cb(SidebarAction::SetPinnedLetter(idx, String::new())),
                                         5 => cb(SidebarAction::UnloadTab(idx)),
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::SharePinnedTab(idx)),
@@ -1543,25 +1806,10 @@ unsafe extern "system" fn wndproc(
             if pt.x >= r.left && state.borrow().sidebar_visible {
                 let dpi = GetDpiForWindow(hwnd);
                 let step = (48.0 * dpi as f32 / 96.0) as i32;
-                // Wheel over the top section (folders + pinned tabs) scrolls that box only.
-                let over_top = {
-                    let b = state.borrow();
-                    let ll = b.sidebar.last_layout.borrow();
-                    let hit = ll
-                        .as_ref()
-                        .map(|l| l.top_clip.bottom > l.top_clip.top && pt.y >= l.top_clip.top && pt.y < l.top_clip.bottom)
-                        .unwrap_or(false);
-                    hit
-                };
                 {
                     let mut b = state.borrow_mut();
-                    if over_top {
-                        let cur = b.sidebar_state.scroll_top;
-                        b.sidebar_state.scroll_top = cur - delta * step / 120;
-                    } else {
-                        let cur = b.sidebar_state.scroll;
-                        b.sidebar_state.scroll = cur - delta * step / 120;
-                    }
+                    let cur = b.sidebar_state.scroll;
+                    b.sidebar_state.scroll = cur - delta * step / 120;
                 }
                 clamp_scroll(hwnd, state);
                 invalidate_sidebar(hwnd, state);
@@ -1594,6 +1842,22 @@ unsafe extern "system" fn wndproc(
             return LRESULT(0);
         }
         WM_KEYDOWN => {
+            if (wparam.0 as i32) == 0x1B {
+                let was_drag = {
+                    let mut b = state.borrow_mut();
+                    b.drag_candidate = None;
+                    b.sidebar_state.drag_state.take().is_some()
+                };
+                if was_drag {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                        let _ = KillTimer(Some(hwnd), DRAG_HOVER_TIMER_ID);
+                    }
+                    state.borrow_mut().pressed_hit = SidebarHit::None;
+                    unsafe { invalidate_sidebar(hwnd, state); }
+                    return LRESULT(0);
+                }
+            }
             let has_edit = state.borrow().sidebar_state.inline_edit.is_some();
             if has_edit {
                 match wparam.0 as i32 {
@@ -1602,16 +1866,21 @@ unsafe extern "system" fn wndproc(
                         let edit_opt = state.borrow_mut().sidebar_state.inline_edit.take();
                         if let Some(ed) = edit_opt {
                             let trimmed = ed.text.trim().to_string();
-                            if !trimmed.is_empty() {
-                                let on_action = state.borrow().on_action.clone();
-                                if let Some(ref cb) = on_action {
-                                    match ed.target {
-                                        crate::sidebar::InlineEditTarget::Folder(fid) => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(ref cb) = on_action {
+                                match ed.target {
+                                    crate::sidebar::InlineEditTarget::Folder(fid) => {
+                                        if !trimmed.is_empty() {
                                             cb(SidebarAction::RenameFolder(fid, trimmed));
                                         }
-                                        crate::sidebar::InlineEditTarget::Tab(idx) => {
+                                    }
+                                    crate::sidebar::InlineEditTarget::Tab(idx) => {
+                                        if !trimmed.is_empty() {
                                             cb(SidebarAction::RenameTab(idx, trimmed));
                                         }
+                                    }
+                                    crate::sidebar::InlineEditTarget::PinnedLetter(idx) => {
+                                        cb(SidebarAction::SetPinnedLetter(idx, trimmed));
                                     }
                                 }
                             }
@@ -1862,16 +2131,24 @@ unsafe extern "system" fn wndproc(
                 if let Some(c) = char::from_u32(ch as u32) {
                     let mut b = state.borrow_mut();
                     if let Some(ref mut ed) = b.sidebar_state.inline_edit {
-                        if let Some((s_idx, e_idx)) = ed.selection.take() {
-                            let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
-                            let min_i = min_i.min(ed.text.len());
-                            let max_i = max_i.min(ed.text.len());
-                            ed.text.drain(min_i..max_i);
-                            ed.cursor = min_i;
+                        if matches!(ed.target, crate::sidebar::InlineEditTarget::PinnedLetter(_)) {
+                            let upper = c.to_uppercase().to_string();
+                            ed.text = upper.chars().take(1).collect();
+                            ed.cursor = ed.text.len();
+                            ed.selection = None;
+                            ed.caret_visible = true;
+                        } else {
+                            if let Some((s_idx, e_idx)) = ed.selection.take() {
+                                let (min_i, max_i) = if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) };
+                                let min_i = min_i.min(ed.text.len());
+                                let max_i = max_i.min(ed.text.len());
+                                ed.text.drain(min_i..max_i);
+                                ed.cursor = min_i;
+                            }
+                            ed.text.insert(ed.cursor, c);
+                            ed.cursor += c.len_utf8();
+                            ed.caret_visible = true;
                         }
-                        ed.text.insert(ed.cursor, c);
-                        ed.cursor += c.len_utf8();
-                        ed.caret_visible = true;
                     }
                     drop(b);
                     unsafe {
@@ -1906,6 +2183,45 @@ unsafe extern "system" fn wndproc(
             let handler = state.borrow().on_custom_msg.clone();
             if let Some(handler) = handler {
                 handler(msg, wparam, lparam);
+            }
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == DRAG_HOVER_TIMER_ID => {
+            let folder_to_open = {
+                let mut b = state.borrow_mut();
+                let SidebarState { ref mut drag_state, ref folders, .. } = b.sidebar_state;
+                if let Some(ref mut ds) = drag_state {
+                    if let Some(crate::sidebar::DragTarget::Folder(f_idx)) = ds.target {
+                        let is_closed = folders.get(f_idx).map_or(false, |f| !f.is_open);
+                        if is_closed {
+                            if let Some((idx, start)) = ds.folder_hover_start {
+                                if idx == f_idx && start.elapsed() >= std::time::Duration::from_millis(200) {
+                                    ds.folder_hover_start = None;
+                                    Some(f_idx)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            ds.folder_hover_start = None;
+                            None
+                        }
+                    } else {
+                        ds.folder_hover_start = None;
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(f_idx) = folder_to_open {
+                unsafe { let _ = KillTimer(Some(hwnd), DRAG_HOVER_TIMER_ID); }
+                let on_action = state.borrow().on_action.clone();
+                if let Some(ref cb) = on_action {
+                    cb(SidebarAction::OpenFolder(f_idx));
+                }
             }
             return LRESULT(0);
         }

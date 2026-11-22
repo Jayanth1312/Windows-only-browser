@@ -669,6 +669,14 @@ unsafe extern "system" fn site_card_wndproc(
                             cb(SiteCardAction::Share);
                         }
                         SiteCardHit::Bookmark => {
+                            {
+                                let mut st_mut = (*ptr).borrow_mut();
+                                st_mut.data.is_bookmarked = !st_mut.data.is_bookmarked;
+                            }
+                            let sc = SiteCard { hwnd, state: Rc::from_raw(ptr) };
+                            sc.render();
+                            let _ = Rc::into_raw(sc.state);
+
                             cb(SiteCardAction::Bookmark);
                         }
                         SiteCardHit::Zap => {
@@ -683,6 +691,14 @@ unsafe extern "system" fn site_card_wndproc(
                             cb(SiteCardAction::RestoreHiddenElements);
                         }
                         SiteCardHit::ToggleShield => {
+                            {
+                                let mut st_mut = (*ptr).borrow_mut();
+                                st_mut.data.shield_paused_for_site = !st_mut.data.shield_paused_for_site;
+                            }
+                            let sc = SiteCard { hwnd, state: Rc::from_raw(ptr) };
+                            sc.render();
+                            let _ = Rc::into_raw(sc.state);
+
                             cb(SiteCardAction::ToggleShield);
                         }
                         SiteCardHit::SecurityBadge => {

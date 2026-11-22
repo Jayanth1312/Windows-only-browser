@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -77,6 +77,7 @@ struct Tab {
     is_pinned: bool,
     folder_id: Option<String>,
     custom_title: bool,
+    custom_letter: Option<String>,
     is_muted: bool,
     controller: Option<WebViewController>,
     last_active: Instant,
@@ -101,6 +102,7 @@ enum AppEvent {
     ReloadSpecificPinnedTab(usize),
     PromptRenameTab(usize),
     RenameTab(usize, String),
+    SetPinnedLetter(usize, String),
     Navigate(String),
     NavBack,
     NavForward,
@@ -172,6 +174,11 @@ enum AppEvent {
     AcceptPermission(usize),
     CaptureScreenshot,
     ShareCurrentPage,
+    DropTab {
+        source: ui::DragSource,
+        destination: ui::TabDropDestination,
+    },
+    OpenFolder(usize),
 }
 
 fn show_windows_share_ui(hwnd: HWND, title: &str, url: &str) -> windows::core::Result<()> {
@@ -284,57 +291,12 @@ struct BrowserApp {
     storage: Rc<RefCell<Storage>>,
     event_tx: mpsc::Sender<AppEvent>,
     favicon_cache: std::collections::HashMap<String, std::sync::Arc<ui::FaviconData>>,
-    extension_dir: Option<PathBuf>,
-    extension_loaded: bool,
     persist_dirty: bool,
     last_persist: Instant,
     closed_tabs: Vec<ClosedTab>,
     sidebar_before_fullscreen: Option<bool>,
     last_anim_tick: Instant,
     shield_state: std::sync::Arc<engine::ShieldState>,
-}
-
-const UBOL_VERSION: &str = "2026.1116.1650";
-
-/// Downloads and unpacks the official uBlock Origin Lite (Chromium build) once.
-fn ensure_ubol(ext_dir: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    if ext_dir.join("manifest.json").exists() {
-        return true;
-    }
-    let parent = match ext_dir.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    let _ = std::fs::create_dir_all(ext_dir);
-    let zip_path = parent.join("ubol.zip");
-    let url = format!(
-        "https://github.com/uBlockOrigin/uBOL-home/releases/download/{v}/uBOLite_{v}.chromium.zip",
-        v = UBOL_VERSION
-    );
-    let dl = std::process::Command::new("curl.exe")
-        .args(["-s", "-L", "--fail", "--max-time", "180", "-o"])
-        .arg(&zip_path)
-        .arg(&url)
-        .creation_flags(0x08000000)
-        .status();
-    if !matches!(dl, Ok(s) if s.success()) {
-        tracing::warn!("uBOL download failed");
-        let _ = std::fs::remove_file(&zip_path);
-        return false;
-    }
-    let ex = std::process::Command::new("tar.exe")
-        .arg("-xf")
-        .arg(&zip_path)
-        .arg("-C")
-        .arg(ext_dir)
-        .creation_flags(0x08000000)
-        .status();
-    let _ = std::fs::remove_file(&zip_path);
-    if !matches!(ex, Ok(s) if s.success()) {
-        tracing::warn!("uBOL extract failed");
-    }
-    ext_dir.join("manifest.json").exists()
 }
 
 fn get_base_domain(domain: &str) -> Option<String> {
@@ -382,7 +344,6 @@ impl BrowserApp {
         engine: Rc<WebViewEngine>,
         storage: Rc<RefCell<Storage>>,
         event_tx: mpsc::Sender<AppEvent>,
-        extension_dir: Option<PathBuf>,
     ) -> Self {
         let mut favicon_cache = std::collections::HashMap::new();
 
@@ -462,6 +423,7 @@ impl BrowserApp {
                         anim_progress: 1.0,
                         is_closing: false,
                         folder_id: None,
+                        custom_letter: s.custom_letter,
                     }
                 })
                 .collect()
@@ -480,6 +442,7 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: None,
                 },
                 TabItem {
                     id: "pin-github".into(),
@@ -494,6 +457,7 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: None,
                 },
                 TabItem {
                     id: "pin-youtube".into(),
@@ -512,6 +476,7 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: None,
                 },
             ];
             for sc in &defaults {
@@ -565,6 +530,7 @@ impl BrowserApp {
                 is_pinned: false,
                 folder_id: s.folder_id,
                 custom_title: s.custom_title,
+                custom_letter: s.custom_letter,
                 is_muted: false,
                 controller: None, // sleeping, will be activated if active tab
                 last_active: Instant::now(),
@@ -602,8 +568,6 @@ impl BrowserApp {
             storage,
             event_tx,
             favicon_cache,
-            extension_dir,
-            extension_loaded: false,
             persist_dirty: false,
             last_persist: Instant::now(),
             closed_tabs: Vec::new(),
@@ -640,6 +604,7 @@ impl BrowserApp {
                     is_pinned: true,
                     custom_title: false,
                     folder_id: None,
+                    custom_letter: sc.custom_letter.clone(),
                 });
                 pos += 1;
             }
@@ -653,6 +618,7 @@ impl BrowserApp {
                         is_pinned: false,
                         custom_title: t.custom_title,
                         folder_id: t.folder_id.clone(),
+                        custom_letter: t.custom_letter.clone(),
                     });
                     pos += 1;
                 }
@@ -886,15 +852,7 @@ impl BrowserApp {
             Some(on_fullscreen),
             Some(on_zapper),
         ) {
-            Ok(c) => {
-                if !self.extension_loaded {
-                    if let Some(ref ext_dir) = self.extension_dir {
-                        let _ = c.load_extension(ext_dir);
-                        self.extension_loaded = true;
-                    }
-                }
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
                 info!("Failed to create tab controller: {}", e);
                 return;
@@ -924,6 +882,7 @@ impl BrowserApp {
             is_pinned,
             folder_id: None,
             custom_title: false,
+            custom_letter: None,
             is_muted: false,
             controller: Some(controller),
             last_active: Instant::now(),
@@ -1121,12 +1080,6 @@ impl BrowserApp {
             Some(on_zapper),
         ) {
             Ok(c) => {
-                if !self.extension_loaded {
-                    if let Some(ref ext_dir) = self.extension_dir {
-                        let _ = c.load_extension(ext_dir);
-                        self.extension_loaded = true;
-                    }
-                }
                 if self.tabs[idx].is_muted {
                     let _ = c.set_muted(true);
                 }
@@ -1134,6 +1087,7 @@ impl BrowserApp {
             }
             Err(e) => {
                 info!("Failed to create tab controller on wake: {}", e);
+                self.window.set_loading(false, 0.0);
             }
         }
     }
@@ -1363,6 +1317,7 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: sc.custom_letter.clone().or_else(|| t.custom_letter.clone()),
                 });
             } else {
                 pinned_items.push(TabItem {
@@ -1376,6 +1331,7 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     folder_id: None,
+                    custom_letter: sc.custom_letter.clone(),
                 });
             }
         }
@@ -1396,6 +1352,7 @@ impl BrowserApp {
                     anim_progress: t.anim_progress,
                     is_closing: t.is_closing,
                     folder_id: t.folder_id.clone(),
+                    custom_letter: t.custom_letter.clone(),
                 });
             }
         }
@@ -1458,7 +1415,6 @@ impl BrowserApp {
             }
             AppEvent::SelectPinned(idx) => {
                 if let Some(sc) = self.pinned_shortcuts.get(idx) {
-                    self.window.set_loading(true, 0.25);
                     let sc_url = sc.url.clone();
                     let sc_domain = ui::domain_of(&sc_url);
                     let open_tab_pos = self.tabs.iter().position(|t| {
@@ -1547,6 +1503,7 @@ impl BrowserApp {
                             anim_progress: 1.0,
                             is_closing: false,
                             folder_id: None,
+                            custom_letter: self.tabs[pos].custom_letter.clone(),
                         });
                     }
                     self.window.show_toast("Added to Favourite tabs");
@@ -1574,6 +1531,7 @@ impl BrowserApp {
                             is_pinned: false,
                             folder_id: None,
                             custom_title: false,
+                            custom_letter: removed.custom_letter,
                             is_muted: false,
                             controller: None, // Sleeping!
                             last_active: Instant::now(),
@@ -1613,6 +1571,28 @@ impl BrowserApp {
                     }
                     self.sync_tabs_ui();
                     self.mark_dirty();
+                }
+            }
+            AppEvent::SetPinnedLetter(idx, letter) => {
+                if idx < self.pinned_shortcuts.len() {
+                    let letter_val = if letter.trim().is_empty() {
+                        None
+                    } else {
+                        // Take the first char as uppercase
+                        let c = letter.trim().chars().next().map(|ch| ch.to_uppercase().to_string());
+                        c
+                    };
+                    self.pinned_shortcuts[idx].custom_letter = letter_val.clone();
+                    let sc_url = self.pinned_shortcuts[idx].url.clone();
+                    let sc_domain = ui::domain_of(&sc_url);
+                    if let Some(pos) = self.tabs.iter().position(|t| {
+                        t.is_pinned && (t.url == sc_url || (!sc_domain.is_empty() && ui::domain_of(&t.url) == sc_domain))
+                    }) {
+                        self.tabs[pos].custom_letter = letter_val;
+                    }
+                    self.sync_tabs_ui();
+                    self.mark_dirty();
+                    self.persist_state();
                 }
             }
             AppEvent::CloseTab(idx) => {
@@ -2166,12 +2146,35 @@ impl BrowserApp {
                 }
             }
             AppEvent::TogglePinCurrentTab => {
+                let mut is_pinned = false;
                 if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
                     tab.is_pinned = !tab.is_pinned;
+                    is_pinned = tab.is_pinned;
                     if tab.is_pinned {
                         self.window.show_toast("Added to Favourite tabs");
                     } else {
                         self.window.show_toast("Removed from Favourite tabs");
+                    }
+                }
+                if self.window.is_site_card_visible() {
+                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                        let active_host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+                        let hidden_count = if let Ok(st) = self.storage.try_borrow() {
+                            st.get_hidden_elements(&active_host).map(|l| l.len()).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let card_data = SiteCardData {
+                            url: tab.url.clone(),
+                            host: active_host.clone(),
+                            is_secure: tab.url.starts_with("https://"),
+                            is_bookmarked: is_pinned,
+                            shield_enabled: self.shield_state.is_enabled(),
+                            shield_paused_for_site: self.shield_state.is_paused(&active_host),
+                            trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
+                            hidden_elements_count: hidden_count,
+                        };
+                        self.window.update_site_card(card_data);
                     }
                 }
                 self.sync_tabs_ui();
@@ -2459,6 +2462,67 @@ impl BrowserApp {
                     "Shield Paused: Protection Disabled Globally".to_string()
                 };
                 self.window.show_toast(&msg);
+
+                // Update SiteCard if visible so toggle knob reflects new state
+                if self.window.is_site_card_visible() {
+                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                        let active_host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+                        let is_bookmarked = tab.is_pinned;
+                        let hidden_count = if let Ok(st) = self.storage.try_borrow() {
+                            st.get_hidden_elements(&active_host).map(|l| l.len()).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let card_data = SiteCardData {
+                            url: tab.url.clone(),
+                            host: active_host.clone(),
+                            is_secure: tab.url.starts_with("https://"),
+                            is_bookmarked,
+                            shield_enabled: new_enabled,
+                            shield_paused_for_site: self.shield_state.is_paused(&active_host),
+                            trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
+                            hidden_elements_count: hidden_count,
+                        };
+                        self.window.update_site_card(card_data);
+                    }
+                }
+
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref ctrl) = tab.controller {
+                        let script = if new_enabled {
+                            r#"
+                                (() => {
+                                    try {
+                                        window.__BROWSER_SHIELD_ENABLED__ = true;
+                                        localStorage.setItem('__browser_shield_global_enabled', 'true');
+                                    } catch(e) {}
+                                    location.reload();
+                                })();
+                            "#
+                        } else {
+                            r#"
+                                (() => {
+                                    try {
+                                        window.__BROWSER_SHIELD_ENABLED__ = false;
+                                        localStorage.setItem('__browser_shield_global_enabled', 'false');
+                                        const s = document.getElementById('__browser_shield_cosmetic__');
+                                        if (s) s.remove();
+                                        const v = document.querySelector('video');
+                                        if (v) {
+                                            if (v.playbackRate === 16) v.playbackRate = 1.0;
+                                            v.muted = false;
+                                        }
+                                    } catch(e) {}
+                                    location.reload();
+                                })();
+                            "#
+                        };
+                        if ctrl.execute_script(script).is_err() {
+                            let _ = ctrl.reload();
+                        }
+                    }
+                }
+
                 self.sync_tabs_ui();
             }
             AppEvent::ToggleSiteShield => {
@@ -2483,6 +2547,68 @@ impl BrowserApp {
                     format!("Shield Active for {}", active_host)
                 };
                 self.window.show_toast(&msg);
+
+                // Update SiteCard if visible so toggle knob and status match
+                if self.window.is_site_card_visible() {
+                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                        let is_bookmarked = tab.is_pinned;
+                        let hidden_count = if let Ok(st) = self.storage.try_borrow() {
+                            st.get_hidden_elements(&active_host).map(|l| l.len()).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let card_data = SiteCardData {
+                            url: tab.url.clone(),
+                            host: active_host.clone(),
+                            is_secure: tab.url.starts_with("https://"),
+                            is_bookmarked,
+                            shield_enabled: self.shield_state.is_enabled(),
+                            shield_paused_for_site: new_paused,
+                            trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
+                            hidden_elements_count: hidden_count,
+                        };
+                        self.window.update_site_card(card_data);
+                    }
+                }
+
+                // Update live page state and reload so ads load/strip according to updated policy
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref ctrl) = tab.controller {
+                        let script = if new_paused {
+                            r#"
+                                (() => {
+                                    try {
+                                        window.__BROWSER_SHIELD_PAUSED__ = true;
+                                        localStorage.setItem('__browser_shield_paused', 'true');
+                                        const s = document.getElementById('__browser_shield_cosmetic__');
+                                        if (s) s.remove();
+                                        const v = document.querySelector('video');
+                                        if (v) {
+                                            if (v.playbackRate === 16) v.playbackRate = 1.0;
+                                            v.muted = false;
+                                        }
+                                    } catch(e) {}
+                                    location.reload();
+                                })();
+                            "#
+                        } else {
+                            r#"
+                                (() => {
+                                    try {
+                                        window.__BROWSER_SHIELD_PAUSED__ = false;
+                                        localStorage.setItem('__browser_shield_paused', 'false');
+                                        localStorage.removeItem('__browser_shield_paused');
+                                    } catch(e) {}
+                                    location.reload();
+                                })();
+                            "#
+                        };
+                        if ctrl.execute_script(script).is_err() {
+                            let _ = ctrl.reload();
+                        }
+                    }
+                }
+
                 self.sync_tabs_ui();
             }
             AppEvent::ToggleSiteCard => {
@@ -2653,6 +2779,307 @@ impl BrowserApp {
                 capture_screenshot_to_clipboard(self.window.hwnd());
                 self.window.show_toast("Screenshot copied to clipboard");
             }
+            AppEvent::OpenFolder(idx) => {
+                if let Some(folder) = self.folders.get_mut(idx) {
+                    if !folder.is_open {
+                        folder.is_open = true;
+                        self.window.start_tab_anim_timer();
+                        self.sync_tabs_ui();
+                        self.persist_state();
+                    }
+                }
+            }
+            AppEvent::DropTab { source, destination } => {
+                self.handle_tab_drop(source, destination);
+            }
+        }
+    }
+
+    fn move_tab_to_section_slot(
+        &mut self,
+        tab_id: &str,
+        new_folder_id: Option<String>,
+        slot: usize,
+    ) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+            let mut tab = self.tabs.remove(pos);
+            tab.folder_id = new_folder_id.clone();
+            tab.is_pinned = false;
+
+            let matching_indices: Vec<usize> = self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.is_pinned && t.folder_id == new_folder_id)
+                .map(|(i, _)| i)
+                .collect();
+
+            if matching_indices.is_empty() {
+                self.tabs.push(tab);
+            } else if slot < matching_indices.len() {
+                self.tabs.insert(matching_indices[slot], tab);
+            } else {
+                let last_idx = *matching_indices.last().unwrap();
+                self.tabs.insert(last_idx + 1, tab);
+            }
+        }
+        if let Some(id) = active_id {
+            if let Some(new_idx) = self.tabs.iter().position(|t| t.id == id) {
+                self.active_tab_idx = new_idx;
+            }
+        }
+    }
+
+    fn handle_tab_drop(&mut self, source: ui::DragSource, dest: ui::TabDropDestination) {
+        let target_tab_id = match source {
+            ui::DragSource::Tab(tab_idx) => {
+                self.tabs.iter().filter(|t| !t.is_pinned).nth(tab_idx).map(|t| t.id.clone())
+            }
+            ui::DragSource::Pinned(_) => None,
+        };
+
+        match dest {
+            ui::TabDropDestination::Favorites(slot) => {
+                match source {
+                    ui::DragSource::Pinned(from_idx) => {
+                        if from_idx < self.pinned_shortcuts.len() {
+                            let item = self.pinned_shortcuts.remove(from_idx);
+                            let insert_at = slot.min(self.pinned_shortcuts.len());
+                            self.pinned_shortcuts.insert(insert_at, item);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                    ui::DragSource::Tab(_) => {
+                        if let Some(tab_id) = target_tab_id {
+                            if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                                self.tabs[pos].is_pinned = true;
+                                let sc_url = self.tabs[pos].url.clone();
+                                let sc_domain = ui::domain_of(&sc_url);
+                                let existing_idx = self.pinned_shortcuts.iter().position(|s| {
+                                    s.url == sc_url || (!sc_domain.is_empty() && ui::domain_of(&s.url) == sc_domain)
+                                });
+                                let sc = if let Some(idx) = existing_idx {
+                                    self.pinned_shortcuts.remove(idx)
+                                } else {
+                                    ui::TabItem {
+                                        id: format!("pin-{}", self.tabs[pos].id),
+                                        title: self.tabs[pos].title.clone(),
+                                        url: sc_url,
+                                        accent: self.tabs[pos].accent,
+                                        favicon: self.tabs[pos].favicon.clone(),
+                                        is_loaded: true,
+                                        is_muted: self.tabs[pos].is_muted,
+                                        anim_progress: 1.0,
+                                        is_closing: false,
+                                        folder_id: None,
+                                        custom_letter: self.tabs[pos].custom_letter.clone(),
+                                    }
+                                };
+                                let insert_at = slot.min(self.pinned_shortcuts.len());
+                                self.pinned_shortcuts.insert(insert_at, sc);
+                                self.window.show_toast("Added to Favourite tabs");
+                                self.sync_tabs_ui();
+                                self.persist_state();
+                            }
+                        }
+                    }
+                }
+            }
+            ui::TabDropDestination::Folder(folder_id) => {
+                match source {
+                    ui::DragSource::Pinned(fav_idx) => {
+                        if fav_idx < self.pinned_shortcuts.len() {
+                            let item = self.pinned_shortcuts.remove(fav_idx);
+                            let rem_domain = ui::domain_of(&item.url);
+                            let open_pos = self.tabs.iter().position(|t| {
+                                t.is_pinned && (t.url == item.url || (!rem_domain.is_empty() && ui::domain_of(&t.url) == rem_domain))
+                            });
+                            let tab_id = if let Some(pos) = open_pos {
+                                self.tabs[pos].is_pinned = false;
+                                self.tabs[pos].id.clone()
+                            } else {
+                                let id = format!("tab-{}", self.next_tab_id);
+                                self.next_tab_id += 1;
+                                self.tabs.push(Tab {
+                                    id: id.clone(),
+                                    title: item.title,
+                                    url: item.url,
+                                    accent: item.accent,
+                                    favicon: item.favicon,
+                                    is_pinned: false,
+                                    folder_id: None,
+                                    custom_title: false,
+                                    custom_letter: item.custom_letter,
+                                    is_muted: false,
+                                    controller: None,
+                                    last_active: Instant::now(),
+                                    anim_progress: 1.0,
+                                    is_closing: false,
+                                    pending_permissions: Vec::new(),
+                                });
+                                id
+                            };
+                            self.move_tab_to_section_slot(&tab_id, Some(folder_id), usize::MAX);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                    ui::DragSource::Tab(_) => {
+                        if let Some(tab_id) = target_tab_id {
+                            self.move_tab_to_section_slot(&tab_id, Some(folder_id), usize::MAX);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                }
+            }
+            ui::TabDropDestination::FolderInsert { folder_id, insert_idx } => {
+                match source {
+                    ui::DragSource::Pinned(fav_idx) => {
+                        if fav_idx < self.pinned_shortcuts.len() {
+                            let item = self.pinned_shortcuts.remove(fav_idx);
+                            let rem_domain = ui::domain_of(&item.url);
+                            let open_pos = self.tabs.iter().position(|t| {
+                                t.is_pinned && (t.url == item.url || (!rem_domain.is_empty() && ui::domain_of(&t.url) == rem_domain))
+                            });
+                            let tab_id = if let Some(pos) = open_pos {
+                                self.tabs[pos].is_pinned = false;
+                                self.tabs[pos].id.clone()
+                            } else {
+                                let id = format!("tab-{}", self.next_tab_id);
+                                self.next_tab_id += 1;
+                                self.tabs.push(Tab {
+                                    id: id.clone(),
+                                    title: item.title,
+                                    url: item.url,
+                                    accent: item.accent,
+                                    favicon: item.favicon,
+                                    is_pinned: false,
+                                    folder_id: None,
+                                    custom_title: false,
+                                    custom_letter: item.custom_letter,
+                                    is_muted: false,
+                                    controller: None,
+                                    last_active: Instant::now(),
+                                    anim_progress: 1.0,
+                                    is_closing: false,
+                                    pending_permissions: Vec::new(),
+                                });
+                                id
+                            };
+                            self.move_tab_to_section_slot(&tab_id, Some(folder_id), insert_idx);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                    ui::DragSource::Tab(_) => {
+                        if let Some(tab_id) = target_tab_id {
+                            self.move_tab_to_section_slot(&tab_id, Some(folder_id), insert_idx);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                }
+            }
+            ui::TabDropDestination::PinnedSection(slot) => {
+                match source {
+                    ui::DragSource::Pinned(fav_idx) => {
+                        if fav_idx < self.pinned_shortcuts.len() {
+                            let item = self.pinned_shortcuts.remove(fav_idx);
+                            let rem_domain = ui::domain_of(&item.url);
+                            let open_pos = self.tabs.iter().position(|t| {
+                                t.is_pinned && (t.url == item.url || (!rem_domain.is_empty() && ui::domain_of(&t.url) == rem_domain))
+                            });
+                            let tab_id = if let Some(pos) = open_pos {
+                                self.tabs[pos].is_pinned = false;
+                                self.tabs[pos].id.clone()
+                            } else {
+                                let id = format!("tab-{}", self.next_tab_id);
+                                self.next_tab_id += 1;
+                                self.tabs.push(Tab {
+                                    id: id.clone(),
+                                    title: item.title,
+                                    url: item.url,
+                                    accent: item.accent,
+                                    favicon: item.favicon,
+                                    is_pinned: false,
+                                    folder_id: None,
+                                    custom_title: false,
+                                    custom_letter: item.custom_letter,
+                                    is_muted: false,
+                                    controller: None,
+                                    last_active: Instant::now(),
+                                    anim_progress: 1.0,
+                                    is_closing: false,
+                                    pending_permissions: Vec::new(),
+                                });
+                                id
+                            };
+                            self.move_tab_to_section_slot(&tab_id, Some(ui::PINNED_SECTION_ID.to_string()), slot);
+                            self.window.show_toast("Added to Pinned tabs");
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                    ui::DragSource::Tab(_) => {
+                        if let Some(tab_id) = target_tab_id {
+                            self.move_tab_to_section_slot(&tab_id, Some(ui::PINNED_SECTION_ID.to_string()), slot);
+                            self.window.show_toast("Added to Pinned tabs");
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                }
+            }
+            ui::TabDropDestination::NormalTabs(slot) => {
+                match source {
+                    ui::DragSource::Pinned(fav_idx) => {
+                        if fav_idx < self.pinned_shortcuts.len() {
+                            let item = self.pinned_shortcuts.remove(fav_idx);
+                            let rem_domain = ui::domain_of(&item.url);
+                            let open_pos = self.tabs.iter().position(|t| {
+                                t.is_pinned && (t.url == item.url || (!rem_domain.is_empty() && ui::domain_of(&t.url) == rem_domain))
+                            });
+                            let tab_id = if let Some(pos) = open_pos {
+                                self.tabs[pos].is_pinned = false;
+                                self.tabs[pos].id.clone()
+                            } else {
+                                let id = format!("tab-{}", self.next_tab_id);
+                                self.next_tab_id += 1;
+                                self.tabs.push(Tab {
+                                    id: id.clone(),
+                                    title: item.title,
+                                    url: item.url,
+                                    accent: item.accent,
+                                    favicon: item.favicon,
+                                    is_pinned: false,
+                                    folder_id: None,
+                                    custom_title: false,
+                                    custom_letter: item.custom_letter,
+                                    is_muted: false,
+                                    controller: None,
+                                    last_active: Instant::now(),
+                                    anim_progress: 1.0,
+                                    is_closing: false,
+                                    pending_permissions: Vec::new(),
+                                });
+                                id
+                            };
+                            self.move_tab_to_section_slot(&tab_id, None, slot);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                    ui::DragSource::Tab(_) => {
+                        if let Some(tab_id) = target_tab_id {
+                            self.move_tab_to_section_slot(&tab_id, None, slot);
+                            self.sync_tabs_ui();
+                            self.persist_state();
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2724,10 +3151,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
     let command_bar_cell = Rc::new(RefCell::new(None));
 
-    let ext_dir = app_data_dir.join("extensions").join("ubol");
-    // Remove the old hand-written blocker so only real uBOL loads
-    let _ = std::fs::remove_dir_all(app_data_dir.join("extensions").join("ublock_origin_lite"));
-    let ubol_ready = ensure_ubol(&ext_dir);
+    // Stop applying uBlock Origin for now so native ad shielding & YouTube fast-forwarding can be evaluated
+    let _ = std::fs::remove_dir_all(app_data_dir.join("extensions"));
 
     // Create App state
     let app = Rc::new(RefCell::new(BrowserApp::new(
@@ -2736,8 +3161,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.clone(),
         storage.clone(),
         event_tx.clone(),
-        // Set NO_ADBLOCK=1 or BROWSER_NO_ADBLOCK=1 to start without the extension (for isolating issues)
-        if std::env::var_os("NO_ADBLOCK").is_some() || std::env::var_os("BROWSER_NO_ADBLOCK").is_some() || std::env::var_os("ARC_NO_ADBLOCK").is_some() || !ubol_ready { None } else { Some(ext_dir) },
     )));
 
     // Create Command Bar
@@ -2826,6 +3249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
             SidebarAction::ToggleSiteCard => AppEvent::ToggleSiteCard,
             SidebarAction::AcceptPermission(idx) => AppEvent::AcceptPermission(idx),
+            SidebarAction::DropTab { source, destination } => AppEvent::DropTab { source, destination },
+            SidebarAction::OpenFolder(idx) => AppEvent::OpenFolder(idx),
+            SidebarAction::SetPinnedLetter(idx, letter) => AppEvent::SetPinnedLetter(idx, letter),
         };
         let _ = tx_action.send(ev);
         unsafe {
@@ -2917,3 +3343,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Browser exiting.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wake_tabs() {
+        init_com().unwrap();
+        let app_data_dir = get_app_data_dir();
+        let webview_data_dir = app_data_dir.join("WebView2Data");
+        let storage_db_path = app_data_dir.join("browser.db");
+        let storage = Rc::new(RefCell::new(Storage::open(&storage_db_path).unwrap()));
+        let config = WindowConfig {
+            title: "Browser".to_string(),
+            width: 1280,
+            height: 800,
+            sidebar_width: 280,
+            caption_height: 32,
+        };
+        let window = Rc::new(BrowserWindow::new(config).unwrap());
+        let engine = Rc::new(WebViewEngine::new(Some(&webview_data_dir)).unwrap());
+        let (event_tx, _event_rx) = mpsc::channel();
+        let command_bar_cell = Rc::new(RefCell::new(None));
+        let app = Rc::new(RefCell::new(BrowserApp::new(
+            window.clone(),
+            command_bar_cell.clone(),
+            engine.clone(),
+            storage.clone(),
+            event_tx.clone(),
+        )));
+
+        let active_idx = app.borrow().active_tab_idx;
+        println!("Initial active_tab_idx: {}", active_idx);
+        app.borrow_mut().ensure_tab_controller(active_idx);
+        println!("Active tab controller created: {}", app.borrow().tabs[active_idx].controller.is_some());
+
+        let num_tabs = app.borrow().tabs.len();
+        println!("Total tabs to wake: {}", num_tabs);
+        for i in 0..num_tabs {
+            println!("Switching to tab {}...", i);
+            app.borrow_mut().switch_tab(i);
+            let has_ctrl = app.borrow().tabs[i].controller.is_some();
+            println!("Tab {} controller exists: {}", i, has_ctrl);
+            assert!(has_ctrl, "Tab {} controller failed to wake!", i);
+        }
+    }
+}
+
