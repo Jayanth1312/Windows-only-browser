@@ -17,11 +17,13 @@ use webview2_com::{
     WebResourceRequestedEventHandler,
 };
 use windows::core::{HSTRING, Interface, PCWSTR};
-use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, ScreenToClient, SetWindowRgn};
 use windows::Win32::System::Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
-use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetClassNameW, GetParent, GetWindowRect, IsWindow,
+};
 
 #[derive(Error, Debug)]
 pub enum EngineError {
@@ -57,6 +59,12 @@ pub enum BrowserShortcut {
     SelectTab(usize),
     ReopenClosedTab,
     ToggleZapper,
+    SplitView,
+    FocusOtherPane,
+    SwapSplit,
+    EvenSplit,
+    SeparateSplit,
+    CloseSplit,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +96,7 @@ pub struct WebViewController {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     last_bounds: std::cell::Cell<(i32, i32, i32, i32)>,
+    child_hwnd: std::cell::Cell<Option<HWND>>,
     shield_state: std::sync::Arc<crate::shield::ShieldState>,
     current_host: std::sync::Arc<std::sync::RwLock<String>>,
 }
@@ -1486,7 +1495,17 @@ impl WebViewEngine {
 
                             let mut shortcut = None;
 
-                            if alt {
+                            if ctrl && alt {
+                                match virtual_key {
+                                    0x4E => shortcut = Some(BrowserShortcut::SplitView), // 'N' -> Split View (Ctrl+Alt+N)
+                                    0x25 | 0x27 | 0xDC => shortcut = Some(BrowserShortcut::FocusOtherPane), // Left/Right Arrow or '\' -> Focus Other Pane
+                                    0x53 => shortcut = Some(BrowserShortcut::SwapSplit), // 'S' -> Swap Split
+                                    0x45 => shortcut = Some(BrowserShortcut::EvenSplit), // 'E' -> Even Split
+                                    0x55 => shortcut = Some(BrowserShortcut::SeparateSplit), // 'U' -> Separate Split (Unsplit)
+                                    0x57 => shortcut = Some(BrowserShortcut::CloseSplit), // 'W' -> Close Split
+                                    _ => {}
+                                }
+                            } else if alt {
                                 if virtual_key == 0x25 { // Left arrow -> Back
                                     shortcut = Some(BrowserShortcut::NavBack);
                                 } else if virtual_key == 0x27 { // Right arrow -> Forward
@@ -1494,7 +1513,7 @@ impl WebViewEngine {
                                 }
                             }
 
-                            if ctrl {
+                            if ctrl && !alt {
                                 if shift {
                                     match virtual_key {
                                         0x43 => shortcut = Some(BrowserShortcut::CopyCleanLink), // 'C' -> Copy Clean Link (Ctrl+Shift+C)
@@ -1550,6 +1569,7 @@ impl WebViewEngine {
             controller,
             webview,
             last_bounds: std::cell::Cell::new((0, 0, 0, 0)),
+            child_hwnd: std::cell::Cell::new(None),
             shield_state: shield,
             current_host,
         })
@@ -1557,6 +1577,66 @@ impl WebViewEngine {
 }
 
 impl WebViewController {
+    fn get_or_find_child_window(&self, bounds: RECT) -> Option<HWND> {
+        unsafe {
+            if let Some(child) = self.child_hwnd.get() {
+                if IsWindow(Some(child)).as_bool() {
+                    return Some(child);
+                }
+            }
+
+            let mut parent = HWND::default();
+            if self.controller.ParentWindow(&mut parent).is_err() || parent.0.is_null() {
+                return None;
+            }
+
+            let mut children: Vec<HWND> = Vec::new();
+            unsafe extern "system" fn enum_child(child: HWND, lparam: LPARAM) -> windows::core::BOOL {
+                let list = &mut *(lparam.0 as *mut Vec<HWND>);
+                list.push(child);
+                windows::core::BOOL(1)
+            }
+            let _ = EnumChildWindows(
+                Some(parent),
+                Some(enum_child),
+                LPARAM(&mut children as *mut _ as isize),
+            );
+
+            let w = bounds.right - bounds.left;
+            let h = bounds.bottom - bounds.top;
+
+            for child in children {
+                let direct_parent = GetParent(child);
+                if direct_parent != Ok(parent) {
+                    continue;
+                }
+                let mut class_buf = [0u16; 64];
+                let len = GetClassNameW(child, &mut class_buf);
+                if len > 0 {
+                    let cname = String::from_utf16_lossy(&class_buf[..len as usize]);
+                    if cname.contains("Intermediate") {
+                        continue;
+                    }
+                }
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(child, &mut rc);
+                let mut pt = POINT { x: rc.left, y: rc.top };
+                let _ = ScreenToClient(parent, &mut pt);
+                let child_w = rc.right - rc.left;
+                let child_h = rc.bottom - rc.top;
+
+                // Match this controller's child window position and size
+                if (pt.x - bounds.left).abs() <= 2 && (pt.y - bounds.top).abs() <= 2
+                    && (child_w - w).abs() <= 4 && (child_h - h).abs() <= 4
+                {
+                    self.child_hwnd.set(Some(child));
+                    return Some(child);
+                }
+            }
+            None
+        }
+    }
+
     pub fn set_bounds(&self, bounds: RECT) -> Result<(), EngineError> {
         let new_bounds = (bounds.left, bounds.top, bounds.right, bounds.bottom);
         let old_bounds = self.last_bounds.get();
@@ -1566,7 +1646,7 @@ impl WebViewController {
             self.controller.NotifyParentWindowPositionChanged()?;
         }
 
-        // Only redo the expensive child-window region clipping when size actually changes
+        // Only redo the child-window region clipping when size actually changes
         let w = bounds.right - bounds.left;
         let h = bounds.bottom - bounds.top;
         let old_w = old_bounds.2 - old_bounds.0;
@@ -1574,33 +1654,11 @@ impl WebViewController {
 
         if w > 0 && h > 0 && (w != old_w || h != old_h) {
             self.last_bounds.set(new_bounds);
-            unsafe {
-                let mut parent = HWND::default();
-                if self.controller.ParentWindow(&mut parent).is_ok() {
-                    let mut children: Vec<HWND> = Vec::new();
-                    unsafe extern "system" fn enum_child(child: HWND, lparam: LPARAM) -> windows::core::BOOL {
-                        let list = &mut *(lparam.0 as *mut Vec<HWND>);
-                        list.push(child);
-                        windows::core::BOOL(1)
-                    }
-                    let _ = EnumChildWindows(
-                        Some(parent),
-                        Some(enum_child),
-                        LPARAM(&mut children as *mut _ as isize),
-                    );
+            if let Some(child) = self.get_or_find_child_window(bounds) {
+                unsafe {
                     let radius = 16;
-                    for child in children {
-                        let mut class_buf = [0u16; 64];
-                        let len = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(child, &mut class_buf);
-                        if len > 0 {
-                            let cname = String::from_utf16_lossy(&class_buf[..len as usize]);
-                            if cname.contains("Intermediate") {
-                                continue;
-                            }
-                        }
-                        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
-                        let _ = SetWindowRgn(child, Some(rgn), false);
-                    }
+                    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
+                    let _ = SetWindowRgn(child, Some(rgn), true);
                 }
             }
         } else if w > 0 && h > 0 {
@@ -1618,29 +1676,17 @@ impl WebViewController {
 
     pub fn set_fullscreen_mode(&self, fullscreen: bool) {
         unsafe {
-            let mut parent = HWND::default();
-            if self.controller.ParentWindow(&mut parent).is_ok() && !parent.0.is_null() {
-                let mut children: Vec<HWND> = Vec::new();
-                unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
-                    let list = &mut *(lparam.0 as *mut Vec<HWND>);
-                    list.push(hwnd);
-                    windows::core::BOOL(1)
-                }
-                let _ = EnumChildWindows(
-                    Some(parent),
-                    Some(enum_child),
-                    LPARAM(&mut children as *mut _ as isize),
-                );
-                let (left, top, right, bottom) = self.last_bounds.get();
+            let (left, top, right, bottom) = self.last_bounds.get();
+            let bounds = RECT { left, top, right, bottom };
+            if let Some(child) = self.get_or_find_child_window(bounds) {
                 let w = right - left;
                 let h = bottom - top;
-                for child in children {
-                    if fullscreen {
-                        let _ = SetWindowRgn(child, None, true);
-                    } else if w > 0 && h > 0 {
-                        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 16, 16);
-                        let _ = SetWindowRgn(child, Some(rgn), true);
-                    }
+                if fullscreen {
+                    let _ = SetWindowRgn(child, None, true);
+                } else if w > 0 && h > 0 {
+                    let radius = 16;
+                    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
+                    let _ = SetWindowRgn(child, Some(rgn), true);
                 }
             }
         }
@@ -2028,7 +2074,7 @@ mod tests {
                 None, None, None, None,
             ).unwrap()
         };
-        let app_data = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("Browser").join("WebView2Data");
+        let app_data = std::env::temp_dir().join(format!("Browser_WebView2Test_{}", std::process::id()));
         let engine = WebViewEngine::new(Some(&app_data)).unwrap();
         let bounds = RECT { left: 0, top: 0, right: 800, bottom: 600 };
         for i in 1..=6 {

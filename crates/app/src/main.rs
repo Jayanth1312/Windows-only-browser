@@ -86,6 +86,133 @@ struct Tab {
     pending_permissions: Vec<ui::SitePermissionKind>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TabSplit {
+    pub id: String,
+    pub tabs: Vec<String>,     // 2 to 4 tab IDs in order (left to right)
+    pub sizes: Vec<f32>,       // Fractions adding up to 1.0
+    pub focused_tab_id: String,
+}
+
+impl TabSplit {
+    pub const MOST: usize = 4;
+
+    pub fn new(id: String, tabs: Vec<String>, focused_tab_id: String) -> Self {
+        let count = tabs.len();
+        let sizes = Self::even(count);
+        Self {
+            id,
+            tabs,
+            sizes,
+            focused_tab_id,
+        }
+    }
+
+    pub fn with_sizes(id: String, tabs: Vec<String>, sizes: Vec<f32>, focused_tab_id: String) -> Self {
+        let count = tabs.len();
+        let clamped = if sizes.len() == count {
+            Self::clamp(&sizes)
+        } else {
+            Self::even(count)
+        };
+        Self {
+            id,
+            tabs,
+            sizes: clamped,
+            focused_tab_id,
+        }
+    }
+
+    pub fn left_tab_id(&self) -> &str {
+        self.tabs.first().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn right_tab_id(&self) -> &str {
+        self.tabs.last().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn ratio(&self) -> f32 {
+        self.sizes.first().copied().unwrap_or(0.5)
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.tabs.len() >= Self::MOST
+    }
+
+    pub fn contains(&self, tab_id: &str) -> bool {
+        self.tabs.iter().any(|t| t == tab_id)
+    }
+
+    pub fn least(count: usize) -> f32 {
+        if count <= 2 { 0.20 } else { 0.10 }
+    }
+
+    pub fn even(count: usize) -> Vec<f32> {
+        let count = count.max(1);
+        vec![1.0 / count as f32; count]
+    }
+
+    pub fn clamp(sizes: &[f32]) -> Vec<f32> {
+        let count = sizes.len();
+        if count <= 1 {
+            return vec![1.0];
+        }
+        if count == 2 {
+            let first = sizes[0].clamp(0.20, 0.80);
+            return vec![first, 1.0 - first];
+        }
+        let least = Self::least(count);
+        let sum: f32 = sizes.iter().map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 }).sum();
+        let mut shares: Vec<f32> = if sum > 0.0 {
+            sizes.iter().map(|&s| (if s.is_finite() && s > 0.0 { s } else { 1.0 }) / sum).collect()
+        } else {
+            Self::even(count)
+        };
+
+        let short: f32 = shares.iter().map(|&s| (least - s).max(0.0)).sum();
+        if short > 0.0 {
+            let spare: f32 = shares.iter().map(|&s| (s - least).max(0.0)).sum();
+            if spare > 0.0 {
+                shares = shares.iter().map(|&s| {
+                    if s < least { least } else { s - (s - least) / spare * short }
+                }).collect();
+            }
+        }
+        shares
+    }
+
+    pub fn insert(&mut self, tab_id: String, beside: Option<&str>, before: bool) -> bool {
+        if self.is_full() || self.contains(&tab_id) {
+            return false;
+        }
+        let at = if let Some(target) = beside {
+            self.tabs.iter().position(|t| t == target).map(|pos| if before { pos } else { pos + 1 }).unwrap_or(self.tabs.len())
+        } else {
+            self.tabs.len()
+        };
+        self.tabs.insert(at, tab_id);
+        self.sizes = Self::even(self.tabs.len());
+        true
+    }
+
+    pub fn remove(&mut self, tab_id: &str) -> bool {
+        if let Some(pos) = self.tabs.iter().position(|t| t == tab_id) {
+            self.tabs.remove(pos);
+            if self.sizes.len() > pos {
+                self.sizes.remove(pos);
+            }
+            if self.tabs.len() >= 2 {
+                self.sizes = Self::clamp(&self.sizes);
+                if self.focused_tab_id == tab_id {
+                    self.focused_tab_id = self.tabs[0].clone();
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
 enum AppEvent {
     CreateTab(String),
     CreateTabAt(String, usize),
@@ -179,6 +306,16 @@ enum AppEvent {
         destination: ui::TabDropDestination,
     },
     OpenFolder(usize),
+    OpenInSplitView(String),
+    SplitWithNewTab,
+    FocusOtherPane,
+    SwapSplit,
+    EvenSplit,
+    SeparateSplit,
+    CloseSplit,
+    SplitRatioChanged(f32),
+    SplitTabs(Vec<String>),
+    SplitSizesChanged(Vec<f32>),
 }
 
 fn show_windows_share_ui(hwnd: HWND, title: &str, url: &str) -> windows::core::Result<()> {
@@ -284,6 +421,7 @@ struct BrowserApp {
     active_tab_idx: usize,
     pinned_shortcuts: Vec<TabItem>,
     folders: Vec<Folder>,
+    splits: Vec<TabSplit>,
     next_tab_id: usize,
     window: Rc<BrowserWindow>,
     command_bar: Rc<RefCell<Option<CommandBar>>>,
@@ -424,6 +562,7 @@ impl BrowserApp {
                         is_closing: false,
                         folder_id: None,
                         custom_letter: s.custom_letter,
+                        is_split: false,
                     }
                 })
                 .collect()
@@ -443,6 +582,7 @@ impl BrowserApp {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: None,
+                    is_split: false,
                 },
                 TabItem {
                     id: "pin-github".into(),
@@ -458,6 +598,7 @@ impl BrowserApp {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: None,
+                    is_split: false,
                 },
                 TabItem {
                     id: "pin-youtube".into(),
@@ -477,6 +618,7 @@ impl BrowserApp {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: None,
+                    is_split: false,
                 },
             ];
             for sc in &defaults {
@@ -556,11 +698,27 @@ impl BrowserApp {
             shield_state.set_paused(&host, true);
         }
 
+        let saved_splits = if let Ok(st) = storage.try_borrow() {
+            st.get_saved_splits().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let splits: Vec<TabSplit> = saved_splits
+            .into_iter()
+            .map(|s| {
+                let tabs = s.get_tabs();
+                let sizes = s.get_sizes();
+                let focused = s.focused_tab_id.unwrap_or_else(|| tabs.first().cloned().unwrap_or_default());
+                TabSplit::with_sizes(s.id, tabs, sizes, focused)
+            })
+            .collect();
+
         let mut app = Self {
             tabs: restored_tabs,
             active_tab_idx,
             pinned_shortcuts,
             folders,
+            splits,
             next_tab_id,
             window,
             command_bar,
@@ -624,6 +782,11 @@ impl BrowserApp {
                 }
             }
             let _ = st.save_tabs_state(&saved, self.active_tab_idx);
+
+            let saved_splits: Vec<storage::SavedSplit> = self.splits.iter().map(|s| {
+                storage::SavedSplit::new(s.id.clone(), s.tabs.clone(), s.sizes.clone(), Some(s.focused_tab_id.clone()))
+            }).collect();
+            let _ = st.save_splits(&saved_splits);
         }
         self.persist_dirty = false;
         self.last_persist = Instant::now();
@@ -767,6 +930,12 @@ impl BrowserApp {
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
                 BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
+                BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
+                BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
+                BrowserShortcut::EvenSplit => AppEvent::EvenSplit,
+                BrowserShortcut::SeparateSplit => AppEvent::SeparateSplit,
+                BrowserShortcut::CloseSplit => AppEvent::CloseSplit,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -994,6 +1163,12 @@ impl BrowserApp {
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
                 BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
+                BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
+                BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
+                BrowserShortcut::EvenSplit => AppEvent::EvenSplit,
+                BrowserShortcut::SeparateSplit => AppEvent::SeparateSplit,
+                BrowserShortcut::CloseSplit => AppEvent::CloseSplit,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -1092,32 +1267,414 @@ impl BrowserApp {
         }
     }
 
+    pub fn find_split_for_tab(&self, tab_id: &str) -> Option<&TabSplit> {
+        self.splits.iter().find(|s| s.contains(tab_id))
+    }
+
+    pub fn find_split_for_tab_mut(&mut self, tab_id: &str) -> Option<&mut TabSplit> {
+        self.splits.iter_mut().find(|s| s.contains(tab_id))
+    }
+
+    pub fn sync_split_bounds(&mut self) {
+        if self.tabs.is_empty() {
+            self.window.set_split_info(None);
+            return;
+        }
+
+        let active_id = self.tabs[self.active_tab_idx].id.clone();
+        if let Some(s) = self.find_split_for_tab(&active_id).cloned() {
+            let tab_indices: Option<Vec<usize>> = s.tabs.iter().map(|tid| self.tabs.iter().position(|t| t.id == *tid)).collect();
+
+            if let Some(indices) = tab_indices {
+                for &idx in &indices {
+                    self.ensure_tab_controller(idx);
+                }
+
+                let focused_idx = indices
+                    .iter()
+                    .position(|&idx| self.tabs[idx].id == s.focused_tab_id)
+                    .map(|pos| indices[pos])
+                    .unwrap_or(self.active_tab_idx);
+
+                self.window.set_split_info(Some(ui::SplitInfo::new(
+                    s.id.clone(),
+                    indices.clone(),
+                    s.sizes.clone(),
+                    focused_idx,
+                )));
+
+                if let Some((pane_rects, _div_rects)) = self.window.get_split_layout_rects_multi() {
+                    for (i, &idx) in indices.iter().enumerate() {
+                        if let Some(ref ctrl) = self.tabs[idx].controller {
+                            let _ = ctrl.resume();
+                            let _ = ctrl.set_bounds(pane_rects[i]);
+                            let _ = ctrl.set_visible(true);
+                        }
+                    }
+
+                    if let Some(ref ctrl) = self.tabs[focused_idx].controller {
+                        let zoom = ctrl.get_zoom_factor();
+                        self.window.set_zoom(zoom);
+                    }
+                }
+                return;
+            } else {
+                self.splits.retain(|sp| sp.id != s.id);
+            }
+        }
+
+        self.window.set_split_info(None);
+        let (content_rect, _) = self.window.get_layout_rects();
+        if let Some(ref ctrl) = self.tabs[self.active_tab_idx].controller {
+            let _ = ctrl.resume();
+            let _ = ctrl.set_bounds(content_rect);
+            let _ = ctrl.set_visible(true);
+            let zoom = ctrl.get_zoom_factor();
+            self.window.set_zoom(zoom);
+        }
+    }
+
+    fn start_split(&mut self, other_tab_id: Option<String>) {
+        if self.tabs.is_empty() || self.active_tab_idx >= self.tabs.len() {
+            return;
+        }
+
+        let current_tab_id = self.tabs[self.active_tab_idx].id.clone();
+
+        // If the current tab is already in a split:
+        if self.find_split_for_tab(&current_tab_id).is_some() {
+            let is_full = self.find_split_for_tab(&current_tab_id).map_or(true, |s| s.is_full());
+            if is_full {
+                return;
+            }
+
+            let partner_id = match other_tab_id {
+                Some(target_id) => {
+                    if target_id == current_tab_id {
+                        return;
+                    }
+                    if let Some(s) = self.find_split_for_tab(&current_tab_id) {
+                        if s.contains(&target_id) {
+                            return;
+                        }
+                    }
+                    target_id
+                }
+                None => {
+                    let tab_id = format!("tab-{}", self.next_tab_id);
+                    self.next_tab_id += 1;
+                    let default_url = "https://www.google.com".to_string();
+                    let initial_title = friendly_title_for_url(&default_url);
+                    let initial_accent = accent_for_url(&default_url);
+                    let domain = ui::domain_of(&default_url);
+                    let preloaded_favicon = self.get_cached_favicon(&domain);
+
+                    let insert_pos = self.active_tab_idx + 1;
+                    self.tabs.insert(insert_pos, Tab {
+                        id: tab_id.clone(),
+                        title: initial_title,
+                        url: default_url,
+                        accent: initial_accent,
+                        favicon: preloaded_favicon,
+                        is_pinned: false,
+                        folder_id: self.tabs[self.active_tab_idx].folder_id.clone(),
+                        custom_title: false,
+                        custom_letter: None,
+                        is_muted: false,
+                        controller: None,
+                        last_active: Instant::now(),
+                        anim_progress: 1.0,
+                        is_closing: false,
+                        pending_permissions: Vec::new(),
+                    });
+                    tab_id
+                }
+            };
+
+            // Remove partner from any other split if present
+            for other_s in self.splits.iter_mut() {
+                if !other_s.contains(&current_tab_id) && other_s.contains(&partner_id) {
+                    other_s.remove(&partner_id);
+                }
+            }
+            self.splits.retain(|sp| sp.tabs.len() >= 2);
+
+            if let Some(s) = self.find_split_for_tab_mut(&current_tab_id) {
+                s.insert(partner_id.clone(), None, false);
+                s.focused_tab_id = partner_id.clone();
+            }
+
+            if let Some(new_active) = self.tabs.iter().position(|t| t.id == partner_id) {
+                self.ensure_tab_controller(new_active);
+                self.switch_tab(new_active);
+            } else {
+                self.sync_split_bounds();
+                self.sync_tabs_ui();
+            }
+            self.persist_state();
+            return;
+        }
+
+        let partner_id = match other_tab_id {
+            Some(target_id) => {
+                if target_id == current_tab_id {
+                    return;
+                }
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == target_id) {
+                    let tid = self.tabs[pos].id.clone();
+                    for other_s in self.splits.iter_mut() {
+                        if other_s.contains(&tid) {
+                            other_s.remove(&tid);
+                        }
+                    }
+                    self.splits.retain(|sp| sp.tabs.len() >= 2);
+                    tid
+                } else {
+                    return;
+                }
+            }
+            None => {
+                let tab_id = format!("tab-{}", self.next_tab_id);
+                self.next_tab_id += 1;
+                let default_url = "https://www.google.com".to_string();
+                let initial_title = friendly_title_for_url(&default_url);
+                let initial_accent = accent_for_url(&default_url);
+                let domain = ui::domain_of(&default_url);
+                let preloaded_favicon = self.get_cached_favicon(&domain);
+
+                let insert_pos = self.active_tab_idx + 1;
+                self.tabs.insert(insert_pos, Tab {
+                    id: tab_id.clone(),
+                    title: initial_title,
+                    url: default_url,
+                    accent: initial_accent,
+                    favicon: preloaded_favicon,
+                    is_pinned: false,
+                    folder_id: self.tabs[self.active_tab_idx].folder_id.clone(),
+                    custom_title: false,
+                    custom_letter: None,
+                    is_muted: false,
+                    controller: None,
+                    last_active: Instant::now(),
+                    anim_progress: 1.0,
+                    is_closing: false,
+                    pending_permissions: Vec::new(),
+                });
+                tab_id
+            }
+        };
+
+        let split_id = format!("split-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+        self.splits.push(TabSplit::new(
+            split_id,
+            vec![current_tab_id, partner_id.clone()],
+            partner_id.clone(),
+        ));
+
+        if let Some(new_active) = self.tabs.iter().position(|t| t.id == partner_id) {
+            self.ensure_tab_controller(new_active);
+            self.switch_tab(new_active);
+        } else {
+            self.sync_split_bounds();
+            self.sync_tabs_ui();
+        }
+        self.persist_state();
+    }
+
+    fn swap_split(&mut self) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+            s.tabs.reverse();
+            s.sizes.reverse();
+        }
+        self.sync_split_bounds();
+        self.sync_tabs_ui();
+        self.persist_state();
+    }
+
+    fn even_split(&mut self) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+            s.sizes = TabSplit::even(s.tabs.len());
+        }
+        self.sync_split_bounds();
+        self.persist_state();
+    }
+
+    fn separate_split(&mut self) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab(&active_id).cloned() {
+            for tid in &s.tabs {
+                if tid != &active_id {
+                    if let Some(pos) = self.tabs.iter().position(|t| &t.id == tid) {
+                        if let Some(ref ctrl) = self.tabs[pos].controller {
+                            let _ = ctrl.set_visible(false);
+                        }
+                    }
+                }
+            }
+            self.splits.retain(|sp| sp.id != s.id);
+            self.sync_split_bounds();
+            self.sync_tabs_ui();
+            self.persist_state();
+        }
+    }
+
+    fn close_split(&mut self) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab(&active_id).cloned() {
+            self.splits.retain(|sp| sp.id != s.id);
+            let tabs_to_close = s.tabs;
+            for tid in tabs_to_close {
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == tid) {
+                    self.close_tab(pos);
+                }
+            }
+        }
+    }
+
+    fn focus_other_pane(&mut self) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab(&active_id) {
+            if let Some(cur_pos) = s.tabs.iter().position(|t| t == &active_id) {
+                let next_pos = (cur_pos + 1) % s.tabs.len();
+                let next_id = &s.tabs[next_pos];
+                if let Some(pos) = self.tabs.iter().position(|t| &t.id == next_id) {
+                    self.switch_tab(pos);
+                }
+            }
+        }
+    }
+
+    fn split_ratio_changed(&mut self, ratio: f32) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+            let clamped = ratio.clamp(0.2, 0.8);
+            if s.sizes.len() == 2 {
+                s.sizes = vec![clamped, 1.0 - clamped];
+            } else if !s.sizes.is_empty() {
+                s.sizes[0] = clamped;
+                s.sizes = TabSplit::clamp(&s.sizes);
+            }
+        }
+        self.sync_split_bounds();
+        self.mark_dirty();
+    }
+
+    fn split_sizes_changed(&mut self, sizes: Vec<f32>) {
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let Some(active_id) = active_id else { return };
+        if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+            s.sizes = TabSplit::clamp(&sizes);
+        }
+        self.sync_split_bounds();
+        self.mark_dirty();
+    }
+
+    fn handle_split_tabs(&mut self, tab_ids: Vec<String>) {
+        if tab_ids.len() < 2 || tab_ids.len() > TabSplit::MOST {
+            return;
+        }
+
+        let valid_ids: Vec<String> = tab_ids
+            .into_iter()
+            .filter(|tid| self.tabs.iter().any(|t| &t.id == tid))
+            .collect();
+
+        if valid_ids.len() < 2 {
+            return;
+        }
+
+        // Remove these tabs from any existing splits
+        for tid in &valid_ids {
+            for s in self.splits.iter_mut() {
+                if s.contains(tid) {
+                    s.remove(tid);
+                }
+            }
+        }
+        self.splits.retain(|s| s.tabs.len() >= 2);
+
+        let split_id = format!("split-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+        let focused_id = valid_ids[0].clone();
+        self.splits.push(TabSplit::new(split_id, valid_ids.clone(), focused_id.clone()));
+
+        // Ensure controllers for ALL tabs in the split
+        for tid in &valid_ids {
+            if let Some(pos) = self.tabs.iter().position(|t| t.id == *tid) {
+                self.ensure_tab_controller(pos);
+            }
+        }
+
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == focused_id) {
+            self.active_tab_idx = pos;
+        }
+
+        self.sync_split_bounds();
+        self.sync_tabs_ui();
+        self.persist_state();
+    }
+
     fn switch_tab(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
         }
 
-        if self.active_tab_idx < self.tabs.len() && self.active_tab_idx != idx {
-            if let Some(ref current) = self.tabs[self.active_tab_idx].controller {
-                let _ = current.set_visible(false);
+        let old_idx = self.active_tab_idx;
+        if old_idx == idx && self.tabs[idx].controller.is_some() {
+            self.sync_split_bounds();
+            self.sync_tabs_ui();
+            return;
+        }
+
+        if old_idx < self.tabs.len() && old_idx != idx {
+            let old_id = self.tabs[old_idx].id.clone();
+            let new_id = self.tabs[idx].id.clone();
+            let in_same_split = self.find_split_for_tab(&old_id).map_or(false, |s| {
+                s.contains(&old_id) && s.contains(&new_id)
+            });
+
+            if !in_same_split {
+                if let Some(old_split) = self.find_split_for_tab(&old_id).cloned() {
+                    for tid in &old_split.tabs {
+                        if let Some(pos) = self.tabs.iter().position(|t| t.id == *tid) {
+                            if let Some(ref c) = self.tabs[pos].controller {
+                                let _ = c.set_visible(false);
+                            }
+                        }
+                    }
+                } else if let Some(ref current) = self.tabs[old_idx].controller {
+                    let _ = current.set_visible(false);
+                }
             }
-            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+
+            if let Some(tab) = self.tabs.get_mut(old_idx) {
                 tab.last_active = Instant::now();
             }
         }
 
         self.ensure_tab_controller(idx);
-
         self.active_tab_idx = idx;
-        let (content_rect, _) = self.window.get_layout_rects();
-        if let Some(ref active) = self.tabs[idx].controller {
-            let _ = active.resume(); // Restore page state and JS timers from hibernation
-            let _ = active.set_bounds(content_rect);
-            let _ = active.set_visible(true);
-            let _ = active.focus();
-            let zoom = active.get_zoom_factor();
-            self.window.set_zoom(zoom);
+
+        let active_id = self.tabs[idx].id.clone();
+        if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+            s.focused_tab_id = active_id.clone();
         }
+
+        self.sync_split_bounds();
+
+        if let Some(ref ctrl) = self.tabs[idx].controller {
+            let _ = ctrl.focus();
+        }
+
         if let Some(tab) = self.tabs.get_mut(idx) {
             tab.last_active = Instant::now();
         }
@@ -1147,6 +1704,14 @@ impl BrowserApp {
             self.closed_tabs.remove(0);
         }
 
+        let closed_tab_id = self.tabs[target_idx].id.clone();
+        for s in self.splits.iter_mut() {
+            if s.contains(&closed_tab_id) {
+                s.remove(&closed_tab_id);
+            }
+        }
+        self.splits.retain(|sp| sp.tabs.len() >= 2);
+
         if self.tabs[target_idx].is_pinned {
             if let Some(ref ctrl) = self.tabs[target_idx].controller {
                 let _ = ctrl.set_visible(false);
@@ -1170,12 +1735,7 @@ impl BrowserApp {
             }
 
             self.ensure_tab_controller(self.active_tab_idx);
-
-            let (content_rect, _) = self.window.get_layout_rects();
-            if let Some(ref active) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
-                let _ = active.set_bounds(content_rect);
-                let _ = active.set_visible(true);
-            }
+            self.sync_split_bounds();
 
             self.sync_tabs_ui();
             self.persist_state();
@@ -1254,6 +1814,13 @@ impl BrowserApp {
         let mut removed = false;
         while i < self.tabs.len() {
             if self.tabs[i].is_closing && self.tabs[i].anim_progress <= 0.001 {
+                let tab_id = self.tabs[i].id.clone();
+                for s in self.splits.iter_mut() {
+                    if s.contains(&tab_id) {
+                        s.remove(&tab_id);
+                    }
+                }
+                self.splits.retain(|sp| sp.tabs.len() >= 2);
                 if let Some(ref ctrl) = self.tabs[i].controller {
                     let _ = ctrl.set_visible(false);
                 }
@@ -1270,12 +1837,9 @@ impl BrowserApp {
         if removed {
             if !self.tabs.is_empty() {
                 self.ensure_tab_controller(self.active_tab_idx);
-                let (content_rect, _) = self.window.get_layout_rects();
-                if let Some(ref active) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
-                    let _ = active.set_bounds(content_rect);
-                    let _ = active.set_visible(true);
-                }
+                self.sync_split_bounds();
             } else {
+                self.window.set_split_info(None);
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.window.hwnd()), None, false);
                 }
@@ -1318,6 +1882,7 @@ impl BrowserApp {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: sc.custom_letter.clone().or_else(|| t.custom_letter.clone()),
+                    is_split: false,
                 });
             } else {
                 pinned_items.push(TabItem {
@@ -1332,6 +1897,7 @@ impl BrowserApp {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: sc.custom_letter.clone(),
+                    is_split: false,
                 });
             }
         }
@@ -1341,6 +1907,7 @@ impl BrowserApp {
                 if i == self.active_tab_idx {
                     active_regular = Some(regular_items.len());
                 }
+                let is_split = self.splits.iter().any(|s| s.contains(&t.id));
                 regular_items.push(TabItem {
                     id: t.id.clone(),
                     title: t.title.clone(),
@@ -1353,6 +1920,7 @@ impl BrowserApp {
                     is_closing: t.is_closing,
                     folder_id: t.folder_id.clone(),
                     custom_letter: t.custom_letter.clone(),
+                    is_split,
                 });
             }
         }
@@ -1379,8 +1947,22 @@ impl BrowserApp {
             (false, false)
         };
 
+        let split_groups: Vec<ui::SidebarSplitGroup> = self.splits.iter().filter_map(|s| {
+            let indices: Vec<usize> = s.tabs.iter().filter_map(|tid| {
+                regular_items.iter().position(|item| item.id == *tid)
+            }).collect();
+            if indices.len() >= 2 {
+                Some(ui::SidebarSplitGroup {
+                    id: s.id.clone(),
+                    tab_indices: indices,
+                })
+            } else {
+                None
+            }
+        }).collect();
+
         let has_closed = !self.closed_tabs.is_empty();
-        self.window.update_sidebar_data(regular_items, pinned_items, folder_items, active, can_back, can_forward, has_closed);
+        self.window.update_sidebar_data(regular_items, pinned_items, folder_items, split_groups, active, can_back, can_forward, has_closed);
 
         let (blocked, active_host) = if let Some(tab) = self.tabs.get(self.active_tab_idx) {
             let host = tab.controller.as_ref().map(|c| c.get_current_host()).unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
@@ -1504,6 +2086,7 @@ impl BrowserApp {
                             is_closing: false,
                             folder_id: None,
                             custom_letter: self.tabs[pos].custom_letter.clone(),
+                            is_split: false,
                         });
                     }
                     self.window.show_toast("Added to Favourite tabs");
@@ -1933,12 +2516,7 @@ impl BrowserApp {
             }
             AppEvent::ToggleSidebar => {
                 self.window.toggle_sidebar();
-                let (content_rect, _) = self.window.get_layout_rects();
-                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                    if let Some(ref ctrl) = tab.controller {
-                        let _ = ctrl.set_bounds(content_rect);
-                    }
-                }
+                self.sync_split_bounds();
             }
             AppEvent::OpenCommandBar(mode) => {
                 let (content_rect, _) = self.window.get_layout_rects();
@@ -2792,6 +3370,36 @@ impl BrowserApp {
             AppEvent::DropTab { source, destination } => {
                 self.handle_tab_drop(source, destination);
             }
+            AppEvent::OpenInSplitView(tab_id) => {
+                self.start_split(Some(tab_id));
+            }
+            AppEvent::SplitWithNewTab => {
+                self.start_split(None);
+            }
+            AppEvent::FocusOtherPane => {
+                self.focus_other_pane();
+            }
+            AppEvent::SwapSplit => {
+                self.swap_split();
+            }
+            AppEvent::EvenSplit => {
+                self.even_split();
+            }
+            AppEvent::SeparateSplit => {
+                self.separate_split();
+            }
+            AppEvent::CloseSplit => {
+                self.close_split();
+            }
+            AppEvent::SplitRatioChanged(ratio) => {
+                self.split_ratio_changed(ratio);
+            }
+            AppEvent::SplitTabs(tab_ids) => {
+                self.handle_split_tabs(tab_ids);
+            }
+            AppEvent::SplitSizesChanged(sizes) => {
+                self.split_sizes_changed(sizes);
+            }
         }
     }
 
@@ -2874,6 +3482,7 @@ impl BrowserApp {
                                         is_closing: false,
                                         folder_id: None,
                                         custom_letter: self.tabs[pos].custom_letter.clone(),
+                                        is_split: false,
                                     }
                                 };
                                 let insert_at = slot.min(self.pinned_shortcuts.len());
@@ -3080,6 +3689,96 @@ impl BrowserApp {
                     }
                 }
             }
+            ui::TabDropDestination::SplitContainer { split_id } => {
+                let dropped_tab_id = match source {
+                    ui::DragSource::Tab(tab_idx) => {
+                        self.tabs.iter().filter(|t| !t.is_pinned).nth(tab_idx).map(|t| t.id.clone())
+                    }
+                    ui::DragSource::Pinned(fav_idx) => {
+                        self.pinned_shortcuts.get(fav_idx).map(|sc| sc.id.clone())
+                    }
+                };
+                let Some(dropped_id) = dropped_tab_id else { return };
+
+                // If already in this split or full, ignore
+                if let Some(s) = self.splits.iter().find(|s| s.id == split_id) {
+                    if s.contains(&dropped_id) || s.is_full() {
+                        return;
+                    }
+                }
+
+                // Remove from any other split
+                for s in self.splits.iter_mut() {
+                    if s.contains(&dropped_id) {
+                        s.remove(&dropped_id);
+                    }
+                }
+                self.splits.retain(|s| s.tabs.len() >= 2);
+
+                if let Some(s) = self.splits.iter_mut().find(|sp| sp.id == split_id) {
+                    if !s.is_full() {
+                        let last_tab = s.tabs.last().cloned();
+                        s.insert(dropped_id.clone(), last_tab.as_deref(), false);
+                        s.focused_tab_id = dropped_id.clone();
+                    }
+                }
+
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == dropped_id) {
+                    self.ensure_tab_controller(pos);
+                    self.active_tab_idx = pos;
+                }
+
+                self.sync_split_bounds();
+                self.sync_tabs_ui();
+                self.persist_state();
+            }
+            ui::TabDropDestination::WindowSplit { target_tab_id, on_left } => {
+                let dropped_tab_id = match source {
+                    ui::DragSource::Tab(tab_idx) => {
+                        self.tabs.iter().filter(|t| !t.is_pinned).nth(tab_idx).map(|t| t.id.clone())
+                    }
+                    ui::DragSource::Pinned(fav_idx) => {
+                        self.pinned_shortcuts.get(fav_idx).map(|sc| sc.id.clone())
+                    }
+                };
+                let Some(dropped_id) = dropped_tab_id else { return };
+                if self.tabs.is_empty() || self.active_tab_idx >= self.tabs.len() {
+                    return;
+                }
+                let active_id = self.tabs[self.active_tab_idx].id.clone();
+                if dropped_id == active_id {
+                    return;
+                }
+
+                // If dropped_id is in any split, remove it from that split
+                for s in self.splits.iter_mut() {
+                    if s.contains(&dropped_id) {
+                        s.remove(&dropped_id);
+                    }
+                }
+                self.splits.retain(|s| s.tabs.len() >= 2);
+
+                if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+                    if !s.is_full() && !s.contains(&dropped_id) {
+                        let beside_id = target_tab_id.as_deref().unwrap_or(&active_id);
+                        s.insert(dropped_id.clone(), Some(beside_id), on_left);
+                        s.focused_tab_id = dropped_id.clone();
+                    }
+                } else {
+                    let tabs = if on_left {
+                        vec![dropped_id.clone(), active_id]
+                    } else {
+                        vec![active_id, dropped_id.clone()]
+                    };
+                    let split_id = format!("split-{}", self.next_tab_id);
+                    self.next_tab_id += 1;
+                    self.splits.push(TabSplit::new(split_id, tabs, dropped_id.clone()));
+                }
+
+                self.sync_split_bounds();
+                self.sync_tabs_ui();
+                self.persist_state();
+            }
         }
     }
 }
@@ -3183,6 +3882,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandAction::ToggleShield => AppEvent::ToggleShield,
                 CommandAction::ToggleSiteShield => AppEvent::ToggleSiteShield,
                 CommandAction::ToggleSiteCard => AppEvent::ToggleSiteCard,
+                CommandAction::OpenInSplitView => AppEvent::SplitWithNewTab,
+                CommandAction::SwapSplit => AppEvent::SwapSplit,
+                CommandAction::EvenSplit => AppEvent::EvenSplit,
+                CommandAction::SeparateSplit => AppEvent::SeparateSplit,
+                CommandAction::CloseSplit => AppEvent::CloseSplit,
             };
             let _ = tx_cb.send(ev);
             unsafe {
@@ -3252,6 +3956,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::DropTab { source, destination } => AppEvent::DropTab { source, destination },
             SidebarAction::OpenFolder(idx) => AppEvent::OpenFolder(idx),
             SidebarAction::SetPinnedLetter(idx, letter) => AppEvent::SetPinnedLetter(idx, letter),
+            SidebarAction::OpenInSplitView(tab_id) => AppEvent::OpenInSplitView(tab_id),
+            SidebarAction::SplitWithNewTab => AppEvent::SplitWithNewTab,
+            SidebarAction::FocusOtherPane => AppEvent::FocusOtherPane,
+            SidebarAction::SwapSplit => AppEvent::SwapSplit,
+            SidebarAction::EvenSplit => AppEvent::EvenSplit,
+            SidebarAction::SeparateSplit => AppEvent::SeparateSplit,
+            SidebarAction::CloseSplit => AppEvent::CloseSplit,
+            SidebarAction::SplitRatioChanged(ratio) => AppEvent::SplitRatioChanged(ratio),
+            SidebarAction::SplitTabs(tab_ids) => AppEvent::SplitTabs(tab_ids),
+            SidebarAction::SplitSizesChanged(sizes) => AppEvent::SplitSizesChanged(sizes),
         };
         let _ = tx_action.send(ev);
         unsafe {
@@ -3263,12 +3977,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_for_resize = app.clone();
     let cb_for_resize = command_bar_cell.clone();
     window.set_resize_callback(move |content_rect, _sidebar_rect| {
-        if let Ok(app) = app_for_resize.try_borrow() {
-            if let Some(tab) = app.tabs.get(app.active_tab_idx) {
-                if let Some(ref ctrl) = tab.controller {
-                    let _ = ctrl.set_bounds(content_rect);
-                }
-            }
+        if let Ok(mut app) = app_for_resize.try_borrow_mut() {
+            app.sync_split_bounds();
         }
         if let Ok(cb_opt) = cb_for_resize.try_borrow() {
             if let Some(ref cb) = *cb_opt {
@@ -3349,45 +4059,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wake_tabs() {
-        init_com().unwrap();
-        let app_data_dir = get_app_data_dir();
-        let webview_data_dir = app_data_dir.join("WebView2Data");
-        let storage_db_path = app_data_dir.join("browser.db");
-        let storage = Rc::new(RefCell::new(Storage::open(&storage_db_path).unwrap()));
-        let config = WindowConfig {
-            title: "Browser".to_string(),
-            width: 1280,
-            height: 800,
-            sidebar_width: 280,
-            caption_height: 32,
-        };
-        let window = Rc::new(BrowserWindow::new(config).unwrap());
-        let engine = Rc::new(WebViewEngine::new(Some(&webview_data_dir)).unwrap());
-        let (event_tx, _event_rx) = mpsc::channel();
-        let command_bar_cell = Rc::new(RefCell::new(None));
-        let app = Rc::new(RefCell::new(BrowserApp::new(
-            window.clone(),
-            command_bar_cell.clone(),
-            engine.clone(),
-            storage.clone(),
-            event_tx.clone(),
-        )));
+    fn test_tab_split_even_and_clamp() {
+        assert_eq!(TabSplit::even(2), vec![0.5, 0.5]);
+        assert_eq!(TabSplit::even(4), vec![0.25, 0.25, 0.25, 0.25]);
 
-        let active_idx = app.borrow().active_tab_idx;
-        println!("Initial active_tab_idx: {}", active_idx);
-        app.borrow_mut().ensure_tab_controller(active_idx);
-        println!("Active tab controller created: {}", app.borrow().tabs[active_idx].controller.is_some());
+        let clamped_2 = TabSplit::clamp(&[0.05, 0.95]);
+        assert_eq!(clamped_2, vec![0.20, 0.80]);
 
-        let num_tabs = app.borrow().tabs.len();
-        println!("Total tabs to wake: {}", num_tabs);
-        for i in 0..num_tabs {
-            println!("Switching to tab {}...", i);
-            app.borrow_mut().switch_tab(i);
-            let has_ctrl = app.borrow().tabs[i].controller.is_some();
-            println!("Tab {} controller exists: {}", i, has_ctrl);
-            assert!(has_ctrl, "Tab {} controller failed to wake!", i);
-        }
+        let clamped_4 = TabSplit::clamp(&[0.05, 0.30, 0.30, 0.35]);
+        assert!(clamped_4[0] >= 0.10);
+        let sum: f32 = clamped_4.iter().sum();
+        assert!((sum - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tab_split_insert_up_to_most() {
+        let mut split = TabSplit::new(
+            "split-1".to_string(),
+            vec!["tab-1".to_string(), "tab-2".to_string()],
+            "tab-1".to_string(),
+        );
+        assert_eq!(split.tabs.len(), 2);
+        assert!(!split.is_full());
+
+        // Insert 3rd tab
+        assert!(split.insert("tab-3".to_string(), Some("tab-2"), false));
+        assert_eq!(split.tabs, vec!["tab-1", "tab-2", "tab-3"]);
+        assert_eq!(split.sizes.len(), 3);
+
+        // Insert 4th tab (before tab-2)
+        assert!(split.insert("tab-4".to_string(), Some("tab-2"), true));
+        assert_eq!(split.tabs, vec!["tab-1", "tab-4", "tab-2", "tab-3"]);
+        assert_eq!(split.sizes.len(), 4);
+        assert!(split.is_full());
+
+        // 5th tab rejected (max 4)
+        assert!(!split.insert("tab-5".to_string(), None, false));
+        assert_eq!(split.tabs.len(), 4);
+
+        // Duplicate tab rejected
+        assert!(!split.insert("tab-1".to_string(), None, false));
+    }
+
+    #[test]
+    fn test_tab_split_remove() {
+        let mut split = TabSplit::new(
+            "split-1".to_string(),
+            vec!["tab-1".to_string(), "tab-2".to_string(), "tab-3".to_string()],
+            "tab-1".to_string(),
+        );
+
+        // Remove tab-2: 2 tabs remain, split stays valid
+        assert!(split.remove("tab-2"));
+        assert_eq!(split.tabs, vec!["tab-1", "tab-3"]);
+        assert_eq!(split.sizes.len(), 2);
+
+        // Remove tab-3: only 1 tab remains, split dissolve signal returned (false)
+        assert!(!split.remove("tab-3"));
+        assert_eq!(split.tabs, vec!["tab-1"]);
+    }
+
+    #[test]
+    fn test_tab_split_multi_direct() {
+        let split_3 = TabSplit::new(
+            "split-3way".to_string(),
+            vec!["tab-1".to_string(), "tab-2".to_string(), "tab-3".to_string()],
+            "tab-1".to_string(),
+        );
+        assert_eq!(split_3.tabs.len(), 3);
+        assert_eq!(split_3.sizes.len(), 3);
+        assert!(!split_3.is_full());
+        let sum: f32 = split_3.sizes.iter().sum();
+        assert!((sum - 1.0).abs() < 0.001);
     }
 }
 

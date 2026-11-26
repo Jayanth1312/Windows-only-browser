@@ -119,6 +119,8 @@ pub enum DragTarget {
     FolderInsert { folder_idx: usize, insert_idx: usize },
     PinnedSection(usize),
     NormalTabs(usize),
+    SplitContainer { split_id: String },
+    WindowSplit { target_tab_id: Option<String>, on_left: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +130,8 @@ pub enum TabDropDestination {
     FolderInsert { folder_id: String, insert_idx: usize },
     PinnedSection(usize),
     NormalTabs(usize),
+    SplitContainer { split_id: String },
+    WindowSplit { target_tab_id: Option<String>, on_left: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +397,8 @@ pub struct TabItem {
     pub folder_id: Option<String>,
     /// Optional single capital custom letter assigned to the tab.
     pub custom_letter: Option<String>,
+    /// Whether this tab is currently in a Split View pair.
+    pub is_split: bool,
 }
 
 impl TabItem {
@@ -409,8 +415,15 @@ impl TabItem {
             is_closing: false,
             folder_id: None,
             custom_letter: None,
+            is_split: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSplitGroup {
+    pub id: String,
+    pub tab_indices: Vec<usize>,
 }
 
 pub struct SidebarState {
@@ -432,6 +445,8 @@ pub struct SidebarState {
     pub selected: Vec<usize>,
     /// Regular-tab indices of the tabs shown together in a split view.
     pub split_group: Option<(usize, usize)>,
+    /// All active split groups in the regular tab list.
+    pub splits: Vec<SidebarSplitGroup>,
     /// Whether there are closed tabs available to reopen (Ctrl+Shift+T).
     pub has_closed_tabs: bool,
     pub shield_enabled: bool,
@@ -459,6 +474,7 @@ impl Default for SidebarState {
             toast: None,
             selected: Vec::new(),
             split_group: None,
+            splits: Vec::new(),
             has_closed_tabs: false,
             shield_enabled: true,
             shield_blocked_count: 0,
@@ -827,6 +843,7 @@ pub struct Layout {
     pub top_clip: RECT,
     pub top_content_h: i32,
     pub tabs: Vec<RECT>,
+    pub split_containers: Vec<(String, RECT, Vec<usize>)>,
     pub new_tab: RECT,
     pub footer_top: i32,
     pub downloads: RECT,
@@ -1143,29 +1160,43 @@ impl SidebarRenderer {
         y += full_row_h + full_row_gap + px(4.0);
 
         // 5. Normal open tabs (UNDER "+ New Tab" button)
-        let group = st.split_group.filter(|g| g.1 == g.0 + 1);
-        for (i, tab_item) in st.tabs.iter().enumerate() {
-            if tab_item.folder_id.is_none() {
-                let mid = (row_l + row_r) / 2;
-                let progress = tab_item.anim_progress.clamp(0.0, 1.0);
-                let ease = 1.0 - (1.0 - progress).powi(3);
-                let row_h = (full_row_h as f32 * ease).round() as i32;
-                let row_gap = (full_row_gap as f32 * ease).round() as i32;
+        let mut split_containers = Vec::new();
+        let mut placed_split_tabs = std::collections::HashSet::new();
 
-                match group {
-                    Some((a, _)) if i == a => {
-                        tabs[i] = rc(row_l, y, mid - px(1.0), y + row_h);
+        for (i, tab_item) in st.tabs.iter().enumerate() {
+            if tab_item.folder_id.is_some() || placed_split_tabs.contains(&i) {
+                continue;
+            }
+
+            // Check if tab i belongs to an active split
+            if let Some(sp) = st.splits.iter().find(|s| s.tab_indices.contains(&i)) {
+                let valid_indices: Vec<usize> = sp.tab_indices.iter()
+                    .copied()
+                    .filter(|&idx| idx < st.tabs.len() && st.tabs[idx].folder_id.is_none())
+                    .collect();
+
+                if valid_indices.len() >= 2 {
+                    let count = valid_indices.len() as i32;
+                    let container_h = count * full_row_h;
+                    let container_rect = rc(row_l, y, row_r, y + container_h);
+                    split_containers.push((sp.id.clone(), container_rect, valid_indices.clone()));
+
+                    for (k, &tab_idx) in valid_indices.iter().enumerate() {
+                        let tab_y = y + k as i32 * full_row_h;
+                        tabs[tab_idx] = rc(row_l, tab_y, row_r, tab_y + full_row_h);
+                        placed_split_tabs.insert(tab_idx);
                     }
-                    Some((_, b)) if i == b => {
-                        tabs[i] = rc(mid + px(1.0), y, row_r, y + row_h);
-                        y += row_h + row_gap;
-                    }
-                    _ => {
-                        tabs[i] = rc(row_l, y, row_r, y + row_h);
-                        y += row_h + row_gap;
-                    }
+                    y += container_h + full_row_gap;
+                    continue;
                 }
             }
+
+            let progress = tab_item.anim_progress.clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - progress).powi(3);
+            let row_h = (full_row_h as f32 * ease).round() as i32;
+            let row_gap = (full_row_gap as f32 * ease).round() as i32;
+            tabs[i] = rc(row_l, y, row_r, y + row_h);
+            y += row_h + row_gap;
         }
 
         let list_content_h = ((y + st.scroll) - list_top).max(0);
@@ -1198,7 +1229,7 @@ impl SidebarRenderer {
 
         let layout = Layout {
             back, forward, reload, toggle_sidebar, url, clean_link_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, ghost_pinned, divider_y, list_clip,
-            folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, new_tab,
+            folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, split_containers, new_tab,
             footer_top, downloads, settings, footer_toggle,
             jump_to_active_pill, jump_target_scroll, jump_active_favicon,
             list_content_h,
@@ -1453,7 +1484,13 @@ impl SidebarRenderer {
             return Some(DragTarget::PinnedSection(slot));
         }
 
-        // 3. Bottom region: Normal tabs
+        // 3. Bottom region: Normal tabs & Split Containers
+        for (split_id, container_rect, tab_indices) in &l.split_containers {
+            if tab_indices.len() < 4 && sy >= container_rect.top && sy < container_rect.bottom {
+                return Some(DragTarget::SplitContainer { split_id: split_id.clone() });
+            }
+        }
+
         let normal_tabs: Vec<usize> = st.tabs.iter().enumerate()
             .filter(|(_, t)| t.folder_id.is_none())
             .map(|(idx, _)| idx)
@@ -1898,14 +1935,46 @@ impl SidebarRenderer {
                          DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0, t.text_dim);
                 }
 
-                // 4. Stitched background for tabs that are split together
-                if let Some((ga, gb)) = st.split_group.filter(|g| g.1 == g.0 + 1) {
-                    if let (Some(ra), Some(rb)) = (l.tabs.get(ga), l.tabs.get(gb)) {
-                        let combined = rc(ra.left, ra.top, rb.right, rb.bottom);
-                        cv.fill_round(&combined, px(7.0), t.white, t.surface_a);
-                        cv.stroke_round(&combined, px(7.0), t.white, t.stroke_a, 1.0);
-                        let mx = (ra.right + rb.left) / 2;
-                        cv.fill_rect(&rc(mx, ra.top + px(8.0), mx + 1, ra.bottom - px(8.0)), t.white, 0.12);
+                // 4. Split Containers (card background + hairlines)
+                for (split_id, container_rect, tab_indices) in &l.split_containers {
+                    if container_rect.bottom < l.list_clip.top || container_rect.top > l.list_clip.bottom {
+                        continue;
+                    }
+
+                    // Background card of the split container
+                    cv.fill_round(container_rect, px(8.0), rgb(24, 24, 28), 0.95);
+                    cv.stroke_round(container_rect, px(8.0), rgb(44, 44, 50), 0.85, 1.0);
+
+                    // Drop target glow outline when dragging tab over this split
+                    if let Some(ref drag) = st.drag_state {
+                        if let Some(DragTarget::SplitContainer { split_id: ref target_id }) = drag.target {
+                            if target_id == split_id {
+                                cv.stroke_round(container_rect, px(8.0), rgb(255, 255, 255), 0.50, 1.5);
+                            }
+                        }
+                    }
+
+                    // Draw 1px hairline dividers between lines inside the container
+                    let count = tab_indices.len();
+                    let full_row_h = px(34.0);
+                    for k in 1..count {
+                        let prev_idx = tab_indices[k - 1];
+                        let curr_idx = tab_indices[k];
+                        let prev_lit = st.active == Some(ActiveTab::Tab(prev_idx))
+                            || st.selected.contains(&prev_idx)
+                            || matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == prev_idx);
+                        let curr_lit = st.active == Some(ActiveTab::Tab(curr_idx))
+                            || st.selected.contains(&curr_idx)
+                            || matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == curr_idx);
+
+                        if !prev_lit && !curr_lit {
+                            let div_y = container_rect.top + k as i32 * full_row_h;
+                            cv.fill_rect(
+                                &rc(container_rect.left + px(10.0), div_y, container_rect.right - px(10.0), div_y + 1),
+                                rgb(44, 44, 50),
+                                0.85,
+                            );
+                        }
                     }
                 }
 
@@ -1925,15 +1994,25 @@ impl SidebarRenderer {
                     let alpha_mult = if is_drag_source { 0.25 } else { 1.0 };
                     let is_active = st.active == Some(ActiveTab::Tab(i));
                     let is_hover = matches!(st.hovered, SidebarHit::Tab(n) | SidebarHit::TabClose(n) if n == i);
-                    if st.selected.contains(&i) {
-                        cv.fill_round(r, px(7.0), t.accent, 0.28 * ease * alpha_mult);
-                        cv.stroke_round(r, px(7.0), t.accent, 0.8 * ease * alpha_mult, 1.0);
-                    }
-                    if is_active {
-                        cv.fill_round(r, px(7.0), t.white, t.active_a * ease * alpha_mult);
-                        cv.stroke_round(r, px(7.0), t.white, t.stroke_a * ease * alpha_mult, 1.0);
-                    } else if is_hover {
-                        cv.fill_round(r, px(7.0), t.white, t.hover_a * ease * alpha_mult);
+                    let is_in_split = l.split_containers.iter().any(|(_, _, indices)| indices.contains(&i));
+                    let is_selected = st.selected.contains(&i);
+
+                    if is_in_split {
+                        if is_active || is_selected {
+                            let inner_r = rc(r.left + px(2.0), r.top + px(1.0), r.right - px(2.0), r.bottom - px(1.0));
+                            cv.fill_round(&inner_r, px(6.0), t.white, t.active_a * ease * alpha_mult);
+                            cv.stroke_round(&inner_r, px(6.0), t.white, t.stroke_a * ease * alpha_mult, 1.0);
+                        } else if is_hover {
+                            let inner_r = rc(r.left + px(2.0), r.top + px(1.0), r.right - px(2.0), r.bottom - px(1.0));
+                            cv.fill_round(&inner_r, px(6.0), t.white, t.hover_a * ease * alpha_mult);
+                        }
+                    } else {
+                        if is_active || is_selected {
+                            cv.fill_round(r, px(7.0), t.white, t.active_a * ease * alpha_mult);
+                            cv.stroke_round(r, px(7.0), t.white, t.stroke_a * ease * alpha_mult, 1.0);
+                        } else if is_hover {
+                            cv.fill_round(r, px(7.0), t.white, t.hover_a * ease * alpha_mult);
+                        }
                     }
 
                     if (r.bottom - r.top) < px(14.0) {
@@ -1949,9 +2028,12 @@ impl SidebarRenderer {
                     let show_close = is_hover || is_active;
                     let cb = px(20.0);
                     let is_muted = st.tabs[i].is_muted;
-                    let right_limit = if show_close && is_muted {
+                    let is_split = st.tabs[i].is_split && !is_in_split;
+                    let right_limit = if show_close && is_muted && is_split {
+                        r.right - cb * 3 - px(16.0)
+                    } else if (show_close && is_muted) || (show_close && is_split) || (is_muted && is_split) {
                         r.right - cb * 2 - px(14.0)
-                    } else if show_close || is_muted {
+                    } else if show_close || is_muted || is_split {
                         r.right - cb - px(12.0)
                     } else {
                         r.right - px(10.0)
@@ -2022,10 +2104,34 @@ impl SidebarRenderer {
                     let cy = r.top + (r.bottom - r.top - cb) / 2;
 
                     if is_muted {
-                        let mx = if show_close { r.right - cb * 2 - px(10.0) } else { r.right - cb - px(8.0) };
+                        let mx = if show_close && is_split {
+                            r.right - cb * 3 - px(10.0)
+                        } else if show_close {
+                            r.right - cb * 2 - px(10.0)
+                        } else {
+                            r.right - cb - px(8.0)
+                        };
                         let mute_r = rc(mx, cy, mx + cb, cy + cb);
                         SelectObject(mem_dc, icon_cap.into());
                         text(mem_dc, "\u{E74F}", mute_r, DT_CENTER.0 | DT_VCENTER.0 | DT_SINGLELINE.0, rgb(255, 130, 130));
+                    }
+
+                    if is_split {
+                        let sx = if show_close && is_muted {
+                            r.right - cb * 3 - px(10.0)
+                        } else if show_close || is_muted {
+                            r.right - cb * 2 - px(8.0)
+                        } else {
+                            r.right - cb - px(6.0)
+                        };
+                        let sb_w = px(13.0);
+                        let sb_h = px(11.0);
+                        let sb_y = r.top + (r.bottom - r.top - sb_h) / 2;
+                        let badge_rect = rc(sx, sb_y, sx + sb_w, sb_y + sb_h);
+                        let col = t.text_dim;
+                        cv.stroke_round(&badge_rect, px(2.0), col, 0.70, 1.0);
+                        let mid = sx + sb_w / 2;
+                        cv.fill_rect(&rc(mid, sb_y + 1, mid + 1, sb_y + sb_h - 1), col, 0.70);
                     }
 
                     if show_close {
@@ -2206,6 +2312,8 @@ impl SidebarRenderer {
                         };
                         draw_drag_insertion_line(&cv, row_l, row_r, y_insert, px);
                     }
+                    Some(DragTarget::SplitContainer { .. }) => {}
+                    Some(DragTarget::WindowSplit { .. }) => {}
                     None => {}
                 }
 

@@ -103,6 +103,51 @@ pub enum SidebarAction {
         destination: crate::sidebar::TabDropDestination,
     },
     OpenFolder(usize),
+    OpenInSplitView(String),
+    SplitWithNewTab,
+    FocusOtherPane,
+    SwapSplit,
+    EvenSplit,
+    SeparateSplit,
+    CloseSplit,
+    SplitRatioChanged(f32),
+    SplitTabs(Vec<String>),
+    SplitSizesChanged(Vec<f32>),
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitInfo {
+    pub id: String,
+    pub tab_indices: Vec<usize>,
+    pub sizes: Vec<f32>,
+    pub focused_tab_idx: usize,
+}
+
+impl SplitInfo {
+    pub fn new(id: String, tab_indices: Vec<usize>, sizes: Vec<f32>, focused_tab_idx: usize) -> Self {
+        Self {
+            id,
+            tab_indices,
+            sizes,
+            focused_tab_idx,
+        }
+    }
+
+    pub fn left_tab_idx(&self) -> usize {
+        self.tab_indices.first().copied().unwrap_or(0)
+    }
+
+    pub fn right_tab_idx(&self) -> usize {
+        self.tab_indices.last().copied().unwrap_or(0)
+    }
+
+    pub fn ratio(&self) -> f32 {
+        self.sizes.first().copied().unwrap_or(0.5)
+    }
+
+    pub fn is_left_focused(&self) -> bool {
+        self.focused_tab_idx == self.left_tab_idx()
+    }
 }
 
 const TAB_ANIM_TIMER_ID: usize = 0x4203;
@@ -155,6 +200,13 @@ struct WindowState {
     site_card: Option<crate::site_card::SiteCard>,
     clear_data_dialog: Option<crate::confirm_dialog::ClearDataDialog>,
     drag_candidate: Option<crate::sidebar::DragCandidate>,
+    split_info: Option<SplitInfo>,
+    is_resizing_split: bool,
+    active_split_divider_idx: usize,
+    split_drag_start_x: i32,
+    split_drag_start_sizes: Vec<f32>,
+    is_hovering_split_divider: bool,
+    split_drop_overlay: Option<crate::split_overlay::SplitDropOverlay>,
 }
 
 #[inline]
@@ -214,6 +266,13 @@ impl BrowserWindow {
                 site_card: None,
                 clear_data_dialog: None,
                 drag_candidate: None,
+                split_info: None,
+                is_resizing_split: false,
+                active_split_divider_idx: 0,
+                split_drag_start_x: 0,
+                split_drag_start_sizes: Vec::new(),
+                is_hovering_split_divider: false,
+                split_drop_overlay: None,
             }));
 
             let raw_state = Rc::into_raw(state.clone()) as *mut _;
@@ -254,6 +313,9 @@ impl BrowserWindow {
 
             let cdd = crate::confirm_dialog::ClearDataDialog::new(hwnd).ok();
             state.borrow_mut().clear_data_dialog = cdd;
+
+            let drop_overlay = crate::split_overlay::SplitDropOverlay::new(hwnd).ok();
+            state.borrow_mut().split_drop_overlay = drop_overlay;
 
             Ok(Self { hwnd, state })
         }
@@ -306,6 +368,7 @@ impl BrowserWindow {
         tabs: Vec<TabItem>,
         pinned: Vec<TabItem>,
         folders: Vec<crate::sidebar::FolderItem>,
+        splits: Vec<crate::sidebar::SidebarSplitGroup>,
         active: Option<ActiveTab>,
         can_go_back: bool,
         can_go_forward: bool,
@@ -317,6 +380,7 @@ impl BrowserWindow {
             b.sidebar_state.tabs = tabs;
             b.sidebar_state.pinned = pinned;
             b.sidebar_state.folders = folders;
+            b.sidebar_state.splits = splits;
             b.sidebar_state.active = active;
             b.sidebar_state.can_go_back = can_go_back;
             b.sidebar_state.can_go_forward = can_go_forward;
@@ -416,7 +480,8 @@ impl BrowserWindow {
         has_closed_tabs: bool,
     ) {
         let folders = self.state.borrow().sidebar_state.folders.clone();
-        self.update_sidebar_data(tabs, pinned, folders, active, can_go_back, can_go_forward, has_closed_tabs);
+        let splits = self.state.borrow().sidebar_state.splits.clone();
+        self.update_sidebar_data(tabs, pinned, folders, splits, active, can_go_back, can_go_forward, has_closed_tabs);
     }
 
     pub fn is_sidebar_visible(&self) -> bool {
@@ -471,6 +536,24 @@ impl BrowserWindow {
 
     pub fn get_layout_rects(&self) -> (RECT, RECT) {
         compute_layout_rects(self.hwnd, &self.state)
+    }
+
+    pub fn set_split_info(&self, info: Option<SplitInfo>) {
+        {
+            let mut b = self.state.borrow_mut();
+            b.split_info = info;
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    pub fn get_split_layout_rects(&self) -> Option<(RECT, RECT, RECT)> {
+        compute_split_layout_rects(self.hwnd, &self.state)
+    }
+
+    pub fn get_split_layout_rects_multi(&self) -> Option<(Vec<RECT>, Vec<RECT>)> {
+        compute_split_layout_rects_multi(self.hwnd, &self.state)
     }
 
     pub fn trigger_resize(&self) {
@@ -727,6 +810,127 @@ fn is_on_sidebar_edge(hwnd: HWND, state: &RefCell<WindowState>, x: i32, _y: i32)
     (x - border_x).abs() <= 5
 }
 
+pub fn calculate_split_rects_multi(content_rect: RECT, sizes: &[f32], scale: f32) -> Option<(Vec<RECT>, Vec<RECT>)> {
+    let count = sizes.len();
+    if count < 2 {
+        return None;
+    }
+    let gutter = (7.0 * scale).round().max(6.0) as i32;
+    let total_w = content_rect.right - content_rect.left;
+    let total_gutters = (count as i32 - 1) * gutter;
+    if total_w <= total_gutters + 50 {
+        return None;
+    }
+    let avail_w = total_w - total_gutters;
+
+    // Normalize sizes to sum to 1.0
+    let sum: f32 = sizes.iter().map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 }).sum();
+    let norm_sizes: Vec<f32> = if sum > 0.0 {
+        sizes.iter().map(|&s| (if s.is_finite() && s > 0.0 { s } else { 1.0 }) / sum).collect()
+    } else {
+        vec![1.0 / count as f32; count]
+    };
+
+    let mut pane_rects = Vec::with_capacity(count);
+    let mut div_rects = Vec::with_capacity(count - 1);
+    let mut cur_x = content_rect.left;
+
+    for i in 0..count {
+        let is_last = i == count - 1;
+        let pane_w = if is_last {
+            content_rect.right - cur_x
+        } else {
+            ((avail_w as f32) * norm_sizes[i]).round() as i32
+        };
+
+        let pane_right = if is_last {
+            content_rect.right
+        } else {
+            cur_x + pane_w
+        };
+
+        pane_rects.push(RECT {
+            left: cur_x,
+            top: content_rect.top,
+            right: pane_right,
+            bottom: content_rect.bottom,
+        });
+
+        if !is_last {
+            let div_left = pane_right;
+            let div_right = div_left + gutter;
+            div_rects.push(RECT {
+                left: div_left,
+                top: content_rect.top,
+                right: div_right,
+                bottom: content_rect.bottom,
+            });
+            cur_x = div_right;
+        }
+    }
+
+    Some((pane_rects, div_rects))
+}
+
+pub fn calculate_split_rects(content_rect: RECT, ratio: f32, scale: f32) -> Option<(RECT, RECT, RECT)> {
+    let clamped_ratio = ratio.clamp(0.20, 0.80);
+    let (panes, divs) = calculate_split_rects_multi(content_rect, &[clamped_ratio, 1.0 - clamped_ratio], scale)?;
+    if panes.len() == 2 && divs.len() == 1 {
+        Some((panes[0], divs[0], panes[1]))
+    } else {
+        None
+    }
+}
+
+pub fn snap_split_ratio(x: i32, content_left: i32, avail_w: i32, scale: f32) -> f32 {
+    let raw_ratio = (x - content_left) as f32 / avail_w.max(1) as f32;
+    let clamped = raw_ratio.clamp(0.20, 0.80);
+    let snap_px = (15.0 * scale).round() as i32;
+    let center_x = content_left + avail_w / 2;
+    if (x - center_x).abs() <= snap_px {
+        0.50
+    } else {
+        clamped
+    }
+}
+
+fn compute_split_layout_rects_multi(hwnd: HWND, state: &RefCell<WindowState>) -> Option<(Vec<RECT>, Vec<RECT>)> {
+    let b = state.try_borrow().ok()?;
+    let split = b.split_info.as_ref()?;
+    let sizes = split.sizes.clone();
+    drop(b);
+
+    let (content_rect, _) = compute_layout_rects(hwnd, state);
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let scale = dpi as f32 / 96.0;
+
+    calculate_split_rects_multi(content_rect, &sizes, scale)
+}
+
+fn compute_split_layout_rects(hwnd: HWND, state: &RefCell<WindowState>) -> Option<(RECT, RECT, RECT)> {
+    let (panes, divs) = compute_split_layout_rects_multi(hwnd, state)?;
+    if panes.len() >= 2 && !divs.is_empty() {
+        Some((panes[0], divs[0], panes[1]))
+    } else {
+        None
+    }
+}
+
+fn which_split_divider(hwnd: HWND, state: &RefCell<WindowState>, x: i32, y: i32) -> Option<usize> {
+    if let Some((_panes, divs)) = compute_split_layout_rects_multi(hwnd, state) {
+        for (i, div) in divs.iter().enumerate() {
+            if x >= div.left - 3 && x <= div.right + 3 && y >= div.top && y <= div.bottom {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn is_on_split_divider(hwnd: HWND, state: &RefCell<WindowState>, x: i32, y: i32) -> bool {
+    which_split_divider(hwnd, state, x, y).is_some()
+}
+
 unsafe fn clamp_scroll(hwnd: HWND, state: &RefCell<WindowState>) {
     let r = sidebar_rect_of(hwnd, state);
     let (w, h) = (r.right - r.left, r.bottom - r.top);
@@ -809,7 +1013,9 @@ unsafe extern "system" fn wndproc(
                 let _ = GetCursorPos(&mut pt);
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let is_resizing = state.borrow().is_resizing_sidebar;
-                if is_resizing || is_on_sidebar_edge(hwnd, state, pt.x, pt.y) {
+                let is_resizing_split = state.borrow().is_resizing_split;
+                if is_resizing || is_on_sidebar_edge(hwnd, state, pt.x, pt.y)
+                    || is_resizing_split || is_on_split_divider(hwnd, state, pt.x, pt.y) {
                     if let Ok(c) = LoadCursorW(None, IDC_SIZEWE) {
                         let _ = SetCursor(Some(c));
                         return LRESULT(1);
@@ -916,6 +1122,62 @@ unsafe extern "system" fn wndproc(
                 }
             }
 
+            // If split view is active, render the draggable dividers between panes
+            if let Some((_pane_rects, div_rects)) = compute_split_layout_rects_multi(hwnd, state) {
+                let dpi = GetDpiForWindow(hwnd);
+                let scale = dpi as f32 / 96.0;
+
+                for (di, div_rect) in div_rects.iter().enumerate() {
+                    // Fill divider gutter with the unified chassis background
+                    let div_bg_brush = CreateSolidBrush(crate::sidebar::rgb(22, 22, 25));
+                    let _ = FillRect(hdc, div_rect, div_bg_brush);
+                    let _ = DeleteObject(div_bg_brush.into());
+
+                    // Subtle hairline borders on left and right edges of divider
+                    let border_pen_brush = CreateSolidBrush(crate::sidebar::rgb(35, 35, 40));
+                    let left_edge = RECT { left: div_rect.left, top: div_rect.top, right: div_rect.left + 1, bottom: div_rect.bottom };
+                    let right_edge = RECT { left: div_rect.right - 1, top: div_rect.top, right: div_rect.right, bottom: div_rect.bottom };
+                    let _ = FillRect(hdc, &left_edge, border_pen_brush);
+                    let _ = FillRect(hdc, &right_edge, border_pen_brush);
+                    let _ = DeleteObject(border_pen_brush.into());
+
+                    // Focus accent line indicating which adjacent pane is currently focused
+                    let focused_idx = b.split_info.as_ref().map(|sp| sp.focused_tab_idx).unwrap_or(0);
+                    let is_left_of_div = focused_idx == di;
+                    let is_right_of_div = focused_idx == di + 1;
+                    if is_left_of_div || is_right_of_div {
+                        let focus_brush = CreateSolidBrush(crate::sidebar::rgb(140, 140, 150)); // subtle neutral silver
+                        let focus_edge = if is_left_of_div {
+                            RECT { left: div_rect.left, top: div_rect.top, right: div_rect.left + 2, bottom: div_rect.bottom }
+                        } else {
+                            RECT { left: div_rect.right - 2, top: div_rect.top, right: div_rect.right, bottom: div_rect.bottom }
+                        };
+                        let _ = FillRect(hdc, &focus_edge, focus_brush);
+                        let _ = DeleteObject(focus_brush.into());
+                    }
+
+                    // Centered rounded grip handle pill
+                    let grip_w = (3.0 * scale).round().max(2.0) as i32;
+                    let grip_h = (36.0 * scale).round().max(24.0) as i32;
+                    let grip_x = div_rect.left + (div_rect.right - div_rect.left - grip_w) / 2;
+                    let grip_y = div_rect.top + (div_rect.bottom - div_rect.top - grip_h) / 2;
+                    let grip_rect = RECT { left: grip_x, top: grip_y, right: grip_x + grip_w, bottom: grip_y + grip_h };
+
+                    let grip_color = if b.is_resizing_split && b.active_split_divider_idx == di {
+                        crate::sidebar::rgb(220, 220, 225) // bright white-silver when dragging
+                    } else if b.is_hovering_split_divider {
+                        crate::sidebar::rgb(180, 180, 190) // silver on hover
+                    } else {
+                        crate::sidebar::rgb(75, 75, 85) // subtle grey idle
+                    };
+                    let grip_brush = CreateSolidBrush(grip_color);
+                    let grip_rgn = CreateRoundRectRgn(grip_rect.left, grip_rect.top, grip_rect.right, grip_rect.bottom, grip_w, grip_w);
+                    let _ = FillRgn(hdc, grip_rgn, grip_brush);
+                    let _ = DeleteObject(grip_brush.into());
+                    let _ = DeleteObject(grip_rgn.into());
+                }
+            }
+
             // Render sidebar smoothly from offscreen memory DC
             if b.sidebar_visible {
                 let dpi = GetDpiForWindow(hwnd);
@@ -932,6 +1194,88 @@ unsafe extern "system" fn wndproc(
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+
+            if state.borrow().is_resizing_split {
+                let (active_div, start_sizes) = {
+                    let b = state.borrow();
+                    (b.active_split_divider_idx, b.split_drag_start_sizes.clone())
+                };
+
+                let count = start_sizes.len();
+                if count >= 2 && active_div + 1 < count {
+                    let (content_rect, _) = compute_layout_rects(hwnd, state);
+                    let dpi = GetDpiForWindow(hwnd);
+                    let scale = dpi as f32 / 96.0;
+                    let gutter = (7.0 * scale).round().max(6.0) as i32;
+                    let total_gutters = (count as i32 - 1) * gutter;
+                    let avail_w = (content_rect.right - content_rect.left - total_gutters).max(50);
+
+                    // Compute the start X of the pair being resized
+                    let start_share: f32 = start_sizes[..active_div].iter().sum();
+                    let pair_start_x = content_rect.left + (start_share * avail_w as f32).round() as i32 + (active_div as i32 * gutter);
+                    let both_fraction = start_sizes[active_div] + start_sizes[active_div + 1];
+                    let both_px = both_fraction * avail_w as f32;
+
+                    // Mouse X relative to the pair
+                    let left_px = (x - gutter / 2 - pair_start_x) as f32;
+                    let least_fraction = if count <= 2 { 0.20 } else { 0.15 };
+                    let least_px = least_fraction * avail_w as f32;
+                    let clamped_left_px = left_px.clamp(least_px, (both_px - least_px).max(least_px));
+
+                    // 15px snap to even 50/50 of this pair
+                    let even_px = both_px / 2.0;
+                    let snapped_left_px = if (clamped_left_px - even_px).abs() <= 15.0 * scale {
+                        even_px
+                    } else {
+                        clamped_left_px
+                    };
+
+                    let first_fraction = snapped_left_px / avail_w as f32;
+                    let second_fraction = (both_px - snapped_left_px) / avail_w as f32;
+
+                    let mut new_sizes = start_sizes.clone();
+                    new_sizes[active_div] = first_fraction;
+                    new_sizes[active_div + 1] = second_fraction;
+
+                    let changed = {
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut sp) = b.split_info {
+                            sp.sizes = new_sizes.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    if changed {
+                        let on_resize = state.borrow().on_resize.clone();
+                        if let Some(cb) = on_resize {
+                            let (content, sidebar) = compute_layout_rects(hwnd, state);
+                            cb(content, sidebar);
+                        }
+                        let _ = InvalidateRect(Some(hwnd), Some(&content_rect), false);
+                    }
+                }
+                return LRESULT(0);
+            }
+
+            let is_on_div = is_on_split_divider(hwnd, state, x, y);
+            let div_hover_changed = {
+                let mut b = state.borrow_mut();
+                if b.is_hovering_split_divider != is_on_div {
+                    b.is_hovering_split_divider = is_on_div;
+                    true
+                } else {
+                    false
+                }
+            };
+            if div_hover_changed {
+                if let Some((_, divs)) = compute_split_layout_rects_multi(hwnd, state) {
+                    for div in divs {
+                        let _ = InvalidateRect(Some(hwnd), Some(&div), false);
+                    }
+                }
+            }
 
             if state.borrow().is_resizing_sidebar {
                 let dpi = GetDpiForWindow(hwnd);
@@ -1027,9 +1371,72 @@ unsafe extern "system" fn wndproc(
 
             let is_dragging = state.borrow().sidebar_state.drag_state.is_some();
             if is_dragging {
-                let (_, sidebar_rect) = compute_layout_rects(hwnd, state);
-                let target = {
+                let (content_rect, sidebar_rect) = compute_layout_rects(hwnd, state);
+                let is_in_content = x >= content_rect.left && x <= content_rect.right && y >= content_rect.top && y <= content_rect.bottom;
+                let target = if is_in_content {
                     let b = state.borrow();
+                    let split_info_opt = b.split_info.clone();
+                    if let Some(sp) = split_info_opt {
+                        if sp.tab_indices.len() >= 4 {
+                            // Max 4 vertical split panes reached
+                            if let Some(ref ov) = b.split_drop_overlay {
+                                ov.hide();
+                            }
+                            None
+                        } else {
+                            let (panes, _) = compute_split_layout_rects_multi(hwnd, state).unwrap_or_default();
+                            let mut target_pane_idx = 0;
+                            for (pi, pr) in panes.iter().enumerate() {
+                                if x >= pr.left && x <= pr.right {
+                                    target_pane_idx = pi;
+                                    break;
+                                }
+                            }
+                            if target_pane_idx < panes.len() {
+                                let pr = panes[target_pane_idx];
+                                let mid = pr.left + (pr.right - pr.left) / 2;
+                                let on_left = x < mid;
+                                let drop_rect = if on_left {
+                                    RECT { left: pr.left, top: pr.top, right: mid, bottom: pr.bottom }
+                                } else {
+                                    RECT { left: mid, top: pr.top, right: pr.right, bottom: pr.bottom }
+                                };
+                                let target_tab_id = b.sidebar_state.tabs.get(sp.tab_indices[target_pane_idx]).map(|t| t.id.clone());
+                                let label = if on_left { "Split Left" } else { "Split Right" };
+                                let accent = crate::sidebar::rgb(220, 220, 225);
+                                if let Some(ref ov) = b.split_drop_overlay {
+                                    ov.show(drop_rect, label, accent);
+                                }
+                                Some(crate::sidebar::DragTarget::WindowSplit { target_tab_id, on_left })
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        // Single active tab
+                        let mid = content_rect.left + (content_rect.right - content_rect.left) / 2;
+                        let on_left = x < mid;
+                        let drop_rect = if on_left {
+                            RECT { left: content_rect.left, top: content_rect.top, right: mid, bottom: content_rect.bottom }
+                        } else {
+                            RECT { left: mid, top: content_rect.top, right: content_rect.right, bottom: content_rect.bottom }
+                        };
+                        let active_tab_id = match b.sidebar_state.active {
+                            Some(crate::sidebar::ActiveTab::Tab(i)) => b.sidebar_state.tabs.get(i).map(|t| t.id.clone()),
+                            _ => None,
+                        };
+                        let label = if on_left { "Split Left" } else { "Split Right" };
+                        let accent = crate::sidebar::rgb(220, 220, 225);
+                        if let Some(ref ov) = b.split_drop_overlay {
+                            ov.show(drop_rect, label, accent);
+                        }
+                        Some(crate::sidebar::DragTarget::WindowSplit { target_tab_id: active_tab_id, on_left })
+                    }
+                } else {
+                    let b = state.borrow();
+                    if let Some(ref ov) = b.split_drop_overlay {
+                        ov.hide();
+                    }
                     b.sidebar.compute_drag_target(hwnd, &b.sidebar_state, x, y, sidebar_rect)
                 };
 
@@ -1182,6 +1589,39 @@ unsafe extern "system" fn wndproc(
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
 
+            if let Some(div_idx) = which_split_divider(hwnd, state, x, y) {
+                if msg == WM_LBUTTONDBLCLK {
+                    {
+                        let mut b = state.borrow_mut();
+                        if let Some(ref mut sp) = b.split_info {
+                            let count = sp.tab_indices.len().max(1);
+                            sp.sizes = vec![1.0 / count as f32; count];
+                        }
+                    }
+                    let on_action = state.borrow().on_action.clone();
+                    if let Some(ref cb) = on_action {
+                        cb(SidebarAction::EvenSplit);
+                    }
+                    if let Some((_l, divs)) = compute_split_layout_rects_multi(hwnd, state) {
+                        for div in divs {
+                            let _ = InvalidateRect(Some(hwnd), Some(&div), false);
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                let mut b = state.borrow_mut();
+                let start_sizes = b.split_info.as_ref().map(|sp| sp.sizes.clone());
+                if let Some(sizes) = start_sizes {
+                    b.is_resizing_split = true;
+                    b.active_split_divider_idx = div_idx;
+                    b.split_drag_start_x = x;
+                    b.split_drag_start_sizes = sizes;
+                }
+                drop(b);
+                let _ = SetCapture(hwnd);
+                return LRESULT(0);
+            }
+
             if is_on_sidebar_edge(hwnd, state, x, y) {
                 let mut b = state.borrow_mut();
                 b.is_resizing_sidebar = true;
@@ -1241,6 +1681,18 @@ unsafe extern "system" fn wndproc(
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
 
+            if state.borrow().is_resizing_split {
+                state.borrow_mut().is_resizing_split = false;
+                let _ = ReleaseCapture();
+                let sizes = state.borrow().split_info.as_ref().map(|sp| sp.sizes.clone()).unwrap_or_default();
+                let on_action = state.borrow().on_action.clone();
+                if let Some(ref cb) = on_action {
+                    cb(SidebarAction::SplitSizesChanged(sizes));
+                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                return LRESULT(0);
+            }
+
             if state.borrow().is_resizing_sidebar {
                 state.borrow_mut().is_resizing_sidebar = false;
                 let _ = ReleaseCapture();
@@ -1251,6 +1703,9 @@ unsafe extern "system" fn wndproc(
             let drag = {
                 let mut b = state.borrow_mut();
                 b.drag_candidate = None;
+                if let Some(ref ov) = b.split_drop_overlay {
+                    ov.hide();
+                }
                 b.sidebar_state.drag_state.take()
             };
 
@@ -1282,6 +1737,12 @@ unsafe extern "system" fn wndproc(
                             }
                             crate::sidebar::DragTarget::NormalTabs(slot) => {
                                 Some(crate::sidebar::TabDropDestination::NormalTabs(slot))
+                            }
+                            crate::sidebar::DragTarget::SplitContainer { split_id } => {
+                                Some(crate::sidebar::TabDropDestination::SplitContainer { split_id })
+                            }
+                            crate::sidebar::DragTarget::WindowSplit { target_tab_id, on_left } => {
+                                Some(crate::sidebar::TabDropDestination::WindowSplit { target_tab_id, on_left })
                             }
                         }
                     };
@@ -1390,9 +1851,39 @@ unsafe extern "system" fn wndproc(
                             }
                         }
                         SidebarHit::Tab(i) => {
-                            let on_action = state.borrow().on_action.clone();
-                            if let Some(cb) = on_action {
-                                cb(SidebarAction::SelectTab(i));
+                            let ctrl_pressed = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) } < 0;
+                            let shift_pressed = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32) } < 0;
+
+                            if ctrl_pressed {
+                                let mut b = state.borrow_mut();
+                                if b.sidebar_state.selected.is_empty() {
+                                    if let Some(crate::sidebar::ActiveTab::Tab(act)) = b.sidebar_state.active {
+                                        b.sidebar_state.selected.push(act);
+                                    }
+                                }
+                                if let Some(pos) = b.sidebar_state.selected.iter().position(|&idx| idx == i) {
+                                    b.sidebar_state.selected.remove(pos);
+                                } else {
+                                    b.sidebar_state.selected.push(i);
+                                }
+                                drop(b);
+                                unsafe { invalidate_sidebar(hwnd, state); }
+                            } else if shift_pressed {
+                                let mut b = state.borrow_mut();
+                                let anchor = b.sidebar_state.selected.first().copied()
+                                    .or_else(|| if let Some(crate::sidebar::ActiveTab::Tab(act)) = b.sidebar_state.active { Some(act) } else { None })
+                                    .unwrap_or(i);
+                                let start = anchor.min(i);
+                                let end = anchor.max(i);
+                                b.sidebar_state.selected = (start..=end).collect();
+                                drop(b);
+                                unsafe { invalidate_sidebar(hwnd, state); }
+                            } else {
+                                state.borrow_mut().sidebar_state.selected.clear();
+                                let on_action = state.borrow().on_action.clone();
+                                if let Some(cb) = on_action {
+                                    cb(SidebarAction::SelectTab(i));
+                                }
                             }
                         }
                         SidebarHit::Downloads => {
@@ -1451,6 +1942,34 @@ unsafe extern "system" fn wndproc(
         WM_RBUTTONUP => {
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+
+            if is_on_split_divider(hwnd, state, x, y) {
+                let mut pt = POINT { x, y };
+                unsafe { let _ = ClientToScreen(hwnd, &mut pt); }
+                let items = vec![
+                    crate::context_menu::ContextMenuItem::item(1, "Swap Left and Right Panes", Some("Ctrl+Alt+S")),
+                    crate::context_menu::ContextMenuItem::item(2, "Even Out (50 / 50)", Some("Double-Click")),
+                    crate::context_menu::ContextMenuItem::separator(),
+                    crate::context_menu::ContextMenuItem::item(3, "Separate Split", Some("Ctrl+Alt+U")),
+                    crate::context_menu::ContextMenuItem::item(4, "Close Split (Both Panes)", Some("Ctrl+Alt+W")),
+                ];
+                let on_action = state.borrow().on_action.clone();
+                if let Some(ref menu) = state.borrow().context_menu {
+                    menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
+                        if let Some(ref cb) = on_action {
+                            match cmd {
+                                1 => cb(SidebarAction::SwapSplit),
+                                2 => cb(SidebarAction::EvenSplit),
+                                3 => cb(SidebarAction::SeparateSplit),
+                                4 => cb(SidebarAction::CloseSplit),
+                                _ => {}
+                            }
+                        }
+                    }));
+                }
+                return LRESULT(0);
+            }
+
             let hit = hit_at(hwnd, state, x, y);
             let has_closed = state.borrow().sidebar_state.has_closed_tabs;
 
@@ -1458,6 +1977,15 @@ unsafe extern "system" fn wndproc(
                 SidebarHit::Tab(idx) => {
                     let mut pt = POINT { x, y };
                     unsafe { let _ = ClientToScreen(hwnd, &mut pt); }
+
+                    let selected_tabs = {
+                        let mut b = state.borrow_mut();
+                        if !b.sidebar_state.selected.contains(&idx) {
+                            b.sidebar_state.selected.clear();
+                        }
+                        b.sidebar_state.selected.clone()
+                    };
+
                     let tab_opt = state.borrow().sidebar_state.tabs.get(idx).cloned();
                     if let Some(tab) = tab_opt {
                         let mute_label = if tab.is_muted { "Unmute Tab" } else { "Mute Tab" };
@@ -1486,6 +2014,13 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item(4, "Rename...", Some("F2")),
                         ];
 
+                        if selected_tabs.len() >= 2 && selected_tabs.len() <= 4 && selected_tabs.contains(&idx) {
+                            let count = selected_tabs.len();
+                            let split_label = format!("Open {} Tabs in Split View", count);
+                            items.insert(0, crate::context_menu::ContextMenuItem::item(24, &split_label, Some("Ctrl+Alt+N")));
+                            items.insert(1, crate::context_menu::ContextMenuItem::separator());
+                        }
+
                         let folders = state.borrow().sidebar_state.folders.clone();
                         if !folders.is_empty() {
                             items.push(crate::context_menu::ContextMenuItem::separator());
@@ -1509,6 +2044,24 @@ unsafe extern "system" fn wndproc(
                             crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
                             crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
+                        ]);
+
+                        if tab.is_split {
+                            items.extend(vec![
+                                crate::context_menu::ContextMenuItem::item(25, "Add New Tab to Split View", Some("Ctrl+Alt+N")),
+                                crate::context_menu::ContextMenuItem::item(20, "Swap Split Panes", Some("Ctrl+Alt+S")),
+                                crate::context_menu::ContextMenuItem::item(21, "Even Out Split (50 / 50)", Some("Ctrl+Alt+E")),
+                                crate::context_menu::ContextMenuItem::item(22, "Separate Split", Some("Ctrl+Alt+U")),
+                                crate::context_menu::ContextMenuItem::separator(),
+                            ]);
+                        } else {
+                            items.extend(vec![
+                                crate::context_menu::ContextMenuItem::item(23, "Open in Split View", Some("Ctrl+Alt+N")),
+                                crate::context_menu::ContextMenuItem::separator(),
+                            ]);
+                        }
+
+                        items.extend(vec![
                             crate::context_menu::ContextMenuItem::item(13, "Element Zapper", Some("Ctrl+Shift+H")),
                             crate::context_menu::ContextMenuItem::item(14, "Restore Hidden Elements", None),
                             crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
@@ -1522,6 +2075,7 @@ unsafe extern "system" fn wndproc(
                         let state_rc = state;
                         let folders_rc = folders.clone();
                         let tab_title_rename = tab.title.clone();
+                        let tab_id_split = tab.id.clone();
                         if let Some(ref menu) = state.borrow().context_menu {
                             menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
                                 if cmd == 4 {
@@ -1576,6 +2130,18 @@ unsafe extern "system" fn wndproc(
                                         13 => cb(SidebarAction::ToggleZapper),
                                         14 => cb(SidebarAction::RestoreAllHidden),
                                         16 => cb(SidebarAction::ToggleSiteShield),
+                                        20 => cb(SidebarAction::SwapSplit),
+                                        21 => cb(SidebarAction::EvenSplit),
+                                        22 => cb(SidebarAction::SeparateSplit),
+                                        23 => cb(SidebarAction::OpenInSplitView(tab_id_split.clone())),
+                                        24 => {
+                                            let tab_ids: Vec<String> = {
+                                                let b = state_rc.borrow();
+                                                selected_tabs.iter().filter_map(|&i| b.sidebar_state.tabs.get(i).map(|t| t.id.clone())).collect()
+                                            };
+                                            cb(SidebarAction::SplitTabs(tab_ids));
+                                        }
+                                        25 => cb(SidebarAction::SplitWithNewTab),
                                         _ => {}
                                     }
                                 }
@@ -1846,6 +2412,9 @@ unsafe extern "system" fn wndproc(
                 let was_drag = {
                     let mut b = state.borrow_mut();
                     b.drag_candidate = None;
+                    if let Some(ref ov) = b.split_drop_overlay {
+                        ov.hide();
+                    }
                     b.sidebar_state.drag_state.take().is_some()
                 };
                 if was_drag {
@@ -2031,7 +2600,48 @@ unsafe extern "system" fn wndproc(
             let on_action = state.borrow().on_action.clone();
             let vk = wparam.0 as u32;
 
-            if alt {
+            if ctrl && alt {
+                match vk {
+                    0x4E => { // 'N' -> Split View (Ctrl+Alt+N)
+                        let selected = state.borrow().sidebar_state.selected.clone();
+                        if selected.len() >= 2 && selected.len() <= 4 {
+                            let tab_ids: Vec<String> = {
+                                let b = state.borrow();
+                                selected.iter().filter_map(|&i| b.sidebar_state.tabs.get(i).map(|t| t.id.clone())).collect()
+                            };
+                            if tab_ids.len() >= 2 {
+                                state.borrow_mut().sidebar_state.selected.clear();
+                                unsafe { invalidate_sidebar(hwnd, state); }
+                                if let Some(ref cb) = on_action { cb(SidebarAction::SplitTabs(tab_ids)); }
+                                return LRESULT(0);
+                            }
+                        }
+                        if let Some(ref cb) = on_action { cb(SidebarAction::SplitWithNewTab); }
+                        return LRESULT(0);
+                    }
+                    0x25 | 0x27 | 0xDC => { // Left/Right Arrow or '\' -> Focus Other Pane
+                        if let Some(ref cb) = on_action { cb(SidebarAction::FocusOtherPane); }
+                        return LRESULT(0);
+                    }
+                    0x53 => { // 'S' -> Swap Split (Ctrl+Alt+S)
+                        if let Some(ref cb) = on_action { cb(SidebarAction::SwapSplit); }
+                        return LRESULT(0);
+                    }
+                    0x45 => { // 'E' -> Even Split (Ctrl+Alt+E)
+                        if let Some(ref cb) = on_action { cb(SidebarAction::EvenSplit); }
+                        return LRESULT(0);
+                    }
+                    0x55 => { // 'U' -> Separate Split (Ctrl+Alt+U)
+                        if let Some(ref cb) = on_action { cb(SidebarAction::SeparateSplit); }
+                        return LRESULT(0);
+                    }
+                    0x57 => { // 'W' -> Close Split (Ctrl+Alt+W)
+                        if let Some(ref cb) = on_action { cb(SidebarAction::CloseSplit); }
+                        return LRESULT(0);
+                    }
+                    _ => {}
+                }
+            } else if alt {
                 if vk == 0x25 { // Left arrow -> Back
                     if let Some(ref cb) = on_action { cb(SidebarAction::NavBack); }
                     return LRESULT(0);
@@ -2256,4 +2866,88 @@ unsafe extern "system" fn wndproc(
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_rects_50_50() {
+        let content_rect = RECT { left: 100, top: 0, right: 1100, bottom: 800 };
+        let (left, div, right) = calculate_split_rects(content_rect, 0.5, 1.0).expect("layout should succeed");
+        // total_w = 1000, gutter = 7. avail_w = 993.
+        // left_w = round(993 * 0.5) = 497.
+        // left: 100 .. 597
+        // div: 597 .. 604 (width 7)
+        // right: 604 .. 1100 (width 496)
+        assert_eq!(left.left, 100);
+        assert_eq!(left.right, 597);
+        assert_eq!(div.left, 597);
+        assert_eq!(div.right, 604);
+        assert_eq!(div.right - div.left, 7);
+        assert_eq!(right.left, 604);
+        assert_eq!(right.right, 1100);
+        assert_eq!(left.top, 0);
+        assert_eq!(left.bottom, 800);
+    }
+
+    #[test]
+    fn test_split_rects_ratio_clamping() {
+        let content_rect = RECT { left: 0, top: 0, right: 1000, bottom: 600 };
+        // Extreme left (< 0.20) should clamp to 0.20
+        let (left_min, _, _) = calculate_split_rects(content_rect, 0.05, 1.0).unwrap();
+        // avail_w = 993, 993 * 0.20 = 199
+        assert_eq!(left_min.right - left_min.left, 199);
+
+        // Extreme right (> 0.80) should clamp to 0.80
+        let (left_max, _, _) = calculate_split_rects(content_rect, 0.95, 1.0).unwrap();
+        // avail_w = 993, 993 * 0.80 = 794
+        assert_eq!(left_max.right - left_max.left, 794);
+    }
+
+    #[test]
+    fn test_snap_split_ratio() {
+        let content_left = 100;
+        let avail_w = 1000;
+        let scale = 1.0;
+        // center is 100 + 500 = 600.
+        // snap range is within 15px: 585 .. 615
+
+        // Within snap zone -> 0.50
+        assert_eq!(snap_split_ratio(605, content_left, avail_w, scale), 0.50);
+        assert_eq!(snap_split_ratio(590, content_left, avail_w, scale), 0.50);
+
+        // Outside snap zone -> proportional ratio
+        let r1 = snap_split_ratio(400, content_left, avail_w, scale);
+        assert!((r1 - 0.30).abs() < 0.01);
+
+        // Beyond clamp bounds -> clamped
+        assert_eq!(snap_split_ratio(150, content_left, avail_w, scale), 0.20);
+        assert_eq!(snap_split_ratio(950, content_left, avail_w, scale), 0.80);
+    }
+
+    #[test]
+    fn test_split_rects_multi_3_panes() {
+        let content_rect = RECT { left: 0, top: 0, right: 1200, bottom: 800 };
+        let (panes, divs) = calculate_split_rects_multi(content_rect, &[1.0, 1.0, 1.0], 1.0).expect("3 panes");
+        assert_eq!(panes.len(), 3);
+        assert_eq!(divs.len(), 2);
+        assert_eq!(panes[0].left, 0);
+        assert_eq!(panes[2].right, 1200);
+        assert_eq!(divs[0].left, panes[0].right);
+        assert_eq!(divs[0].right, panes[1].left);
+        assert_eq!(divs[1].left, panes[1].right);
+        assert_eq!(divs[1].right, panes[2].left);
+    }
+
+    #[test]
+    fn test_split_rects_multi_4_panes() {
+        let content_rect = RECT { left: 0, top: 0, right: 1600, bottom: 900 };
+        let (panes, divs) = calculate_split_rects_multi(content_rect, &[0.25, 0.25, 0.25, 0.25], 1.0).expect("4 panes");
+        assert_eq!(panes.len(), 4);
+        assert_eq!(divs.len(), 3);
+        assert_eq!(panes[0].left, 0);
+        assert_eq!(panes[3].right, 1600);
+    }
 }

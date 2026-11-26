@@ -50,6 +50,56 @@ pub struct SavedFolder {
     pub is_open: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedSplit {
+    pub id: String,
+    pub left_tab_id: String,
+    pub right_tab_id: String,
+    pub ratio: f32,
+    pub focused_tab_id: Option<String>,
+    pub tabs_csv: Option<String>,
+    pub sizes_csv: Option<String>,
+}
+
+impl SavedSplit {
+    pub fn new(id: String, tabs: Vec<String>, sizes: Vec<f32>, focused_tab_id: Option<String>) -> Self {
+        let left_tab_id = tabs.first().cloned().unwrap_or_default();
+        let right_tab_id = tabs.last().cloned().unwrap_or_default();
+        let ratio = sizes.first().copied().unwrap_or(0.5);
+        let tabs_csv = Some(tabs.join(","));
+        let sizes_csv = Some(sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","));
+        Self {
+            id,
+            left_tab_id,
+            right_tab_id,
+            ratio,
+            focused_tab_id,
+            tabs_csv,
+            sizes_csv,
+        }
+    }
+
+    pub fn get_tabs(&self) -> Vec<String> {
+        if let Some(ref csv) = self.tabs_csv {
+            let list: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if list.len() >= 2 {
+                return list;
+            }
+        }
+        vec![self.left_tab_id.clone(), self.right_tab_id.clone()]
+    }
+
+    pub fn get_sizes(&self) -> Vec<f32> {
+        if let Some(ref csv) = self.sizes_csv {
+            let list: Vec<f32> = csv.split(',').filter_map(|s| s.trim().parse::<f32>().ok()).collect();
+            if list.len() >= 2 {
+                return list;
+            }
+        }
+        vec![self.ratio, (1.0 - self.ratio).max(0.1)]
+    }
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -152,12 +202,23 @@ impl Storage {
                 autoplay INTEGER NOT NULL DEFAULT 1,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS tab_splits (
+                id TEXT PRIMARY KEY,
+                left_tab_id TEXT NOT NULL,
+                right_tab_id TEXT NOT NULL,
+                ratio REAL NOT NULL DEFAULT 0.5,
+                focused_tab_id TEXT,
+                created_at INTEGER NOT NULL
+            );
             "#,
         )?;
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_title INTEGER NOT NULL DEFAULT 0", []);
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN folder_id TEXT", []);
         let _ = self.conn.execute("ALTER TABLE tabs ADD COLUMN custom_letter TEXT", []);
         let _ = self.conn.execute("ALTER TABLE folders ADD COLUMN is_open INTEGER NOT NULL DEFAULT 1", []);
+        let _ = self.conn.execute("ALTER TABLE tab_splits ADD COLUMN tabs_csv TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE tab_splits ADD COLUMN sizes_csv TEXT", []);
         Ok(())
     }
 
@@ -380,6 +441,61 @@ impl Storage {
             }
         }
         Ok(None)
+    }
+
+    pub fn save_splits(&self, splits: &[SavedSplit]) -> Result<(), StorageError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM tab_splits", [])?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tab_splits (id, left_tab_id, right_tab_id, ratio, focused_tab_id, created_at, tabs_csv, sizes_csv) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            )?;
+            for s in splits {
+                stmt.execute(params![
+                    s.id,
+                    s.left_tab_id,
+                    s.right_tab_id,
+                    s.ratio as f64,
+                    s.focused_tab_id,
+                    now,
+                    s.tabs_csv,
+                    s.sizes_csv,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_saved_splits(&self) -> Result<Vec<SavedSplit>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, left_tab_id, right_tab_id, ratio, focused_tab_id, tabs_csv, sizes_csv FROM tab_splits ORDER BY created_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SavedSplit {
+                id: row.get(0)?,
+                left_tab_id: row.get(1)?,
+                right_tab_id: row.get(2)?,
+                ratio: row.get::<_, f64>(3)? as f32,
+                focused_tab_id: row.get(4).ok(),
+                tabs_csv: row.get(5).ok(),
+                sizes_csv: row.get(6).ok(),
+            })
+        })?;
+        let mut res = Vec::new();
+        for r in rows {
+            res.push(r?);
+        }
+        Ok(res)
+    }
+
+    pub fn delete_split(&self, id: &str) -> Result<(), StorageError> {
+        self.conn.execute("DELETE FROM tab_splits WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn normalize_host(host: &str) -> String {
@@ -874,6 +990,38 @@ mod tests {
         assert!(storage.get_site_autoplay("kissasian.cam").unwrap());
         storage.set_site_autoplay("kissasian.cam", false).unwrap();
         assert!(!storage.get_site_autoplay("kissasian.cam").unwrap());
+    }
+
+    #[test]
+    fn test_tab_splits_persistence() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+
+        let splits = vec![
+            SavedSplit {
+                id: "split-1".to_string(),
+                left_tab_id: "tab-a".to_string(),
+                right_tab_id: "tab-b".to_string(),
+                ratio: 0.65,
+                focused_tab_id: Some("tab-a".to_string()),
+                tabs_csv: Some("tab-a,tab-b,tab-c".to_string()),
+                sizes_csv: Some("0.33,0.33,0.34".to_string()),
+            },
+        ];
+
+        storage.save_splits(&splits).expect("save splits");
+        let loaded = storage.get_saved_splits().expect("get splits");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "split-1");
+        assert_eq!(loaded[0].left_tab_id, "tab-a");
+        assert_eq!(loaded[0].right_tab_id, "tab-b");
+        assert!((loaded[0].ratio - 0.65).abs() < 0.001);
+        assert_eq!(loaded[0].focused_tab_id.as_deref(), Some("tab-a"));
+        assert_eq!(loaded[0].get_tabs(), vec!["tab-a", "tab-b", "tab-c"]);
+        assert_eq!(loaded[0].get_sizes().len(), 3);
+
+        storage.delete_split("split-1").expect("delete split");
+        let empty = storage.get_saved_splits().expect("get splits");
+        assert!(empty.is_empty());
     }
 }
 

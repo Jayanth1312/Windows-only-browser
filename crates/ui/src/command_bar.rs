@@ -60,6 +60,11 @@ pub enum CommandAction {
     ToggleShield,
     ToggleSiteShield,
     ToggleSiteCard,
+    OpenInSplitView,
+    SwapSplit,
+    EvenSplit,
+    SeparateSplit,
+    CloseSplit,
 }
 
 #[derive(Debug, Clone)]
@@ -820,6 +825,104 @@ fn get_action_items(
         });
     }
 
+    if "split view".contains(&q_lower) || "split".contains(&q_lower) || "side by side".contains(&q_lower) || "dual pane".contains(&q_lower) {
+        items.push(CommandItem {
+            primary: "Split View: Open Page Side-by-Side".to_string(),
+            secondary: "Ctrl+Alt+N".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE740,
+            icon_accent: rgb(96, 165, 250),
+            action: CommandAction::OpenInSplitView,
+        });
+        items.push(CommandItem {
+            primary: "Split View: Swap Left and Right Panes".to_string(),
+            secondary: "Ctrl+Alt+S".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE746,
+            icon_accent: rgb(167, 139, 250),
+            action: CommandAction::SwapSplit,
+        });
+        items.push(CommandItem {
+            primary: "Split View: Reset Divider to 50/50".to_string(),
+            secondary: "Ctrl+Alt+E".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE71D,
+            icon_accent: rgb(52, 211, 153),
+            action: CommandAction::EvenSplit,
+        });
+        items.push(CommandItem {
+            primary: "Split View: Separate into Independent Tabs".to_string(),
+            secondary: "Ctrl+Alt+U".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE899,
+            icon_accent: rgb(245, 158, 11),
+            action: CommandAction::SeparateSplit,
+        });
+        items.push(CommandItem {
+            primary: "Split View: Close Both Panes".to_string(),
+            secondary: "Ctrl+Alt+W".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE711,
+            icon_accent: rgb(239, 68, 68),
+            action: CommandAction::CloseSplit,
+        });
+    } else {
+        if "swap".contains(&q_lower) {
+            items.push(CommandItem {
+                primary: "Split View: Swap Left and Right Panes".to_string(),
+                secondary: "Ctrl+Alt+S".to_string(),
+                is_chip: true,
+                is_bookmark: false,
+                url: String::new(),
+                favicon: None,
+                icon_glyph: 0xE746,
+                icon_accent: rgb(167, 139, 250),
+                action: CommandAction::SwapSplit,
+            });
+        }
+        if "even".contains(&q_lower) || "50/50".contains(&q_lower) {
+            items.push(CommandItem {
+                primary: "Split View: Reset Divider to 50/50".to_string(),
+                secondary: "Ctrl+Alt+E".to_string(),
+                is_chip: true,
+                is_bookmark: false,
+                url: String::new(),
+                favicon: None,
+                icon_glyph: 0xE71D,
+                icon_accent: rgb(52, 211, 153),
+                action: CommandAction::EvenSplit,
+            });
+        }
+        if "unsplit".contains(&q_lower) || "separate".contains(&q_lower) {
+            items.push(CommandItem {
+                primary: "Split View: Separate into Independent Tabs".to_string(),
+                secondary: "Ctrl+Alt+U".to_string(),
+                is_chip: true,
+                is_bookmark: false,
+                url: String::new(),
+                favicon: None,
+                icon_glyph: 0xE899,
+                icon_accent: rgb(245, 158, 11),
+                action: CommandAction::SeparateSplit,
+            });
+        }
+    }
+
     items
 }
 
@@ -1093,6 +1196,7 @@ unsafe fn repaint(hwnd: HWND, state: &RefCell<CommandBarState>) {
                     is_closing: false,
                     folder_id: None,
                     custom_letter: None,
+                    is_split: false,
                 };
                 crate::sidebar::draw_webapp_icon(&cv, &badge, &tab_item, px(4.0), px);
             } else {
