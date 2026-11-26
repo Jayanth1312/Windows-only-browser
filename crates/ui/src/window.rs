@@ -94,6 +94,9 @@ pub enum SidebarAction {
     SelectTabId(String),
     ToggleZapper,
     RestoreAllHidden,
+    ToggleReader(Option<String>),
+    CopyPageAsMarkdown(Option<String>),
+    CopyMarkdownLink(Option<String>),
     ToggleShield,
     ToggleSiteShield,
     ToggleSiteCard,
@@ -401,6 +404,23 @@ impl BrowserWindow {
             if active_changed {
                 let _ = InvalidateRect(Some(self.hwnd), None, false);
             } else {
+                invalidate_sidebar(self.hwnd, &self.state);
+            }
+        }
+    }
+
+    pub fn set_reader_active(&self, active: bool) {
+        let changed = {
+            let mut b = self.state.borrow_mut();
+            if b.sidebar_state.is_reader != active {
+                b.sidebar_state.is_reader = active;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            unsafe {
                 invalidate_sidebar(self.hwnd, &self.state);
             }
         }
@@ -1078,6 +1098,7 @@ unsafe extern "system" fn wndproc(
                             | SidebarHit::Reload
                             | SidebarHit::ToggleSidebar
                             | SidebarHit::CleanLinkBtn
+                            | SidebarHit::ReaderMode
                             | SidebarHit::SiteSettings
                             | SidebarHit::PermissionIcon(_)
                             | SidebarHit::UrlBar
@@ -1882,6 +1903,12 @@ unsafe extern "system" fn wndproc(
                                 cb(SidebarAction::CopyCleanLinkActive);
                             }
                         }
+                        SidebarHit::ReaderMode => {
+                            let on_action = state.borrow().on_action.clone();
+                            if let Some(cb) = on_action {
+                                cb(SidebarAction::ToggleReader(None));
+                            }
+                        }
                         SidebarHit::PermissionIcon(idx) => {
                             let on_action = state.borrow().on_action.clone();
                             if let Some(cb) = on_action {
@@ -2129,6 +2156,9 @@ unsafe extern "system" fn wndproc(
                             unload_item,
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
+                            crate::context_menu::ContextMenuItem::item(26, "Toggle Reader Mode", Some("Ctrl+Shift+R")),
+                            crate::context_menu::ContextMenuItem::item(27, "Copy Page as Markdown", None),
+                            crate::context_menu::ContextMenuItem::item(28, "Copy as Markdown Link", None),
                             crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
                             crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
@@ -2164,6 +2194,7 @@ unsafe extern "system" fn wndproc(
                         let folders_rc = folders.clone();
                         let tab_title_rename = tab.title.clone();
                         let tab_id_split = tab.id.clone();
+                        let tab_id_reader = tab.id.clone();
                         if let Some(ref menu) = state.borrow().context_menu {
                             menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
                                 if cmd == 4 {
@@ -2206,6 +2237,9 @@ unsafe extern "system" fn wndproc(
                                         5 => cb(SidebarAction::UnloadTab(idx)),
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::ShareTab(idx)),
+                                        26 => cb(SidebarAction::ToggleReader(Some(tab_id_reader.clone()))),
+                                        27 => cb(SidebarAction::CopyPageAsMarkdown(Some(tab_id_reader.clone()))),
+                                        28 => cb(SidebarAction::CopyMarkdownLink(Some(tab_id_reader.clone()))),
                                         15 => cb(SidebarAction::CopyCleanLink(idx)),
                                         8 => cb(SidebarAction::CloseTab(idx)),
                                         9 => cb(SidebarAction::CloseOtherTabs(idx)),
@@ -2368,6 +2402,9 @@ unsafe extern "system" fn wndproc(
                             unload_item,
                             crate::context_menu::ContextMenuItem::item(6, "Duplicate Tab", None),
                             crate::context_menu::ContextMenuItem::item(7, "Share Tab (Copy Link)", None),
+                            crate::context_menu::ContextMenuItem::item(26, "Toggle Reader Mode", Some("Ctrl+Shift+R")),
+                            crate::context_menu::ContextMenuItem::item(27, "Copy Page as Markdown", None),
+                            crate::context_menu::ContextMenuItem::item(28, "Copy as Markdown Link", None),
                             crate::context_menu::ContextMenuItem::item(15, "Copy Clean Link", Some("Ctrl+Shift+C")),
                             crate::context_menu::ContextMenuItem::item(16, "Toggle Ad & Tracker Shield", None),
                             crate::context_menu::ContextMenuItem::separator(),
@@ -2375,6 +2412,7 @@ unsafe extern "system" fn wndproc(
                             reopen_item,
                         ]);
 
+                        let pin_id_reader = pin.id.clone();
                         let on_action = state.borrow().on_action.clone();
                         if let Some(ref menu) = state.borrow().context_menu {
                             menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
@@ -2402,6 +2440,9 @@ unsafe extern "system" fn wndproc(
                                         5 => cb(SidebarAction::UnloadTab(idx)),
                                         6 => cb(SidebarAction::DuplicateTab(idx)),
                                         7 => cb(SidebarAction::SharePinnedTab(idx)),
+                                        26 => cb(SidebarAction::ToggleReader(Some(pin_id_reader.clone()))),
+                                        27 => cb(SidebarAction::CopyPageAsMarkdown(Some(pin_id_reader.clone()))),
+                                        28 => cb(SidebarAction::CopyMarkdownLink(Some(pin_id_reader.clone()))),
                                         15 => cb(SidebarAction::CopyCleanPinnedTab(idx)),
                                         16 => cb(SidebarAction::ToggleSiteShield),
                                         8 => cb(SidebarAction::ClosePinnedTab(idx)),
@@ -2753,6 +2794,10 @@ unsafe extern "system" fn wndproc(
                         if let Some(ref cb) = on_action { cb(SidebarAction::CloseSplit); }
                         return LRESULT(0);
                     }
+                    0x52 => { // 'R' -> Hard Reload (Ctrl+Alt+R)
+                        if let Some(ref cb) = on_action { cb(SidebarAction::HardReload); }
+                        return LRESULT(0);
+                    }
                     _ => {}
                 }
             } else if alt {
@@ -2776,8 +2821,8 @@ unsafe extern "system" fn wndproc(
                             if let Some(ref cb) = on_action { cb(SidebarAction::TogglePinCurrentTab); }
                             return LRESULT(0);
                         }
-                        0x52 => { // 'R' -> Hard Reload
-                            if let Some(ref cb) = on_action { cb(SidebarAction::HardReload); }
+                        0x52 => { // 'R' -> Toggle Reader Mode (Ctrl+Shift+R)
+                            if let Some(ref cb) = on_action { cb(SidebarAction::ToggleReader(None)); }
                             return LRESULT(0);
                         }
                         0x09 => { // Tab -> Prev Tab
@@ -2806,6 +2851,10 @@ unsafe extern "system" fn wndproc(
                         }
                         0x52 => { // 'R' -> Reload
                             if let Some(ref cb) = on_action { cb(SidebarAction::NavReload); }
+                            return LRESULT(0);
+                        }
+                        0x74 => { // Ctrl+F5 -> Hard Reload
+                            if let Some(ref cb) = on_action { cb(SidebarAction::HardReload); }
                             return LRESULT(0);
                         }
                         0x4C => { // 'L' -> Focus URL Bar

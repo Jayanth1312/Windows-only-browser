@@ -60,6 +60,10 @@ pub enum CommandAction {
     ToggleShield,
     ToggleSiteShield,
     ToggleSiteCard,
+    ToggleReader,
+    CycleReaderLook,
+    CopyPageAsMarkdown,
+    CopyMarkdownLink,
     OpenInSplitView,
     SwapSplit,
     EvenSplit,
@@ -774,6 +778,58 @@ fn get_action_items(
             icon_glyph: 0xE777,
             icon_accent: rgb(59, 130, 246),
             action: CommandAction::RestoreAllHidden,
+        });
+    }
+    if "reader mode".contains(&q_lower) || "reading mode".contains(&q_lower) || "reader".contains(&q_lower) {
+        items.push(CommandItem {
+            primary: "Toggle Reader Mode".to_string(),
+            secondary: "Ctrl+Shift+R".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE736,
+            icon_accent: rgb(56, 189, 248),
+            action: CommandAction::ToggleReader,
+        });
+    }
+    if "reader look".contains(&q_lower) || "reader theme".contains(&q_lower) || "reader appearance".contains(&q_lower) || "reader light".contains(&q_lower) || "reader dark".contains(&q_lower) {
+        items.push(CommandItem {
+            primary: "Reader Look: Cycle Light / Dark / System".to_string(),
+            secondary: "Reader appearance".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE790,
+            icon_accent: rgb(167, 139, 250),
+            action: CommandAction::CycleReaderLook,
+        });
+    }
+    if "copy page as markdown".contains(&q_lower) || "export markdown".contains(&q_lower) || "page markdown".contains(&q_lower) || q_lower == "markdown" {
+        items.push(CommandItem {
+            primary: "Copy Page as Markdown".to_string(),
+            secondary: "Export article".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE8C8,
+            icon_accent: rgb(52, 211, 153),
+            action: CommandAction::CopyPageAsMarkdown,
+        });
+    }
+    if "copy as markdown link".contains(&q_lower) || "copy markdown link".contains(&q_lower) || "markdown link".contains(&q_lower) {
+        items.push(CommandItem {
+            primary: "Copy as Markdown Link".to_string(),
+            secondary: "[title](url)".to_string(),
+            is_chip: true,
+            is_bookmark: false,
+            url: String::new(),
+            favicon: None,
+            icon_glyph: 0xE71B,
+            icon_accent: rgb(96, 165, 250),
+            action: CommandAction::CopyMarkdownLink,
         });
     }
     if "copy clean link".contains(&q_lower) || "clean link".contains(&q_lower) || "clean url".contains(&q_lower) || "strip tracking".contains(&q_lower) || "clean".contains(&q_lower) {

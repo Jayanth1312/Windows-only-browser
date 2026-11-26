@@ -60,6 +60,7 @@ pub enum BrowserShortcut {
     SelectTab(usize),
     ReopenClosedTab,
     ToggleZapper,
+    ToggleReader,
     SplitView,
     FocusOtherPane,
     SwapSplit,
@@ -972,7 +973,7 @@ impl WebViewEngine {
         bounds: RECT,
         initial_url: &str,
         shield_state: Option<std::sync::Arc<crate::shield::ShieldState>>,
-        on_nav_starting: Option<Box<dyn Fn() + Send + 'static>>,
+        on_nav_starting: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_nav_completed: Option<Box<dyn Fn(bool) + Send + 'static>>,
         on_title_changed: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_url_changed: Option<Box<dyn Fn(String) + Send + 'static>>,
@@ -981,6 +982,7 @@ impl WebViewEngine {
         on_shortcut: Option<Box<dyn Fn(BrowserShortcut) + Send + 'static>>,
         on_fullscreen_changed: Option<Box<dyn Fn(bool) + Send + 'static>>,
         on_zapper_message: Option<Box<dyn Fn(ZapperMessage) + Send + 'static>>,
+        on_reader_message: Option<Box<dyn Fn(crate::reader::ReaderMessage) + Send + 'static>>,
         on_got_focus: Option<Box<dyn Fn() + Send + 'static>>,
     ) -> Result<WebViewController, EngineError> {
         let mut controller_opt = None;
@@ -1185,6 +1187,7 @@ impl WebViewEngine {
         let url_cb_shared = on_url_changed.map(|cb| std::sync::Arc::new(cb));
         let new_win_cb_shared = on_new_window.map(|cb| std::sync::Arc::new(cb));
         let zapper_cb_shared = on_zapper_message.map(|cb| std::sync::Arc::new(cb));
+        let reader_cb_shared = on_reader_message.map(|cb| std::sync::Arc::new(cb));
 
         // Hook WebMessageReceived for dynamic SPA title updates & selection search
         {
@@ -1193,6 +1196,7 @@ impl WebViewEngine {
             let cur_host_meta = current_host.clone();
             let search_cb = new_win_cb_shared.clone();
             let zapper_cb = zapper_cb_shared.clone();
+            let reader_cb = reader_cb_shared.clone();
             let mut msg_token = 0;
             let msg_handler = WebMessageReceivedEventHandler::create(Box::new(
                 move |_sender, args| {
@@ -1264,6 +1268,12 @@ impl WebViewEngine {
                                         }
                                         _ => {}
                                     }
+                                } else if let Some(payload) = msg.strip_prefix("reader:") {
+                                    if let Some(parsed) = crate::reader::parse_reader_message(payload) {
+                                        if let Some(ref cb) = reader_cb {
+                                            cb(parsed);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1283,6 +1293,7 @@ impl WebViewEngine {
             let mut start_token = 0;
             let start_handler = NavigationStartingEventHandler::create(Box::new(
                 move |_sender, args| {
+                    let mut nav_uri = String::new();
                     if let Some(args) = args {
                         let mut uri_ptr = windows::core::PWSTR::null();
                         if unsafe { args.Uri(&mut uri_ptr) }.is_ok() && !uri_ptr.is_null() {
@@ -1296,11 +1307,12 @@ impl WebViewEngine {
                                     }
                                 }
                                 shield_nav.reset_blocked();
+                                nav_uri = uri;
                             }
                         }
                     }
                     if let Some(ref start_cb) = on_nav_starting {
-                        start_cb();
+                        start_cb(nav_uri);
                     }
                     Ok(())
                 },
@@ -1524,6 +1536,7 @@ impl WebViewEngine {
                                     0x45 => shortcut = Some(BrowserShortcut::EvenSplit), // 'E' -> Even Split
                                     0x55 => shortcut = Some(BrowserShortcut::SeparateSplit), // 'U' -> Separate Split (Unsplit)
                                     0x57 => shortcut = Some(BrowserShortcut::CloseSplit), // 'W' -> Close Split
+                                    0x52 => shortcut = Some(BrowserShortcut::HardReload), // 'R' -> Hard Reload (Ctrl+Alt+R)
                                     _ => {}
                                 }
                             } else if alt {
@@ -1540,7 +1553,7 @@ impl WebViewEngine {
                                         0x43 => shortcut = Some(BrowserShortcut::CopyCleanLink), // 'C' -> Copy Clean Link (Ctrl+Shift+C)
                                         0x48 => shortcut = Some(BrowserShortcut::ToggleZapper), // 'H' -> Element Zapper!
                                         0x58 => shortcut = Some(BrowserShortcut::PinTab),  // 'X'
-                                        0x52 => shortcut = Some(BrowserShortcut::HardReload), // 'R'
+                                        0x52 => shortcut = Some(BrowserShortcut::ToggleReader), // 'R' -> Toggle Reader Mode (Ctrl+Shift+R)
                                         0x09 => shortcut = Some(BrowserShortcut::PrevTab), // Tab
                                         0x54 => shortcut = Some(BrowserShortcut::ReopenClosedTab), // 'T' -> Reopen Closed Tab!
                                         _ => {}
@@ -1558,6 +1571,7 @@ impl WebViewEngine {
                                         0x30 | 0x60 => shortcut = Some(BrowserShortcut::ZoomReset), // '0'
                                         0x44 => shortcut = Some(BrowserShortcut::PinTab), // 'D'
                                         0x09 => shortcut = Some(BrowserShortcut::NextTab), // Tab
+                                        0x74 => shortcut = Some(BrowserShortcut::HardReload), // F5 -> Hard Reload (Ctrl+F5)
                                         0x31..=0x39 => shortcut = Some(BrowserShortcut::SelectTab((virtual_key - 0x31) as usize)),
                                         _ => {}
                                     }
@@ -2123,6 +2137,38 @@ impl WebViewController {
         let script = format!("if(window.__officeVeil){{window.__officeVeil.unpeek(`{}`);}}", escaped);
         self.execute_script(&script)
     }
+
+    pub fn start_reader_twin_check(&self, gen: u64) -> Result<(), EngineError> {
+        let script = crate::reader::start_twin_script(gen);
+        self.execute_script(&script)
+    }
+
+    pub fn show_reader_html(
+        &self,
+        gen: u64,
+        html: &str,
+        title: &str,
+        from: &str,
+        look: crate::reader::ReaderLook,
+    ) -> Result<(), EngineError> {
+        let script = crate::reader::show_html_script(gen, html, title, from, look);
+        self.execute_script(&script)
+    }
+
+    pub fn run_reader_heuristic(&self, gen: u64, look: crate::reader::ReaderLook) -> Result<(), EngineError> {
+        let script = crate::reader::heuristic_script(gen, look);
+        self.execute_script(&script)
+    }
+
+    pub fn apply_reader_look(&self, look: crate::reader::ReaderLook) -> Result<(), EngineError> {
+        let script = crate::reader::apply_look_script(look);
+        self.execute_script(&script)
+    }
+
+    pub fn export_reader_markdown(&self) -> Result<(), EngineError> {
+        let script = crate::reader::export_markdown_script();
+        self.execute_script(&script)
+    }
 }
 
 impl Drop for WebViewController {
@@ -2157,7 +2203,7 @@ mod tests {
         let bounds = RECT { left: 0, top: 0, right: 800, bottom: 600 };
         for i in 1..=6 {
             println!("Creating controller {}...", i);
-            let res = engine.create_controller(hwnd, bounds, "https://www.google.com", None, None, None, None, None, None, None, None, None, None, None);
+            let res = engine.create_controller(hwnd, bounds, "https://www.google.com", None, None, None, None, None, None, None, None, None, None, None, None);
             println!("Controller {} result: {:?}", i, res.as_ref().map(|_| "OK"));
             if let Err(e) = res {
                 println!("Controller {} ERROR: {:?}", i, e);

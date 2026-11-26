@@ -87,6 +87,10 @@ impl ToastOverlay {
     pub fn show(&self, message: &str) {
         let glyph = if message.contains("Zoom") || message.contains("zoom") {
             0xE71E // Zoom in Segoe Fluent Icons
+        } else if message.contains("Reader") || message.contains("Nothing to read") {
+            0xE736 // Reading mode / Book
+        } else if message.contains("Markdown") || message.contains("markdown") {
+            0xE8C8 // Copy
         } else if message.contains("Copied") || message.contains("copied") || message.contains("URL") {
             0xE72D // Share / Link
         } else if message.contains("Reopened") {

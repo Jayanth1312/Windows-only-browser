@@ -46,6 +46,7 @@ pub struct SiteCardData {
     pub shield_paused_for_site: bool,
     pub trackers_blocked_count: u32,
     pub hidden_elements_count: usize,
+    pub is_reader: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub enum SiteCardHit {
     Zap,
     Screenshot,
     RestoreHidden,
+    ReaderMode,
     ToggleShield,
     SecurityBadge,
     ClearCookies,
@@ -68,6 +70,7 @@ pub enum SiteCardAction {
     LaunchElementZapper,
     Screenshot,
     RestoreHiddenElements,
+    ToggleReader,
     ToggleShield,
     ClearSiteData,
     Close,
@@ -111,6 +114,7 @@ impl SiteCard {
                 shield_paused_for_site: false,
                 trackers_blocked_count: 0,
                 hidden_elements_count: 0,
+                is_reader: false,
             },
             hovered: SiteCardHit::None,
             on_action: None,
@@ -311,6 +315,8 @@ struct SiteCardLayout {
     screenshot_btn: RECT,
     restore_btn: Option<RECT>,
     settings_header: RECT,
+    reader_row: RECT,
+    reader_toggle: RECT,
     shield_row: RECT,
     shield_toggle: RECT,
     secure_btn: RECT,
@@ -358,11 +364,19 @@ fn compute_layout(w: i32, scale: f32, data: &SiteCardData) -> SiteCardLayout {
     let settings_header = rc(pad_x, cur_y, w - pad_x, cur_y + px(16.0));
     cur_y += px(16.0) + px(8.0);
 
+    let tog_w = px(38.0);
+    let tog_h = px(22.0);
+
+    // ── Reader Mode Toggle Row ──
+    let reader_row_h = px(28.0);
+    let reader_row = rc(pad_x, cur_y, w - pad_x, cur_y + reader_row_h);
+    let r_tog_y = cur_y + (reader_row_h - tog_h) / 2;
+    let reader_toggle = rc(w - pad_x - tog_w, r_tog_y, w - pad_x, r_tog_y + tog_h);
+    cur_y += reader_row_h + px(6.0);
+
     // ── Block Ads & Trackers Toggle Row ──
     let shield_row_h = px(28.0);
     let shield_row = rc(pad_x, cur_y, w - pad_x, cur_y + shield_row_h);
-    let tog_w = px(38.0);
-    let tog_h = px(22.0);
     let tog_y = cur_y + (shield_row_h - tog_h) / 2;
     let shield_toggle = rc(w - pad_x - tog_w, tog_y, w - pad_x, tog_y + tog_h);
     cur_y += shield_row_h + px(12.0);
@@ -387,6 +401,8 @@ fn compute_layout(w: i32, scale: f32, data: &SiteCardData) -> SiteCardLayout {
         screenshot_btn,
         restore_btn,
         settings_header,
+        reader_row,
+        reader_toggle,
         shield_row,
         shield_toggle,
         secure_btn,
@@ -475,10 +491,31 @@ unsafe fn draw_site_card_gdi(
          DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
          rgb(148, 155, 175));
 
-    // ── 4. Block Ads & Trackers Toggle Row ──
+    // ── 4. Reader Mode & Block Ads & Trackers Toggle Rows ──
     unsafe {
         SelectObject(mem_dc, f_text.into());
     }
+    let reader_text_r = rc(l.reader_row.left, l.reader_row.top, l.reader_toggle.left - px(8.0), l.reader_row.bottom);
+    text(mem_dc, "Reader Mode", reader_text_r,
+         DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
+         rgb(243, 244, 246));
+    let r_on = st.data.is_reader;
+    let r_tog = &l.reader_toggle;
+    if r_on {
+        cv.fill_round(r_tog, px(11.0), rgb(56, 189, 248), 0.95);
+    } else {
+        cv.fill_round(r_tog, px(11.0), rgb(255, 255, 255), 0.15);
+    }
+    let knob_sz = px(16.0);
+    let r_knob_pad = (r_tog.bottom - r_tog.top - knob_sz) / 2;
+    let r_knob_x = if r_on {
+        r_tog.right - r_knob_pad - knob_sz
+    } else {
+        r_tog.left + r_knob_pad
+    };
+    let r_knob_rc = rc(r_knob_x, r_tog.top + r_knob_pad, r_knob_x + knob_sz, r_tog.top + r_knob_pad + knob_sz);
+    cv.fill_round(&r_knob_rc, px(8.0), rgb(255, 255, 255), 1.0);
+
     let shield_text_r = rc(l.shield_row.left, l.shield_row.top, l.shield_toggle.left - px(8.0), l.shield_row.bottom);
     text(mem_dc, "Block Ads & Trackers", shield_text_r,
          DT_LEFT.0 | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOPREFIX.0,
@@ -492,7 +529,6 @@ unsafe fn draw_site_card_gdi(
     } else {
         cv.fill_round(tog_r, px(11.0), rgb(255, 255, 255), 0.15);
     }
-    let knob_sz = px(16.0);
     let knob_pad = (tog_r.bottom - tog_r.top - knob_sz) / 2;
     let knob_x = if shield_on {
         tog_r.right - knob_pad - knob_sz
@@ -578,6 +614,7 @@ fn hit_test_site_card(x: i32, y: i32, l: &SiteCardLayout) -> SiteCardHit {
     if let Some(ref r_btn) = l.restore_btn {
         if contains(r_btn, x, y) { return SiteCardHit::RestoreHidden; }
     }
+    if contains(&l.reader_toggle, x, y) || contains(&l.reader_row, x, y) { return SiteCardHit::ReaderMode; }
     if contains(&l.shield_toggle, x, y) || contains(&l.shield_row, x, y) { return SiteCardHit::ToggleShield; }
     if contains(&l.secure_btn, x, y) { return SiteCardHit::SecurityBadge; }
     if contains(&l.clear_data_btn, x, y) { return SiteCardHit::ClearCookies; }
@@ -689,6 +726,14 @@ unsafe extern "system" fn site_card_wndproc(
                         }
                         SiteCardHit::RestoreHidden => {
                             cb(SiteCardAction::RestoreHiddenElements);
+                        }
+                        SiteCardHit::ReaderMode => {
+                            {
+                                let mut st_mut = (*ptr).borrow_mut();
+                                st_mut.data.is_reader = !st_mut.data.is_reader;
+                            }
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            cb(SiteCardAction::ToggleReader);
                         }
                         SiteCardHit::ToggleShield => {
                             {

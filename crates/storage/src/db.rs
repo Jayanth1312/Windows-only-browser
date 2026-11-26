@@ -240,6 +240,48 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_reader_follows_look(&self) -> Result<bool, StorageError> {
+        match self.get_setting("reader.follows")? {
+            Some(v) => Ok(v != "false" && v != "0"),
+            None => Ok(true),
+        }
+    }
+
+    pub fn set_reader_follows_look(&self, follows: bool) -> Result<(), StorageError> {
+        self.set_setting("reader.follows", if follows { "true" } else { "false" })
+    }
+
+    pub fn get_reader_reads_twins(&self) -> Result<bool, StorageError> {
+        match self.get_setting("reader.twins")? {
+            Some(v) => Ok(v != "false" && v != "0"),
+            None => Ok(true),
+        }
+    }
+
+    pub fn set_reader_reads_twins(&self, reads_twins: bool) -> Result<(), StorageError> {
+        self.set_setting("reader.twins", if reads_twins { "true" } else { "false" })
+    }
+
+    pub fn get_reader_look(&self) -> Result<String, StorageError> {
+        if !self.get_reader_follows_look()? {
+            return Ok("light".to_string());
+        }
+        match self.get_setting("reader.look")?.as_deref() {
+            Some("light") => Ok("light".to_string()),
+            Some("dark") => Ok("dark".to_string()),
+            Some("system") | None | Some(_) => Ok("system".to_string()),
+        }
+    }
+
+    pub fn set_reader_look(&self, look: &str) -> Result<(), StorageError> {
+        let normalized = match look.trim().to_ascii_lowercase().as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            _ => "system",
+        };
+        self.set_setting("reader.look", normalized)
+    }
+
     pub fn add_history(&self, url: &str, title: &str) -> Result<(), StorageError> {
         let url = url.trim();
         if url.is_empty() || url == "about:blank" {
@@ -993,6 +1035,30 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_settings_persistence() {
+        let storage = Storage::open_in_memory().expect("open in memory");
+
+        assert!(storage.get_reader_follows_look().unwrap());
+        assert!(storage.get_reader_reads_twins().unwrap());
+        assert_eq!(storage.get_reader_look().unwrap(), "system");
+
+        storage.set_reader_look("dark").unwrap();
+        assert_eq!(storage.get_reader_look().unwrap(), "dark");
+
+        storage.set_reader_follows_look(false).unwrap();
+        assert_eq!(storage.get_reader_look().unwrap(), "light");
+
+        storage.set_reader_follows_look(true).unwrap();
+        assert_eq!(storage.get_reader_look().unwrap(), "dark");
+
+        storage.set_reader_look("light").unwrap();
+        assert_eq!(storage.get_reader_look().unwrap(), "light");
+
+        storage.set_reader_reads_twins(false).unwrap();
+        assert!(!storage.get_reader_reads_twins().unwrap());
+    }
+
+    #[test]
     fn test_tab_splits_persistence() {
         let storage = Storage::open_in_memory().expect("open in memory");
 
@@ -1024,4 +1090,3 @@ mod tests {
         assert!(empty.is_empty());
     }
 }
-

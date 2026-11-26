@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use engine::{init_com, BrowserShortcut, WebViewController, WebViewEngine, ZapperMessage};
+use engine::{init_com, BrowserShortcut, ReaderLook, ReaderMessage, WebViewController, WebViewEngine, ZapperMessage};
 use storage::Storage;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -84,6 +84,10 @@ struct Tab {
     anim_progress: f32,
     is_closing: bool,
     pending_permissions: Vec<ui::SitePermissionKind>,
+    is_reader: bool,
+    seeking_reader_twin: bool,
+    reader_gen: u64,
+    reader_markdown: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +244,7 @@ enum AppEvent {
     TitleChanged { tab_id: String, title: String },
     UrlChanged { tab_id: String, url: String },
     FaviconChanged { tab_id: String, bytes: Vec<u8> },
-    NavigationStarted { tab_id: String },
+    NavigationStarted { tab_id: String, url: String },
     NavigationCompleted { tab_id: String, _success: bool },
     SelectPinned(usize),
     ClosePinnedTab(usize),
@@ -340,6 +344,14 @@ enum AppEvent {
         tab_id: String,
         url: String,
     },
+    ToggleReader(Option<String>),
+    ReaderMessage {
+        tab_id: String,
+        msg: ReaderMessage,
+    },
+    CycleReaderLook,
+    CopyPageAsMarkdown(Option<String>),
+    CopyMarkdownLink(Option<String>),
 }
 
 fn show_windows_share_ui(hwnd: HWND, title: &str, url: &str) -> windows::core::Result<()> {
@@ -707,6 +719,10 @@ impl BrowserApp {
                 anim_progress: 1.0,
                 is_closing: false,
                 pending_permissions: Vec::new(),
+                is_reader: false,
+                seeking_reader_twin: false,
+                reader_gen: 0,
+                reader_markdown: None,
             });
         }
 
@@ -971,6 +987,7 @@ impl BrowserApp {
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
                 BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::ToggleReader => AppEvent::ToggleReader(None),
                 BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
                 BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
                 BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
@@ -989,9 +1006,10 @@ impl BrowserApp {
 
         let tab_id_clone_start = tab_id.clone();
         let tx_start = self.event_tx.clone();
-        let on_nav_start = Box::new(move || {
+        let on_nav_start = Box::new(move |nav_url: String| {
             let _ = tx_start.send(AppEvent::NavigationStarted {
                 tab_id: tab_id_clone_start.clone(),
+                url: nav_url,
             });
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
@@ -1063,6 +1081,19 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_reader = tab_id.clone();
+        let tx_reader = self.event_tx.clone();
+        let on_reader = Box::new(move |msg: ReaderMessage| {
+            let _ = tx_reader.send(AppEvent::ReaderMessage {
+                tab_id: tab_id_clone_reader.clone(),
+                msg,
+            });
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         let controller = match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -1077,6 +1108,7 @@ impl BrowserApp {
             Some(on_shortcut),
             Some(on_fullscreen),
             Some(on_zapper),
+            Some(on_reader),
             Some(on_got_focus),
         ) {
             Ok(c) => c,
@@ -1116,6 +1148,10 @@ impl BrowserApp {
             anim_progress: if is_pinned { 1.0 } else { 0.05 },
             is_closing: false,
             pending_permissions: Vec::new(),
+            is_reader: false,
+            seeking_reader_twin: false,
+            reader_gen: 0,
+            reader_markdown: None,
         });
 
         if !is_pinned {
@@ -1230,6 +1266,7 @@ impl BrowserApp {
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
                 BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::ToggleReader => AppEvent::ToggleReader(None),
                 BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
                 BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
                 BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
@@ -1248,9 +1285,10 @@ impl BrowserApp {
 
         let tab_id_clone_start = tab_id.clone();
         let tx_start = self.event_tx.clone();
-        let on_nav_start = Box::new(move || {
+        let on_nav_start = Box::new(move |nav_url: String| {
             let _ = tx_start.send(AppEvent::NavigationStarted {
                 tab_id: tab_id_clone_start.clone(),
+                url: nav_url,
             });
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
@@ -1322,6 +1360,19 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_reader = tab_id.clone();
+        let tx_reader = self.event_tx.clone();
+        let on_reader = Box::new(move |msg: ReaderMessage| {
+            let _ = tx_reader.send(AppEvent::ReaderMessage {
+                tab_id: tab_id_clone_reader.clone(),
+                msg,
+            });
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
         match self.engine.create_controller(
             self.window.hwnd(),
             content_rect,
@@ -1336,6 +1387,7 @@ impl BrowserApp {
             Some(on_shortcut),
             Some(on_fullscreen),
             Some(on_zapper),
+            Some(on_reader),
             Some(on_got_focus),
         ) {
             Ok(c) => {
@@ -1597,6 +1649,7 @@ impl BrowserApp {
                 BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
                 BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
                 BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::ToggleReader => AppEvent::ToggleReader(None),
                 BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
                 BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
                 BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
@@ -1638,6 +1691,7 @@ impl BrowserApp {
             None,
             None,
             None,
+            None,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -1667,6 +1721,10 @@ impl BrowserApp {
             anim_progress: 1.0,
             is_closing: false,
             pending_permissions: Vec::new(),
+            is_reader: false,
+            seeking_reader_twin: false,
+            reader_gen: 0,
+            reader_markdown: None,
         });
         self.glance_from_tab_id = from_tab_id;
         self.engine.set_glance_open(true);
@@ -1877,6 +1935,10 @@ impl BrowserApp {
                         anim_progress: 1.0,
                         is_closing: false,
                         pending_permissions: Vec::new(),
+                        is_reader: false,
+                        seeking_reader_twin: false,
+                        reader_gen: 0,
+                        reader_markdown: None,
                     });
                     tab_id
                 }
@@ -1955,6 +2017,10 @@ impl BrowserApp {
                     anim_progress: 1.0,
                     is_closing: false,
                     pending_permissions: Vec::new(),
+                    is_reader: false,
+                    seeking_reader_twin: false,
+                    reader_gen: 0,
+                    reader_markdown: None,
                 });
                 tab_id
             }
@@ -2506,6 +2572,154 @@ impl BrowserApp {
             Vec::new()
         };
         self.window.set_pending_permissions(pending_perms);
+
+        let active_is_reader = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map_or(false, |t| t.is_reader);
+        self.window.set_reader_active(active_is_reader);
+    }
+
+    fn effective_reader_look(&self) -> ReaderLook {
+        if let Ok(st) = self.storage.try_borrow() {
+            let s = st.get_reader_look().unwrap_or_else(|_| "system".to_string());
+            ReaderLook::from_str(&s)
+        } else {
+            ReaderLook::System
+        }
+    }
+
+    fn refresh_site_card_if_visible(&self) {
+        if !self.window.is_site_card_visible() {
+            return;
+        }
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let active_host = tab
+                .controller
+                .as_ref()
+                .map(|c| c.get_current_host())
+                .unwrap_or_else(|| engine::extract_host(&tab.url).unwrap_or_default());
+            let hidden_count = if let Ok(st) = self.storage.try_borrow() {
+                st.get_hidden_elements(&active_host)
+                    .map(|l| l.len())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let card_data = SiteCardData {
+                url: tab.url.clone(),
+                host: active_host.clone(),
+                is_secure: tab.url.starts_with("https://"),
+                is_bookmarked: tab.is_pinned,
+                is_reader: tab.is_reader,
+                shield_enabled: self.shield_state.is_enabled(),
+                shield_paused_for_site: self.shield_state.is_paused(&active_host),
+                trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
+                hidden_elements_count: hidden_count,
+            };
+            self.window.update_site_card(card_data);
+        }
+    }
+
+    fn resolve_tab_index_by_id(&self, target_tab_id: Option<&str>) -> Option<usize> {
+        match target_tab_id {
+            None => {
+                if self.active_tab_idx < self.tabs.len() {
+                    Some(self.active_tab_idx)
+                } else {
+                    None
+                }
+            }
+            Some(tid) => {
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == tid) {
+                    return Some(pos);
+                }
+                if let Some(sc) = self.pinned_shortcuts.iter().find(|s| s.id == tid) {
+                    let sc_domain = ui::domain_of(&sc.url);
+                    return self.tabs.iter().position(|t| {
+                        t.is_pinned
+                            && (t.url == sc.url
+                                || (!sc_domain.is_empty() && ui::domain_of(&t.url) == sc_domain))
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    fn reset_tab_reader_state(&mut self, pos: usize) {
+        if let Some(tab) = self.tabs.get_mut(pos) {
+            tab.is_reader = false;
+            tab.seeking_reader_twin = false;
+            tab.reader_markdown = None;
+            tab.reader_gen = tab.reader_gen.wrapping_add(1);
+        }
+    }
+
+    fn toggle_reader(&mut self, target_tab_id: Option<String>) {
+        let Some(pos) = self.resolve_tab_index_by_id(target_tab_id.as_deref()) else {
+            if target_tab_id.is_some() {
+                self.window.show_toast("Tab is sleeping (open page first)");
+            }
+            return;
+        };
+
+        if self.tabs[pos].is_reader {
+            self.reset_tab_reader_state(pos);
+            if let Some(ref ctrl) = self.tabs[pos].controller {
+                let _ = ctrl.reload();
+            }
+            self.refresh_site_card_if_visible();
+            self.sync_tabs_ui();
+            return;
+        }
+
+        if self.tabs[pos].controller.is_none() {
+            self.window.show_toast("Tab is sleeping (open page first)");
+            return;
+        }
+
+        let live_url = self.tabs[pos]
+            .controller
+            .as_ref()
+            .and_then(|c| c.get_source().ok())
+            .unwrap_or_default();
+        let check_url = if !live_url.is_empty() && live_url != "about:blank" {
+            live_url
+        } else {
+            self.tabs[pos].url.clone()
+        };
+        let lower_url = check_url.trim().to_ascii_lowercase();
+        if !(lower_url.starts_with("http://")
+            || lower_url.starts_with("https://")
+            || lower_url.starts_with("file://"))
+        {
+            self.window.show_toast("Nothing to read on this page");
+            return;
+        }
+
+        self.tabs[pos].reader_gen = self.tabs[pos].reader_gen.wrapping_add(1);
+        let gen = self.tabs[pos].reader_gen;
+        self.tabs[pos].reader_markdown = None;
+
+        let reads_twins = if let Ok(st) = self.storage.try_borrow() {
+            st.get_reader_reads_twins().unwrap_or(true)
+        } else {
+            true
+        };
+        let look = self.effective_reader_look();
+
+        if reads_twins {
+            self.tabs[pos].seeking_reader_twin = true;
+            if let Some(ref ctrl) = self.tabs[pos].controller {
+                let _ = ctrl.start_reader_twin_check(gen);
+            }
+        } else {
+            self.tabs[pos].seeking_reader_twin = false;
+            if let Some(ref ctrl) = self.tabs[pos].controller {
+                let _ = ctrl.run_reader_heuristic(gen, look);
+            }
+        }
     }
 
     fn handle_event(&mut self, event: AppEvent) {
@@ -2646,6 +2860,10 @@ impl BrowserApp {
                             anim_progress: 1.0,
                             is_closing: false,
                             pending_permissions: Vec::new(),
+                            is_reader: false,
+                            seeking_reader_twin: false,
+                            reader_gen: 0,
+                            reader_markdown: None,
                         });
                         self.next_tab_id += 1;
                     }
@@ -2840,6 +3058,7 @@ impl BrowserApp {
                             let alt_idx = if pos == 0 { 1 } else { pos - 1 };
                             self.switch_tab(alt_idx);
                         }
+                        self.reset_tab_reader_state(pos);
                         if let Some(tab) = self.tabs.get_mut(pos) {
                             if let Some(ctrl) = tab.controller.take() {
                                 let _ = ctrl.set_visible(false);
@@ -2967,6 +3186,11 @@ impl BrowserApp {
             AppEvent::ReloadSpecificTab(idx) => {
                 let target = self.tabs.iter().enumerate().filter(|(_, t)| !t.is_pinned).nth(idx).map(|(i, _)| i);
                 if let Some(pos) = target {
+                    self.reset_tab_reader_state(pos);
+                    if pos == self.active_tab_idx {
+                        self.refresh_site_card_if_visible();
+                        self.sync_tabs_ui();
+                    }
                     if let Some(ref ctrl) = self.tabs[pos].controller {
                         let _ = ctrl.reload();
                     } else {
@@ -2982,6 +3206,11 @@ impl BrowserApp {
                         t.is_pinned && (t.url == sc_url || (!sc_domain.is_empty() && ui::domain_of(&t.url) == sc_domain))
                     });
                     if let Some(pos) = open_tab_pos {
+                        self.reset_tab_reader_state(pos);
+                        if pos == self.active_tab_idx {
+                            self.refresh_site_card_if_visible();
+                            self.sync_tabs_ui();
+                        }
                         if let Some(ref ctrl) = self.tabs[pos].controller {
                             let _ = ctrl.reload();
                         } else {
@@ -2999,6 +3228,15 @@ impl BrowserApp {
                 let cached_fav = self.get_cached_favicon(&domain);
 
                 if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                    let is_same_doc_fragment = !url.is_empty()
+                        && url != tab.url
+                        && engine::strip_url_fragment(&url) == engine::strip_url_fragment(&tab.url);
+                    if !is_same_doc_fragment {
+                        tab.is_reader = false;
+                        tab.seeking_reader_twin = false;
+                        tab.reader_markdown = None;
+                        tab.reader_gen = tab.reader_gen.wrapping_add(1);
+                    }
                     tab.url = url.clone();
                     tab.accent = accent_for_url(&url);
                     tab.title = friendly_title_for_url(&url);
@@ -3033,7 +3271,14 @@ impl BrowserApp {
                 }
             }
             AppEvent::NavReload => {
-                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                let pos = self.active_tab_idx;
+                let was_reader = self.tabs.get(pos).map_or(false, |t| t.is_reader || t.seeking_reader_twin);
+                self.reset_tab_reader_state(pos);
+                if was_reader {
+                    self.refresh_site_card_if_visible();
+                    self.sync_tabs_ui();
+                }
+                if let Some(tab) = self.tabs.get(pos) {
                     if let Some(ref ctrl) = tab.controller {
                         let _ = ctrl.reload();
                     }
@@ -3178,8 +3423,21 @@ impl BrowserApp {
                     }
                 }
             }
-            AppEvent::NavigationStarted { tab_id } => {
+            AppEvent::NavigationStarted { tab_id, url } => {
                 let is_active = self.tabs.get(self.active_tab_idx).map_or(false, |t| t.id == tab_id);
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                    let is_same_doc_fragment = !url.is_empty()
+                        && url != self.tabs[pos].url
+                        && engine::strip_url_fragment(&url) == engine::strip_url_fragment(&self.tabs[pos].url);
+                    if !is_same_doc_fragment {
+                        let was_reader = self.tabs[pos].is_reader || self.tabs[pos].seeking_reader_twin;
+                        self.reset_tab_reader_state(pos);
+                        if is_active && was_reader {
+                            self.refresh_site_card_if_visible();
+                            self.sync_tabs_ui();
+                        }
+                    }
+                }
                 if is_active {
                     self.window.set_loading(true, 0.45);
                 }
@@ -3213,7 +3471,14 @@ impl BrowserApp {
                 }
             }
             AppEvent::HardReload => {
-                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                let pos = self.active_tab_idx;
+                let was_reader = self.tabs.get(pos).map_or(false, |t| t.is_reader || t.seeking_reader_twin);
+                self.reset_tab_reader_state(pos);
+                if was_reader {
+                    self.refresh_site_card_if_visible();
+                    self.sync_tabs_ui();
+                }
+                if let Some(tab) = self.tabs.get(pos) {
                     if let Some(ref ctrl) = tab.controller {
                         let _ = ctrl.reload();
                     }
@@ -3272,6 +3537,7 @@ impl BrowserApp {
                             host: active_host.clone(),
                             is_secure: tab.url.starts_with("https://"),
                             is_bookmarked: is_pinned,
+                            is_reader: tab.is_reader,
                             shield_enabled: self.shield_state.is_enabled(),
                             shield_paused_for_site: self.shield_state.is_paused(&active_host),
                             trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
@@ -3615,6 +3881,7 @@ impl BrowserApp {
                             host: active_host.clone(),
                             is_secure: tab.url.starts_with("https://"),
                             is_bookmarked,
+                            is_reader: tab.is_reader,
                             shield_enabled: new_enabled,
                             shield_paused_for_site: self.shield_state.is_paused(&active_host),
                             trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
@@ -3699,6 +3966,7 @@ impl BrowserApp {
                             host: active_host.clone(),
                             is_secure: tab.url.starts_with("https://"),
                             is_bookmarked,
+                            is_reader: tab.is_reader,
                             shield_enabled: self.shield_state.is_enabled(),
                             shield_paused_for_site: new_paused,
                             trackers_blocked_count: self.shield_state.get_blocked_count() as u32,
@@ -3765,6 +4033,7 @@ impl BrowserApp {
                 let shield_enabled = self.shield_state.is_enabled();
                 let blocked_count = self.shield_state.get_blocked_count() as u32;
                 let is_bookmarked = self.tabs.get(self.active_tab_idx).map(|t| t.is_pinned).unwrap_or(false);
+                let is_reader = self.tabs.get(self.active_tab_idx).map(|t| t.is_reader).unwrap_or(false);
                 let (hidden_count, _) = if let Ok(st) = self.storage.try_borrow() {
                     let h_cnt = st.get_hidden_elements(&active_host).map(|l| l.len()).unwrap_or(0);
                     (h_cnt, ())
@@ -3777,6 +4046,7 @@ impl BrowserApp {
                     host: active_host,
                     is_secure,
                     is_bookmarked,
+                    is_reader,
                     shield_enabled,
                     shield_paused_for_site: shield_paused,
                     trackers_blocked_count: blocked_count,
@@ -3790,6 +4060,7 @@ impl BrowserApp {
                     let ev = match action {
                         SiteCardAction::Share => AppEvent::ShareCurrentPage,
                         SiteCardAction::Bookmark => AppEvent::TogglePinCurrentTab,
+                        SiteCardAction::ToggleReader => AppEvent::ToggleReader(None),
                         SiteCardAction::LaunchElementZapper => AppEvent::ToggleZapper,
                         SiteCardAction::Screenshot => AppEvent::CaptureScreenshot,
                         SiteCardAction::RestoreHiddenElements => AppEvent::RestoreAllHiddenElements,
@@ -4023,6 +4294,166 @@ impl BrowserApp {
                     self.handle_event(AppEvent::CreateTab(target_url));
                 }
             }
+            AppEvent::ToggleReader(target_tab_id) => {
+                self.toggle_reader(target_tab_id);
+            }
+            AppEvent::ReaderMessage { tab_id, msg } => {
+                match msg {
+                    ReaderMessage::TwinFound { gen, url, text, title, from } => {
+                        let look = self.effective_reader_look();
+                        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            if self.tabs[pos].seeking_reader_twin && self.tabs[pos].reader_gen == gen {
+                                let parsed = engine::parse_markdown_page(&text, Some(&url));
+                                let final_title = parsed
+                                    .title
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .or_else(|| {
+                                        let t = title.trim();
+                                        if t.is_empty() {
+                                            None
+                                        } else {
+                                            Some(t.to_string())
+                                        }
+                                    })
+                                    .unwrap_or_else(|| friendly_title_for_url(&url));
+                                let from_label = if from.trim().is_empty() {
+                                    ui::domain_of(&url)
+                                } else {
+                                    from
+                                };
+                                self.tabs[pos].seeking_reader_twin = false;
+                                self.tabs[pos].reader_markdown = Some(text);
+                                if let Some(ref ctrl) = self.tabs[pos].controller {
+                                    let _ = ctrl.show_reader_html(gen, &parsed.html, &final_title, &from_label, look);
+                                }
+                            }
+                        }
+                    }
+                    ReaderMessage::TwinNone { gen } => {
+                        let look = self.effective_reader_look();
+                        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            if self.tabs[pos].seeking_reader_twin && self.tabs[pos].reader_gen == gen {
+                                self.tabs[pos].seeking_reader_twin = false;
+                                if let Some(ref ctrl) = self.tabs[pos].controller {
+                                    let _ = ctrl.run_reader_heuristic(gen, look);
+                                }
+                            }
+                        }
+                    }
+                    ReaderMessage::Result { gen, active } => {
+                        let is_active = self.tabs.get(self.active_tab_idx).map_or(false, |t| t.id == tab_id);
+                        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                            if self.tabs[pos].reader_gen == gen {
+                                self.tabs[pos].is_reader = active;
+                                self.tabs[pos].seeking_reader_twin = false;
+                                if !active {
+                                    self.tabs[pos].reader_markdown = None;
+                                    if is_active {
+                                        self.window.show_toast("Nothing to read on this page");
+                                    }
+                                }
+                                if is_active {
+                                    self.refresh_site_card_if_visible();
+                                    self.sync_tabs_ui();
+                                }
+                            }
+                        }
+                    }
+                    ReaderMessage::LookChanged { look } => {
+                        if let Ok(st) = self.storage.try_borrow() {
+                            let _ = st.set_reader_follows_look(true);
+                            let _ = st.set_reader_look(look.as_str());
+                        }
+                        for tab in &self.tabs {
+                            if tab.is_reader {
+                                if let Some(ref ctrl) = tab.controller {
+                                    let _ = ctrl.apply_reader_look(look);
+                                }
+                            }
+                        }
+                    }
+                    ReaderMessage::MarkdownExport { markdown } => {
+                        if !markdown.trim().is_empty() {
+                            copy_to_clipboard(self.window.hwnd(), &markdown);
+                            self.window.show_toast("Copied page as Markdown");
+                        } else {
+                            self.window.show_toast("Nothing to export on this page");
+                        }
+                    }
+                }
+            }
+            AppEvent::CycleReaderLook => {
+                let current = if let Ok(st) = self.storage.try_borrow() {
+                    let follows = st.get_reader_follows_look().unwrap_or(true);
+                    if !follows {
+                        ReaderLook::Light
+                    } else {
+                        ReaderLook::from_str(&st.get_reader_look().unwrap_or_else(|_| "system".to_string()))
+                    }
+                } else {
+                    ReaderLook::System
+                };
+                let next = current.next();
+                if let Ok(st) = self.storage.try_borrow() {
+                    let _ = st.set_reader_follows_look(true);
+                    let _ = st.set_reader_look(next.as_str());
+                }
+                for tab in &self.tabs {
+                    if tab.is_reader {
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.apply_reader_look(next);
+                        }
+                    }
+                }
+                self.window.show_toast(&format!("Reader look: {}", next.title()));
+            }
+            AppEvent::CopyPageAsMarkdown(target_tab_id) => {
+                if let Some(pos) = self.resolve_tab_index_by_id(target_tab_id.as_deref()) {
+                    if self.tabs[pos].is_reader {
+                        if let Some(ref raw) = self.tabs[pos].reader_markdown {
+                            copy_to_clipboard(self.window.hwnd(), raw);
+                            self.window.show_toast("Copied page as Markdown");
+                            return;
+                        }
+                    }
+                    if let Some(ref ctrl) = self.tabs[pos].controller {
+                        let _ = ctrl.export_reader_markdown();
+                    } else {
+                        self.window.show_toast("Tab is sleeping (load page first to export Markdown)");
+                    }
+                } else if target_tab_id.is_some() {
+                    self.window.show_toast("Tab is sleeping (load page first to export Markdown)");
+                }
+            }
+            AppEvent::CopyMarkdownLink(target_tab_id) => {
+                if let Some(pos) = self.resolve_tab_index_by_id(target_tab_id.as_deref()) {
+                    let tab = &self.tabs[pos];
+                    let live_url = tab
+                        .controller
+                        .as_ref()
+                        .and_then(|c| c.get_source().ok())
+                        .unwrap_or_default();
+                    let raw_url = if !live_url.is_empty() && live_url != "about:blank" {
+                        live_url
+                    } else {
+                        tab.url.clone()
+                    };
+                    let clean = engine::clean_url(&raw_url);
+                    let md_link = engine::format_markdown_link(&tab.title, &clean);
+                    copy_to_clipboard(self.window.hwnd(), &md_link);
+                    self.window.show_toast("Copied Markdown link");
+                } else if let Some(tid) = target_tab_id.as_deref() {
+                    if let Some(sc) = self.pinned_shortcuts.iter().find(|s| s.id == tid) {
+                        let clean = engine::clean_url(&sc.url);
+                        let md_link = engine::format_markdown_link(&sc.title, &clean);
+                        copy_to_clipboard(self.window.hwnd(), &md_link);
+                        self.window.show_toast("Copied Markdown link");
+                    }
+                }
+            }
         }
     }
 
@@ -4149,6 +4580,10 @@ impl BrowserApp {
                                     anim_progress: 1.0,
                                     is_closing: false,
                                     pending_permissions: Vec::new(),
+                                    is_reader: false,
+                                    seeking_reader_twin: false,
+                                    reader_gen: 0,
+                                    reader_markdown: None,
                                 });
                                 id
                             };
@@ -4197,6 +4632,10 @@ impl BrowserApp {
                                     anim_progress: 1.0,
                                     is_closing: false,
                                     pending_permissions: Vec::new(),
+                                    is_reader: false,
+                                    seeking_reader_twin: false,
+                                    reader_gen: 0,
+                                    reader_markdown: None,
                                 });
                                 id
                             };
@@ -4245,6 +4684,10 @@ impl BrowserApp {
                                     anim_progress: 1.0,
                                     is_closing: false,
                                     pending_permissions: Vec::new(),
+                                    is_reader: false,
+                                    seeking_reader_twin: false,
+                                    reader_gen: 0,
+                                    reader_markdown: None,
                                 });
                                 id
                             };
@@ -4295,6 +4738,10 @@ impl BrowserApp {
                                     anim_progress: 1.0,
                                     is_closing: false,
                                     pending_permissions: Vec::new(),
+                                    is_reader: false,
+                                    seeking_reader_twin: false,
+                                    reader_gen: 0,
+                                    reader_markdown: None,
                                 });
                                 id
                             };
@@ -4337,6 +4784,10 @@ impl BrowserApp {
                                 anim_progress: 1.0,
                                 is_closing: false,
                                 pending_permissions: Vec::new(),
+                                is_reader: false,
+                                seeking_reader_twin: false,
+                                reader_gen: 0,
+                                reader_markdown: None,
                             });
                             tab_id
                         })
@@ -4408,6 +4859,10 @@ impl BrowserApp {
                                 anim_progress: 1.0,
                                 is_closing: false,
                                 pending_permissions: Vec::new(),
+                                is_reader: false,
+                                seeking_reader_twin: false,
+                                reader_gen: 0,
+                                reader_markdown: None,
                             });
                             tab_id
                         })
@@ -4564,6 +5019,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 CommandAction::CloseTab => AppEvent::CloseTab(usize::MAX),
                 CommandAction::ToggleSidebar => AppEvent::ToggleSidebar,
                 CommandAction::ToggleZapper => AppEvent::ToggleZapper,
+                CommandAction::ToggleReader => AppEvent::ToggleReader(None),
+                CommandAction::CycleReaderLook => AppEvent::CycleReaderLook,
+                CommandAction::CopyPageAsMarkdown => AppEvent::CopyPageAsMarkdown(None),
+                CommandAction::CopyMarkdownLink => AppEvent::CopyMarkdownLink(None),
                 CommandAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
                 CommandAction::CopyCleanLink => AppEvent::CopyCleanLink,
                 CommandAction::ToggleShield => AppEvent::ToggleShield,
@@ -4635,6 +5094,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             SidebarAction::NewTabInFolder(fid) => AppEvent::NewTabInFolder(fid),
             SidebarAction::SelectTabId(tid) => AppEvent::SelectTabId(tid),
             SidebarAction::ToggleZapper => AppEvent::ToggleZapper,
+            SidebarAction::ToggleReader(tid) => AppEvent::ToggleReader(tid),
+            SidebarAction::CopyPageAsMarkdown(tid) => AppEvent::CopyPageAsMarkdown(tid),
+            SidebarAction::CopyMarkdownLink(tid) => AppEvent::CopyMarkdownLink(tid),
             SidebarAction::RestoreAllHidden => AppEvent::RestoreAllHiddenElements,
             SidebarAction::ToggleShield => AppEvent::ToggleShield,
             SidebarAction::ToggleSiteShield => AppEvent::ToggleSiteShield,

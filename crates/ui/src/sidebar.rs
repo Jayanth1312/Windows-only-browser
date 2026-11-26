@@ -59,6 +59,7 @@ pub enum SidebarHit {
     Reload,
     ToggleSidebar,
     CleanLinkBtn,
+    ReaderMode,
     SiteSettings,
     PermissionIcon(usize),
     UrlBar,
@@ -284,6 +285,8 @@ pub fn draw_sidebar_icon(cv: &Canvas, r: &RECT, color: COLORREF, a: f32, px: imp
     cv.fill_rect(&rc(dot_x, dot2_y, dot_x + dot_w, dot2_y + dot_h), color, a);
 }
 
+pub const READER_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>"##;
+
 pub const LINK_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>"##;
 
 pub const TUNE_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="__COLOR__" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="8" x2="21" y2="8"/><circle cx="9" cy="8" r="2.6" fill="#1b1b1f" stroke="__COLOR__" stroke-width="2"/><line x1="3" y1="16" x2="21" y2="16"/><circle cx="15" cy="16" r="2.6" fill="#1b1b1f" stroke="__COLOR__" stroke-width="2"/></svg>"##;
@@ -456,6 +459,7 @@ pub struct SidebarState {
     pub shield_paused_site: bool,
     pub pending_permissions: Vec<SitePermissionKind>,
     pub is_mouse_over_sidebar: bool,
+    pub is_reader: bool,
     pub drag_state: Option<DragState>,
 }
 
@@ -484,6 +488,7 @@ impl Default for SidebarState {
             shield_paused_site: false,
             pending_permissions: Vec::new(),
             is_mouse_over_sidebar: false,
+            is_reader: false,
             drag_state: None,
         }
     }
@@ -832,6 +837,7 @@ pub struct Layout {
     pub toggle_sidebar: RECT,
     pub url: RECT,
     pub clean_link_btn: RECT,
+    pub reader_btn: RECT,
     pub site_settings: RECT,
     pub pending_permissions: Vec<(SitePermissionKind, RECT)>,
     pub pinned: Vec<RECT>,
@@ -960,6 +966,20 @@ impl SidebarRenderer {
             (s_r, c_r)
         } else {
             (rc(0, 0, 0, 0), rc(0, 0, 0, 0))
+        };
+
+        let active_url = match st.active {
+            Some(ActiveTab::Pinned(i)) => st.pinned.get(i).map(|a| a.url.as_str()),
+            Some(ActiveTab::Tab(i)) => st.tabs.get(i).map(|a| a.url.as_str()),
+            None => None,
+        }.unwrap_or("");
+        let can_read_url = active_url.starts_with("http://") || active_url.starts_with("https://") || active_url.starts_with("file://");
+        let reader_btn = if (st.is_mouse_over_sidebar && can_read_url) || st.is_reader {
+            let r_r = rc(cur_right - btn_sz, btn_y, cur_right, btn_y + btn_sz);
+            cur_right = r_r.left - px(4.0);
+            r_r
+        } else {
+            rc(0, 0, 0, 0)
         };
 
         let zoom_pill = if (st.zoom - 1.0).abs() > 0.01 {
@@ -1231,7 +1251,7 @@ impl SidebarRenderer {
         }
 
         let layout = Layout {
-            back, forward, reload, toggle_sidebar, url, clean_link_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, ghost_pinned, divider_y, list_clip,
+            back, forward, reload, toggle_sidebar, url, clean_link_btn, reader_btn, site_settings, pending_permissions, zoom_pill, shield_pill, pinned, ghost_pinned, divider_y, list_clip,
             folders, folder_icons, folder_divider, top_clip, top_content_h, tabs, split_containers, new_tab,
             footer_top, downloads, settings, footer_toggle,
             jump_to_active_pill, jump_target_scroll, jump_active_favicon,
@@ -1309,6 +1329,7 @@ impl SidebarRenderer {
         }
         if l.shield_pill.right > l.shield_pill.left && contains(&l.shield_pill, x, y) { return SidebarHit::Shield; }
         if l.zoom_pill.right > l.zoom_pill.left && contains(&l.zoom_pill, x, y) { return SidebarHit::ZoomReset; }
+        if l.reader_btn.right > l.reader_btn.left && contains(&l.reader_btn, x, y) { return SidebarHit::ReaderMode; }
         if contains(&l.site_settings, x, y) { return SidebarHit::SiteSettings; }
         if contains(&l.clean_link_btn, x, y) { return SidebarHit::CleanLinkBtn; }
         if contains(&l.url, x, y) { return SidebarHit::UrlBar; }
@@ -1665,12 +1686,35 @@ impl SidebarRenderer {
                 draw_svg_icon(&cv, &tune_r, TUNE_ICON_SVG, tune_hex);
             }
 
+            // ── Reader Mode Button ──
+            if l.reader_btn.right > l.reader_btn.left {
+                let is_reader_hov = st.hovered == SidebarHit::ReaderMode;
+                if st.is_reader {
+                    cv.fill_round(&l.reader_btn, px(5.0), rgb(56, 189, 248), if is_reader_hov { 0.28 } else { 0.18 });
+                    cv.stroke_round(&l.reader_btn, px(5.0), rgb(56, 189, 248), 0.35, 1.0);
+                } else if is_reader_hov {
+                    cv.fill_round(&l.reader_btn, px(5.0), t.white, 0.14);
+                }
+                let reader_hex = if st.is_reader {
+                    "#38bdf8"
+                } else if is_reader_hov {
+                    "#ffffff"
+                } else {
+                    "#959bb0"
+                };
+                let r_pad = px(4.0);
+                let r_rc = rc(l.reader_btn.left + r_pad, l.reader_btn.top + r_pad, l.reader_btn.right - r_pad, l.reader_btn.bottom - r_pad);
+                draw_svg_icon(&cv, &r_rc, READER_ICON_SVG, reader_hex);
+            }
+
             SelectObject(mem_dc, ui.into());
             let label = active_item.map(|a| host_of(&a.url)).filter(|h| !h.is_empty()).unwrap_or("Search or enter address");
             let right_limit = if l.shield_pill.right > l.shield_pill.left {
                 l.shield_pill.left - px(6.0)
             } else if l.zoom_pill.right > l.zoom_pill.left {
                 l.zoom_pill.left - px(6.0)
+            } else if l.reader_btn.right > l.reader_btn.left {
+                l.reader_btn.left - px(6.0)
             } else if l.clean_link_btn.right > l.clean_link_btn.left {
                 l.clean_link_btn.left - px(6.0)
             } else if l.site_settings.right > l.site_settings.left {
