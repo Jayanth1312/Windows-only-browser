@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTCLIENT, IDC_ARROW, IDC_HAND, IDC_SIZEWE, MSG, SWP_FRAMECHANGED, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     WM_APP, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_INITMENUPOPUP, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCALCSIZE,
     WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW,
 };
@@ -190,6 +190,7 @@ struct WindowState {
     loading_progress: f32,
     pressed_hit: SidebarHit,
     on_resize: Option<ResizeCallback>,
+    on_move: Option<ResizeCallback>,
     on_action: Option<ActionCallback>,
     on_custom_msg: Option<CustomMsgHandler>,
     is_tracking_mouse: bool,
@@ -205,7 +206,7 @@ struct WindowState {
     active_split_divider_idx: usize,
     split_drag_start_x: i32,
     split_drag_start_sizes: Vec<f32>,
-    is_hovering_split_divider: bool,
+    hovered_split_divider: Option<usize>,
     split_drop_overlay: Option<crate::split_overlay::SplitDropOverlay>,
 }
 
@@ -256,6 +257,7 @@ impl BrowserWindow {
                 loading_progress: 0.0,
                 pressed_hit: SidebarHit::None,
                 on_resize: None,
+                on_move: None,
                 on_action: None,
                 on_custom_msg: None,
                 is_tracking_mouse: false,
@@ -271,7 +273,7 @@ impl BrowserWindow {
                 active_split_divider_idx: 0,
                 split_drag_start_x: 0,
                 split_drag_start_sizes: Vec::new(),
-                is_hovering_split_divider: false,
+                hovered_split_divider: None,
                 split_drop_overlay: None,
             }));
 
@@ -331,6 +333,13 @@ impl BrowserWindow {
     {
         self.state.borrow_mut().on_resize = Some(Rc::new(callback));
         self.trigger_resize();
+    }
+
+    pub fn set_move_callback<F>(&self, callback: F)
+    where
+        F: Fn(RECT, RECT) + 'static,
+    {
+        self.state.borrow_mut().on_move = Some(Rc::new(callback));
     }
 
     pub fn set_action_callback<F>(&self, callback: F)
@@ -491,6 +500,37 @@ impl BrowserWindow {
     pub fn set_sidebar_visible(&self, visible: bool) {
         self.state.borrow_mut().sidebar_visible = visible;
         self.trigger_resize();
+    }
+
+    pub fn set_sidebar_visible_quiet(&self, visible: bool) {
+        self.state.borrow_mut().sidebar_visible = visible;
+    }
+
+    pub fn is_resizing_split(&self) -> bool {
+        self.state.borrow().is_resizing_split
+    }
+
+    pub fn take_selected_split_tabs(&self) -> Option<Vec<String>> {
+        let mut b = self.state.borrow_mut();
+        if b.sidebar_state.selected.len() < 2 || b.sidebar_state.selected.len() > 4 {
+            return None;
+        }
+        let tab_ids: Vec<String> = b.sidebar_state.tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| b.sidebar_state.selected.contains(i))
+            .map(|(_, t)| t.id.clone())
+            .collect();
+        if tab_ids.len() < 2 || tab_ids.len() > 4 {
+            return None;
+        }
+        b.sidebar_state.selected.clear();
+        b.sidebar_state.selection_anchor = None;
+        drop(b);
+        unsafe {
+            invalidate_sidebar(self.hwnd, &self.state);
+        }
+        Some(tab_ids)
     }
 
     pub fn toggle_sidebar(&self) {
@@ -998,7 +1038,9 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(HTCLIENT as isize);
             }
 
-            let is_interactive = is_edge || !matches!(hit, SidebarHit::None);
+            let is_interactive = is_edge
+                || is_on_split_divider(hwnd, state, pt.x, pt.y)
+                || !matches!(hit, SidebarHit::None);
             return handle_nchittest(hwnd, lparam, sidebar_w, caption_h, sidebar_vis, is_interactive);
         }
         WM_SETCURSOR => {
@@ -1142,9 +1184,11 @@ unsafe extern "system" fn wndproc(
                     let _ = DeleteObject(border_pen_brush.into());
 
                     // Focus accent line indicating which adjacent pane is currently focused
-                    let focused_idx = b.split_info.as_ref().map(|sp| sp.focused_tab_idx).unwrap_or(0);
-                    let is_left_of_div = focused_idx == di;
-                    let is_right_of_div = focused_idx == di + 1;
+                    let focused_pane = b.split_info.as_ref().and_then(|sp| {
+                        sp.tab_indices.iter().position(|&ti| ti == sp.focused_tab_idx)
+                    }).unwrap_or(0);
+                    let is_left_of_div = focused_pane == di;
+                    let is_right_of_div = focused_pane == di + 1;
                     if is_left_of_div || is_right_of_div {
                         let focus_brush = CreateSolidBrush(crate::sidebar::rgb(140, 140, 150)); // subtle neutral silver
                         let focus_edge = if is_left_of_div {
@@ -1165,7 +1209,7 @@ unsafe extern "system" fn wndproc(
 
                     let grip_color = if b.is_resizing_split && b.active_split_divider_idx == di {
                         crate::sidebar::rgb(220, 220, 225) // bright white-silver when dragging
-                    } else if b.is_hovering_split_divider {
+                    } else if b.hovered_split_divider == Some(di) {
                         crate::sidebar::rgb(180, 180, 190) // silver on hover
                     } else {
                         crate::sidebar::rgb(75, 75, 85) // subtle grey idle
@@ -1218,7 +1262,7 @@ unsafe extern "system" fn wndproc(
 
                     // Mouse X relative to the pair
                     let left_px = (x - gutter / 2 - pair_start_x) as f32;
-                    let least_fraction = if count <= 2 { 0.20 } else { 0.15 };
+                    let least_fraction = if count <= 2 { 0.20 } else { 0.10 };
                     let least_px = least_fraction * avail_w as f32;
                     let clamped_left_px = left_px.clamp(least_px, (both_px - least_px).max(least_px));
 
@@ -1254,16 +1298,17 @@ unsafe extern "system" fn wndproc(
                             cb(content, sidebar);
                         }
                         let _ = InvalidateRect(Some(hwnd), Some(&content_rect), false);
+                        let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
                     }
                 }
                 return LRESULT(0);
             }
 
-            let is_on_div = is_on_split_divider(hwnd, state, x, y);
+            let hovered_div = which_split_divider(hwnd, state, x, y);
             let div_hover_changed = {
                 let mut b = state.borrow_mut();
-                if b.is_hovering_split_divider != is_on_div {
-                    b.is_hovering_split_divider = is_on_div;
+                if b.hovered_split_divider != hovered_div {
+                    b.hovered_split_divider = hovered_div;
                     true
                 } else {
                     false
@@ -1316,10 +1361,12 @@ unsafe extern "system" fn wndproc(
             // Check if starting or continuing a drag
             let start_drag_info = {
                 let b = state.borrow();
+                let dpi = GetDpiForWindow(hwnd);
+                let threshold = 6.0 * (dpi as f32 / 96.0);
                 if b.sidebar_state.drag_state.is_none() {
                     if let Some(cand) = b.drag_candidate {
                         let dist = (((x - cand.start_x).pow(2) + (y - cand.start_y).pow(2)) as f32).sqrt();
-                        if dist >= 4.0 {
+                        if dist >= threshold {
                             let item = match cand.source {
                                 crate::sidebar::DragSource::Tab(idx) => {
                                     b.sidebar_state.tabs.get(idx).map(|t| crate::sidebar::DragCarriedItem {
@@ -1610,7 +1657,14 @@ unsafe extern "system" fn wndproc(
                     return LRESULT(0);
                 }
                 let mut b = state.borrow_mut();
-                let start_sizes = b.split_info.as_ref().map(|sp| sp.sizes.clone());
+                let start_sizes = b.split_info.as_ref().map(|sp| {
+                    let sum: f32 = sp.sizes.iter().map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 }).sum();
+                    if sum > 0.0 {
+                        sp.sizes.iter().map(|&s| (if s.is_finite() && s > 0.0 { s } else { 1.0 }) / sum).collect::<Vec<f32>>()
+                    } else {
+                        vec![1.0 / sp.sizes.len().max(1) as f32; sp.sizes.len().max(1)]
+                    }
+                });
                 if let Some(sizes) = start_sizes {
                     b.is_resizing_split = true;
                     b.active_split_divider_idx = div_idx;
@@ -1652,15 +1706,17 @@ unsafe extern "system" fn wndproc(
                 }
             }
             if hit != SidebarHit::None {
+                let ctrl_held = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) } < 0;
+                let shift_held = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32) } < 0;
                 match hit {
-                    SidebarHit::Tab(i) => {
+                    SidebarHit::Tab(i) if !ctrl_held && !shift_held => {
                         state.borrow_mut().drag_candidate = Some(crate::sidebar::DragCandidate {
                             source: crate::sidebar::DragSource::Tab(i),
                             start_x: x,
                             start_y: y,
                         });
                     }
-                    SidebarHit::Pinned(i) => {
+                    SidebarHit::Pinned(i) if !ctrl_held && !shift_held => {
                         state.borrow_mut().drag_candidate = Some(crate::sidebar::DragCandidate {
                             source: crate::sidebar::DragSource::Pinned(i),
                             start_x: x,
@@ -1854,32 +1910,53 @@ unsafe extern "system" fn wndproc(
                             let ctrl_pressed = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as i32) } < 0;
                             let shift_pressed = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32) } < 0;
 
-                            if ctrl_pressed {
+                            if shift_pressed {
                                 let mut b = state.borrow_mut();
-                                if b.sidebar_state.selected.is_empty() {
-                                    if let Some(crate::sidebar::ActiveTab::Tab(act)) = b.sidebar_state.active {
-                                        b.sidebar_state.selected.push(act);
-                                    }
-                                }
-                                if let Some(pos) = b.sidebar_state.selected.iter().position(|&idx| idx == i) {
-                                    b.sidebar_state.selected.remove(pos);
-                                } else {
-                                    b.sidebar_state.selected.push(i);
-                                }
-                                drop(b);
-                                unsafe { invalidate_sidebar(hwnd, state); }
-                            } else if shift_pressed {
-                                let mut b = state.borrow_mut();
-                                let anchor = b.sidebar_state.selected.first().copied()
+                                let anchor = b.sidebar_state.selection_anchor
+                                    .or_else(|| b.sidebar_state.selected.first().copied())
                                     .or_else(|| if let Some(crate::sidebar::ActiveTab::Tab(act)) = b.sidebar_state.active { Some(act) } else { None })
                                     .unwrap_or(i);
                                 let start = anchor.min(i);
                                 let end = anchor.max(i);
-                                b.sidebar_state.selected = (start..=end).collect();
+                                if ctrl_pressed {
+                                    for idx in start..=end {
+                                        if !b.sidebar_state.selected.contains(&idx) {
+                                            b.sidebar_state.selected.push(idx);
+                                        }
+                                    }
+                                } else {
+                                    b.sidebar_state.selected = (start..=end).collect();
+                                }
+                                b.sidebar_state.selection_anchor = Some(anchor);
+                                drop(b);
+                                unsafe { invalidate_sidebar(hwnd, state); }
+                            } else if ctrl_pressed {
+                                let mut b = state.borrow_mut();
+                                if b.sidebar_state.selected.is_empty() {
+                                    if let Some(crate::sidebar::ActiveTab::Tab(act)) = b.sidebar_state.active {
+                                        if act == i {
+                                            b.sidebar_state.selected.push(i);
+                                        } else {
+                                            b.sidebar_state.selected.push(act);
+                                            b.sidebar_state.selected.push(i);
+                                        }
+                                    } else {
+                                        b.sidebar_state.selected.push(i);
+                                    }
+                                } else if let Some(pos) = b.sidebar_state.selected.iter().position(|&idx| idx == i) {
+                                    b.sidebar_state.selected.remove(pos);
+                                } else {
+                                    b.sidebar_state.selected.push(i);
+                                }
+                                b.sidebar_state.selection_anchor = Some(i);
                                 drop(b);
                                 unsafe { invalidate_sidebar(hwnd, state); }
                             } else {
-                                state.borrow_mut().sidebar_state.selected.clear();
+                                {
+                                    let mut b = state.borrow_mut();
+                                    b.sidebar_state.selected.clear();
+                                    b.sidebar_state.selection_anchor = None;
+                                }
                                 let on_action = state.borrow().on_action.clone();
                                 if let Some(cb) = on_action {
                                     cb(SidebarAction::SelectTab(i));
@@ -1946,13 +2023,24 @@ unsafe extern "system" fn wndproc(
             if is_on_split_divider(hwnd, state, x, y) {
                 let mut pt = POINT { x, y };
                 unsafe { let _ = ClientToScreen(hwnd, &mut pt); }
-                let items = vec![
-                    crate::context_menu::ContextMenuItem::item(1, "Swap Left and Right Panes", Some("Ctrl+Alt+S")),
-                    crate::context_menu::ContextMenuItem::item(2, "Even Out (50 / 50)", Some("Double-Click")),
-                    crate::context_menu::ContextMenuItem::separator(),
-                    crate::context_menu::ContextMenuItem::item(3, "Separate Split", Some("Ctrl+Alt+U")),
-                    crate::context_menu::ContextMenuItem::item(4, "Close Split (Both Panes)", Some("Ctrl+Alt+W")),
-                ];
+                let pane_count = state.borrow().split_info.as_ref().map(|sp| sp.tab_indices.len()).unwrap_or(2);
+                let items = if pane_count > 2 {
+                    vec![
+                        crate::context_menu::ContextMenuItem::item(1, "Reverse Split Panes", Some("Ctrl+Alt+S")),
+                        crate::context_menu::ContextMenuItem::item(2, "Even Out", Some("Double-Click")),
+                        crate::context_menu::ContextMenuItem::separator(),
+                        crate::context_menu::ContextMenuItem::item(3, "Separate Split", Some("Ctrl+Alt+U")),
+                        crate::context_menu::ContextMenuItem::item(4, "Close Split (All Panes)", Some("Ctrl+Alt+W")),
+                    ]
+                } else {
+                    vec![
+                        crate::context_menu::ContextMenuItem::item(1, "Swap Left and Right Panes", Some("Ctrl+Alt+S")),
+                        crate::context_menu::ContextMenuItem::item(2, "Even Out (50 / 50)", Some("Double-Click")),
+                        crate::context_menu::ContextMenuItem::separator(),
+                        crate::context_menu::ContextMenuItem::item(3, "Separate Split", Some("Ctrl+Alt+U")),
+                        crate::context_menu::ContextMenuItem::item(4, "Close Split (Both Panes)", Some("Ctrl+Alt+W")),
+                    ]
+                };
                 let on_action = state.borrow().on_action.clone();
                 if let Some(ref menu) = state.borrow().context_menu {
                     menu.show(pt.x, pt.y, items, Box::new(move |cmd| {
@@ -2136,9 +2224,18 @@ unsafe extern "system" fn wndproc(
                                         23 => cb(SidebarAction::OpenInSplitView(tab_id_split.clone())),
                                         24 => {
                                             let tab_ids: Vec<String> = {
-                                                let b = state_rc.borrow();
-                                                selected_tabs.iter().filter_map(|&i| b.sidebar_state.tabs.get(i).map(|t| t.id.clone())).collect()
+                                                let mut b = state_rc.borrow_mut();
+                                                let ids: Vec<String> = b.sidebar_state.tabs
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(i, _)| selected_tabs.contains(i))
+                                                    .map(|(_, t)| t.id.clone())
+                                                    .collect();
+                                                b.sidebar_state.selected.clear();
+                                                b.sidebar_state.selection_anchor = None;
+                                                ids
                                             };
+                                            unsafe { invalidate_sidebar(hwnd, &state_rc); }
                                             cb(SidebarAction::SplitTabs(tab_ids));
                                         }
                                         25 => cb(SidebarAction::SplitWithNewTab),
@@ -2382,6 +2479,14 @@ unsafe extern "system" fn wndproc(
                 return LRESULT(0);
             }
         }
+        WM_MOVE => {
+            let (content_rect, sidebar_rect) = compute_layout_rects(hwnd, state);
+            let on_move = state.borrow().on_move.clone();
+            if let Some(cb) = on_move {
+                cb(content_rect, sidebar_rect);
+            }
+            return LRESULT(0);
+        }
         WM_SIZE => {
             let (content_rect, sidebar_rect) = compute_layout_rects(hwnd, state);
 
@@ -2607,10 +2712,19 @@ unsafe extern "system" fn wndproc(
                         if selected.len() >= 2 && selected.len() <= 4 {
                             let tab_ids: Vec<String> = {
                                 let b = state.borrow();
-                                selected.iter().filter_map(|&i| b.sidebar_state.tabs.get(i).map(|t| t.id.clone())).collect()
+                                b.sidebar_state.tabs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| selected.contains(i))
+                                    .map(|(_, t)| t.id.clone())
+                                    .collect()
                             };
                             if tab_ids.len() >= 2 {
-                                state.borrow_mut().sidebar_state.selected.clear();
+                                {
+                                    let mut b = state.borrow_mut();
+                                    b.sidebar_state.selected.clear();
+                                    b.sidebar_state.selection_anchor = None;
+                                }
                                 unsafe { invalidate_sidebar(hwnd, state); }
                                 if let Some(ref cb) = on_action { cb(SidebarAction::SplitTabs(tab_ids)); }
                                 return LRESULT(0);

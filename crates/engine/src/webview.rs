@@ -9,7 +9,7 @@ use webview2_com::{
     CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     ExecuteScriptCompletedHandler,
-    FaviconChangedEventHandler, GetFaviconCompletedHandler,
+    FaviconChangedEventHandler, FocusChangedEventHandler, GetFaviconCompletedHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler,
     SourceChangedEventHandler,
@@ -22,7 +22,8 @@ use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, ScreenToClient, SetWindo
 use windows::Win32::System::Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetClassNameW, GetParent, GetWindowRect, IsWindow,
+    EnumChildWindows, GetClassNameW, GetParent, GetWindowRect, IsWindow, SetWindowPos,
+    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 
 #[derive(Error, Debug)]
@@ -65,6 +66,8 @@ pub enum BrowserShortcut {
     EvenSplit,
     SeparateSplit,
     CloseSplit,
+    CloseGlance,
+    PromoteGlance,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +93,7 @@ pub fn init_com() -> Result<(), EngineError> {
 
 pub struct WebViewEngine {
     environment: ICoreWebView2Environment,
+    glance_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct WebViewController {
@@ -97,6 +101,7 @@ pub struct WebViewController {
     webview: ICoreWebView2,
     last_bounds: std::cell::Cell<(i32, i32, i32, i32)>,
     child_hwnd: std::cell::Cell<Option<HWND>>,
+    is_fullscreen: std::cell::Cell<bool>,
     shield_state: std::sync::Arc<crate::shield::ShieldState>,
     current_host: std::sync::Arc<std::sync::RwLock<String>>,
 }
@@ -952,7 +957,13 @@ impl WebViewEngine {
 
         Ok(Self {
             environment,
+            glance_open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    pub fn set_glance_open(&self, open: bool) {
+        self.glance_open
+            .store(open, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn create_controller(
@@ -966,10 +977,11 @@ impl WebViewEngine {
         on_title_changed: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_url_changed: Option<Box<dyn Fn(String) + Send + 'static>>,
         on_favicon_changed: Option<Box<dyn Fn(Vec<u8>) + Send + 'static>>,
-        on_new_window: Option<Box<dyn Fn(String) + Send + 'static>>,
+        on_new_window: Option<Box<dyn Fn(String, bool) + Send + 'static>>,
         on_shortcut: Option<Box<dyn Fn(BrowserShortcut) + Send + 'static>>,
         on_fullscreen_changed: Option<Box<dyn Fn(bool) + Send + 'static>>,
         on_zapper_message: Option<Box<dyn Fn(ZapperMessage) + Send + 'static>>,
+        on_got_focus: Option<Box<dyn Fn() + Send + 'static>>,
     ) -> Result<WebViewController, EngineError> {
         let mut controller_opt = None;
         let mut attempts = 0;
@@ -1216,11 +1228,11 @@ impl WebViewEngine {
                                 } else if let Some(query) = msg.strip_prefix("search:") {
                                     if let Some(ref cb) = search_cb {
                                         let search_url = format!("https://www.google.com/search?q={}", query);
-                                        cb(search_url);
+                                        cb(search_url, false);
                                     }
                                 } else if let Some(url) = msg.strip_prefix("open_tab:") {
                                     if let Some(ref cb) = search_cb {
-                                        cb(url.to_string());
+                                        cb(url.to_string(), false);
                                     }
                                 } else if let Some(payload) = msg.strip_prefix("zapper:") {
                                     let mut parts = payload.split("|||");
@@ -1423,7 +1435,7 @@ impl WebViewEngine {
             }
         }
 
-        // Hook new window requested (target="_blank" -> open in our tabs!)
+        // Hook new window requested (target="_blank" -> open in our tabs, Shift+Click -> Glance!)
         if let Some(cb) = new_win_cb_shared {
             let mut token = 0;
             let handler = NewWindowRequestedEventHandler::create(Box::new(
@@ -1437,8 +1449,12 @@ impl WebViewEngine {
                                         uri_ptr.as_ptr() as _,
                                     ));
                                 }
+                                let shift = unsafe {
+                                    (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0
+                                        || (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0
+                                };
                                 let _ = unsafe { args.SetHandled(true) };
-                                cb(uri);
+                                cb(uri, shift);
                             }
                         }
                     }
@@ -1470,6 +1486,7 @@ impl WebViewEngine {
 
         // Hook accelerator keys for browser shortcuts
         if let Some(cb) = on_shortcut {
+            let glance_flag = self.glance_open.clone();
             let mut token = 0;
             let handler = AcceleratorKeyPressedEventHandler::create(Box::new(
                 move |_sender, args| {
@@ -1495,7 +1512,11 @@ impl WebViewEngine {
 
                             let mut shortcut = None;
 
-                            if ctrl && alt {
+                            if virtual_key == 0x1B && glance_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                shortcut = Some(BrowserShortcut::CloseGlance);
+                            } else if ctrl && !alt && !shift && virtual_key == 0x4F && glance_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                shortcut = Some(BrowserShortcut::PromoteGlance);
+                            } else if ctrl && alt {
                                 match virtual_key {
                                     0x4E => shortcut = Some(BrowserShortcut::SplitView), // 'N' -> Split View (Ctrl+Alt+N)
                                     0x25 | 0x27 | 0xDC => shortcut = Some(BrowserShortcut::FocusOtherPane), // Left/Right Arrow or '\' -> Focus Other Pane
@@ -1559,20 +1580,35 @@ impl WebViewEngine {
             }
         }
 
+        // Hook GotFocus so clicking a pane in Split View updates active focus state
+        if let Some(cb) = on_got_focus {
+            let mut focus_token = 0;
+            let handler = FocusChangedEventHandler::create(Box::new(move |_sender, _args| {
+                cb();
+                Ok(())
+            }));
+            unsafe {
+                let _ = controller.add_GotFocus(&handler, &mut focus_token);
+            }
+        }
+
         // Initial navigation
         let url_hstring = HSTRING::from(initial_url);
         unsafe {
             webview.Navigate(PCWSTR::from_raw(url_hstring.as_ptr()))?;
         }
 
-        Ok(WebViewController {
+        let ctrl = WebViewController {
             controller,
             webview,
             last_bounds: std::cell::Cell::new((0, 0, 0, 0)),
             child_hwnd: std::cell::Cell::new(None),
+            is_fullscreen: std::cell::Cell::new(false),
             shield_state: shield,
             current_host,
-        })
+        };
+        let _ = ctrl.set_bounds(bounds);
+        Ok(ctrl)
     }
 }
 
@@ -1637,6 +1673,16 @@ impl WebViewController {
         }
     }
 
+    pub fn set_parent_window(&self, parent: HWND) -> Result<(), EngineError> {
+        unsafe {
+            self.controller.SetParentWindow(parent)?;
+            self.controller.NotifyParentWindowPositionChanged()?;
+        }
+        self.child_hwnd.set(None);
+        self.last_bounds.set((0, 0, 0, 0));
+        Ok(())
+    }
+
     pub fn set_bounds(&self, bounds: RECT) -> Result<(), EngineError> {
         let new_bounds = (bounds.left, bounds.top, bounds.right, bounds.bottom);
         let old_bounds = self.last_bounds.get();
@@ -1656,9 +1702,13 @@ impl WebViewController {
             self.last_bounds.set(new_bounds);
             if let Some(child) = self.get_or_find_child_window(bounds) {
                 unsafe {
-                    let radius = 16;
-                    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
-                    let _ = SetWindowRgn(child, Some(rgn), true);
+                    if self.is_fullscreen.get() {
+                        let _ = SetWindowRgn(child, None, true);
+                    } else {
+                        let radius = 16;
+                        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
+                        let _ = SetWindowRgn(child, Some(rgn), true);
+                    }
                 }
             }
         } else if w > 0 && h > 0 {
@@ -1674,7 +1724,26 @@ impl WebViewController {
         Ok(())
     }
 
+    pub fn bring_to_top(&self) {
+        unsafe {
+            let (left, top, right, bottom) = self.last_bounds.get();
+            let bounds = RECT { left, top, right, bottom };
+            if let Some(child) = self.get_or_find_child_window(bounds) {
+                let _ = SetWindowPos(
+                    child,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
     pub fn set_fullscreen_mode(&self, fullscreen: bool) {
+        self.is_fullscreen.set(fullscreen);
         unsafe {
             let (left, top, right, bottom) = self.last_bounds.get();
             let bounds = RECT { left, top, right, bottom };
@@ -1683,6 +1752,15 @@ impl WebViewController {
                 let h = bottom - top;
                 if fullscreen {
                     let _ = SetWindowRgn(child, None, true);
+                    let _ = SetWindowPos(
+                        child,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
                 } else if w > 0 && h > 0 {
                     let radius = 16;
                     let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
@@ -2079,7 +2157,7 @@ mod tests {
         let bounds = RECT { left: 0, top: 0, right: 800, bottom: 600 };
         for i in 1..=6 {
             println!("Creating controller {}...", i);
-            let res = engine.create_controller(hwnd, bounds, "https://www.google.com", None, None, None, None, None, None, None, None, None, None);
+            let res = engine.create_controller(hwnd, bounds, "https://www.google.com", None, None, None, None, None, None, None, None, None, None, None);
             println!("Controller {} result: {:?}", i, res.as_ref().map(|_| "OK"));
             if let Err(e) = res {
                 println!("Controller {} ERROR: {:?}", i, e);

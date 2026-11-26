@@ -259,7 +259,8 @@ enum AppEvent {
     ZoomReset,
     NextTab,
     PrevTab,
-    FullScreenChanged(bool),
+    FullScreenChanged { tab_id: String, is_full: bool },
+    PaneFocused(String),
     TabAnimTick,
     CreateFolder,
     ToggleFolder(usize),
@@ -316,6 +317,29 @@ enum AppEvent {
     SplitRatioChanged(f32),
     SplitTabs(Vec<String>),
     SplitSizesChanged(Vec<f32>),
+    OpenGlance {
+        url: String,
+        from_tab_id: Option<String>,
+    },
+    GlanceClose,
+    GlanceOpenAsTab,
+    GlanceOpenInSplit,
+    GlanceTitleChanged {
+        tab_id: String,
+        title: String,
+    },
+    GlanceUrlChanged {
+        tab_id: String,
+        url: String,
+    },
+    GlanceFaviconChanged {
+        tab_id: String,
+        bytes: Vec<u8>,
+    },
+    GlanceNavigate {
+        tab_id: String,
+        url: String,
+    },
 }
 
 fn show_windows_share_ui(hwnd: HWND, title: &str, url: &str) -> windows::core::Result<()> {
@@ -433,8 +457,12 @@ struct BrowserApp {
     last_persist: Instant,
     closed_tabs: Vec<ClosedTab>,
     sidebar_before_fullscreen: Option<bool>,
+    fullscreen_tab_id: Option<String>,
     last_anim_tick: Instant,
     shield_state: std::sync::Arc<engine::ShieldState>,
+    glance_tab: Option<Tab>,
+    glance_from_tab_id: Option<String>,
+    glance_overlay: Option<Rc<ui::GlanceOverlay>>,
 }
 
 fn get_base_domain(domain: &str) -> Option<String> {
@@ -730,8 +758,12 @@ impl BrowserApp {
             last_persist: Instant::now(),
             closed_tabs: Vec::new(),
             sidebar_before_fullscreen: None,
+            fullscreen_tab_id: None,
             last_anim_tick: Instant::now(),
             shield_state,
+            glance_tab: None,
+            glance_from_tab_id: None,
+            glance_overlay: None,
         };
 
         app.persist_state();
@@ -898,9 +930,18 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_new_win = tab_id.clone();
         let tx3 = self.event_tx.clone();
-        let on_new_window = Box::new(move |target_url: String| {
-            let _ = tx3.send(AppEvent::CreateTab(target_url));
+        let on_new_window = Box::new(move |target_url: String, is_shift: bool| {
+            let ev = if is_shift {
+                AppEvent::OpenGlance {
+                    url: target_url,
+                    from_tab_id: Some(tab_id_new_win.clone()),
+                }
+            } else {
+                AppEvent::CreateTab(target_url)
+            };
+            let _ = tx3.send(ev);
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
                 let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
@@ -936,6 +977,8 @@ impl BrowserApp {
                 BrowserShortcut::EvenSplit => AppEvent::EvenSplit,
                 BrowserShortcut::SeparateSplit => AppEvent::SeparateSplit,
                 BrowserShortcut::CloseSplit => AppEvent::CloseSplit,
+                BrowserShortcut::CloseGlance => AppEvent::GlanceClose,
+                BrowserShortcut::PromoteGlance => AppEvent::GlanceOpenAsTab,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -969,9 +1012,23 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_fs = tab_id.clone();
         let tx_fs = self.event_tx.clone();
         let on_fullscreen = Box::new(move |is_full: bool| {
-            let _ = tx_fs.send(AppEvent::FullScreenChanged(is_full));
+            let _ = tx_fs.send(AppEvent::FullScreenChanged {
+                tab_id: tab_id_clone_fs.clone(),
+                is_full,
+            });
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tab_id_clone_focus = tab_id.clone();
+        let tx_focus = self.event_tx.clone();
+        let on_got_focus = Box::new(move || {
+            let _ = tx_focus.send(AppEvent::PaneFocused(tab_id_clone_focus.clone()));
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
                 let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
@@ -1020,6 +1077,7 @@ impl BrowserApp {
             Some(on_shortcut),
             Some(on_fullscreen),
             Some(on_zapper),
+            Some(on_got_focus),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -1131,9 +1189,18 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_new_win = tab_id.clone();
         let tx3 = self.event_tx.clone();
-        let on_new_window = Box::new(move |target_url: String| {
-            let _ = tx3.send(AppEvent::CreateTab(target_url));
+        let on_new_window = Box::new(move |target_url: String, is_shift: bool| {
+            let ev = if is_shift {
+                AppEvent::OpenGlance {
+                    url: target_url,
+                    from_tab_id: Some(tab_id_new_win.clone()),
+                }
+            } else {
+                AppEvent::CreateTab(target_url)
+            };
+            let _ = tx3.send(ev);
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
                 let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
@@ -1169,6 +1236,8 @@ impl BrowserApp {
                 BrowserShortcut::EvenSplit => AppEvent::EvenSplit,
                 BrowserShortcut::SeparateSplit => AppEvent::SeparateSplit,
                 BrowserShortcut::CloseSplit => AppEvent::CloseSplit,
+                BrowserShortcut::CloseGlance => AppEvent::GlanceClose,
+                BrowserShortcut::PromoteGlance => AppEvent::GlanceOpenAsTab,
             };
             let _ = tx4.send(ev);
             unsafe {
@@ -1202,9 +1271,23 @@ impl BrowserApp {
             }
         });
 
+        let tab_id_clone_fs = tab_id.clone();
         let tx_fs = self.event_tx.clone();
         let on_fullscreen = Box::new(move |is_full: bool| {
-            let _ = tx_fs.send(AppEvent::FullScreenChanged(is_full));
+            let _ = tx_fs.send(AppEvent::FullScreenChanged {
+                tab_id: tab_id_clone_fs.clone(),
+                is_full,
+            });
+            unsafe {
+                let hwnd = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tab_id_clone_focus = tab_id.clone();
+        let tx_focus = self.event_tx.clone();
+        let on_got_focus = Box::new(move || {
+            let _ = tx_focus.send(AppEvent::PaneFocused(tab_id_clone_focus.clone()));
             unsafe {
                 let hwnd = HWND(hwnd_val as *mut _);
                 let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0), LPARAM(0));
@@ -1253,6 +1336,7 @@ impl BrowserApp {
             Some(on_shortcut),
             Some(on_fullscreen),
             Some(on_zapper),
+            Some(on_got_focus),
         ) {
             Ok(c) => {
                 if self.tabs[idx].is_muted {
@@ -1281,6 +1365,39 @@ impl BrowserApp {
             return;
         }
 
+        // While a tab is HTML5-fullscreen (e.g. YouTube video fullscreen), only that tab is shown
+        // across the entire client rect; all other split panes stay hidden until fullscreen ends.
+        if let Some(fs_id) = self.fullscreen_tab_id.clone() {
+            if let Some(fs_idx) = self.tabs.iter().position(|t| t.id == fs_id) {
+                self.window.set_split_info(None);
+                self.ensure_tab_controller(fs_idx);
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    if i != fs_idx {
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.set_visible(false);
+                        }
+                    }
+                }
+                let mut client_rect = RECT::default();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(
+                        self.window.hwnd(),
+                        &mut client_rect,
+                    );
+                }
+                if let Some(ref ctrl) = self.tabs[fs_idx].controller {
+                    let _ = ctrl.resume();
+                    ctrl.set_fullscreen_mode(true);
+                    let _ = ctrl.set_bounds(client_rect);
+                    let _ = ctrl.set_visible(true);
+                    ctrl.bring_to_top();
+                }
+                return;
+            } else {
+                self.fullscreen_tab_id = None;
+            }
+        }
+
         let active_id = self.tabs[self.active_tab_idx].id.clone();
         if let Some(s) = self.find_split_for_tab(&active_id).cloned() {
             let tab_indices: Option<Vec<usize>> = s.tabs.iter().map(|tid| self.tabs.iter().position(|t| t.id == *tid)).collect();
@@ -1290,24 +1407,39 @@ impl BrowserApp {
                     self.ensure_tab_controller(idx);
                 }
 
+                // Hide any tab controller that does not belong to the active split
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    if !indices.contains(&i) {
+                        if let Some(ref ctrl) = tab.controller {
+                            let _ = ctrl.set_visible(false);
+                        }
+                    }
+                }
+
                 let focused_idx = indices
                     .iter()
                     .position(|&idx| self.tabs[idx].id == s.focused_tab_id)
                     .map(|pos| indices[pos])
                     .unwrap_or(self.active_tab_idx);
 
-                self.window.set_split_info(Some(ui::SplitInfo::new(
-                    s.id.clone(),
-                    indices.clone(),
-                    s.sizes.clone(),
-                    focused_idx,
-                )));
+                // Do not overwrite live divider sizes while the user is actively dragging a divider
+                if !self.window.is_resizing_split() {
+                    self.window.set_split_info(Some(ui::SplitInfo::new(
+                        s.id.clone(),
+                        indices.clone(),
+                        s.sizes.clone(),
+                        focused_idx,
+                    )));
+                }
 
                 if let Some((pane_rects, _div_rects)) = self.window.get_split_layout_rects_multi() {
                     for (i, &idx) in indices.iter().enumerate() {
                         if let Some(ref ctrl) = self.tabs[idx].controller {
                             let _ = ctrl.resume();
-                            let _ = ctrl.set_bounds(pane_rects[i]);
+                            ctrl.set_fullscreen_mode(false);
+                            if i < pane_rects.len() {
+                                let _ = ctrl.set_bounds(pane_rects[i]);
+                            }
                             let _ = ctrl.set_visible(true);
                         }
                     }
@@ -1317,6 +1449,7 @@ impl BrowserApp {
                         self.window.set_zoom(zoom);
                     }
                 }
+                self.sync_glance_bounds();
                 return;
             } else {
                 self.splits.retain(|sp| sp.id != s.id);
@@ -1324,13 +1457,371 @@ impl BrowserApp {
         }
 
         self.window.set_split_info(None);
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if i != self.active_tab_idx {
+                if let Some(ref ctrl) = tab.controller {
+                    let _ = ctrl.set_visible(false);
+                }
+            }
+        }
         let (content_rect, _) = self.window.get_layout_rects();
         if let Some(ref ctrl) = self.tabs[self.active_tab_idx].controller {
             let _ = ctrl.resume();
+            ctrl.set_fullscreen_mode(false);
             let _ = ctrl.set_bounds(content_rect);
             let _ = ctrl.set_visible(true);
             let zoom = ctrl.get_zoom_factor();
             self.window.set_zoom(zoom);
+        }
+        self.sync_glance_bounds();
+    }
+
+    pub fn open_glance(&mut self, url: &str, from_tab_id: Option<String>) {
+        let cleaned = engine::clean_link::clean_url(url);
+        if cleaned.trim().is_empty() {
+            return;
+        }
+        if self.glance_tab.is_some() {
+            self.close_glance();
+        }
+
+        let hwnd = self.window.hwnd();
+        let hwnd_val = hwnd.0 as usize;
+
+        if self.glance_overlay.is_none() {
+            if let Ok(ov) = ui::GlanceOverlay::new(hwnd) {
+                let tx = self.event_tx.clone();
+                ov.set_on_action(move |action| {
+                    let ev = match action {
+                        ui::GlanceAction::Close => AppEvent::GlanceClose,
+                        ui::GlanceAction::OpenAsTab => AppEvent::GlanceOpenAsTab,
+                        ui::GlanceAction::OpenInSplit => AppEvent::GlanceOpenInSplit,
+                    };
+                    let _ = tx.send(ev);
+                    unsafe {
+                        let h = HWND(hwnd_val as *mut _);
+                        let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+                    }
+                });
+                self.glance_overlay = Some(Rc::new(ov));
+            }
+        }
+
+        let (content_rect, _) = self.window.get_layout_rects();
+        let card_rect = ui::GlanceOverlay::compute_card_rect(hwnd, content_rect);
+
+        let tab_id = format!("tab-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+
+        let tid_title = tab_id.clone();
+        let tx_title = self.event_tx.clone();
+        let on_title = Box::new(move |title: String| {
+            let _ = tx_title.send(AppEvent::GlanceTitleChanged {
+                tab_id: tid_title.clone(),
+                title,
+            });
+            unsafe {
+                let h = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tid_url = tab_id.clone();
+        let tx_url = self.event_tx.clone();
+        let on_url = Box::new(move |new_url: String| {
+            let _ = tx_url.send(AppEvent::GlanceUrlChanged {
+                tab_id: tid_url.clone(),
+                url: new_url,
+            });
+            unsafe {
+                let h = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tid_fav = tab_id.clone();
+        let tx_fav = self.event_tx.clone();
+        let on_favicon = Box::new(move |bytes: Vec<u8>| {
+            let _ = tx_fav.send(AppEvent::GlanceFaviconChanged {
+                tab_id: tid_fav.clone(),
+                bytes,
+            });
+            unsafe {
+                let h = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tid_new = tab_id.clone();
+        let tx_new = self.event_tx.clone();
+        let on_new_window = Box::new(move |target_url: String, is_shift: bool| {
+            let _ = tx_new.send(if is_shift {
+                AppEvent::OpenGlance {
+                    url: target_url,
+                    from_tab_id: Some(tid_new.clone()),
+                }
+            } else {
+                AppEvent::GlanceNavigate {
+                    tab_id: tid_new.clone(),
+                    url: target_url,
+                }
+            });
+            unsafe {
+                let h = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let tx_sc = self.event_tx.clone();
+        let on_shortcut = Box::new(move |sc: BrowserShortcut| {
+            let ev = match sc {
+                BrowserShortcut::CloseGlance => AppEvent::GlanceClose,
+                BrowserShortcut::PromoteGlance => AppEvent::GlanceOpenAsTab,
+                BrowserShortcut::NewTab => AppEvent::OpenCommandBar(CommandBarMode::NewTab),
+                BrowserShortcut::CloseTab => AppEvent::GlanceClose,
+                BrowserShortcut::ToggleSidebar => AppEvent::ToggleSidebar,
+                BrowserShortcut::Reload => AppEvent::NavReload,
+                BrowserShortcut::HardReload => AppEvent::HardReload,
+                BrowserShortcut::NavBack => AppEvent::NavBack,
+                BrowserShortcut::NavForward => AppEvent::NavForward,
+                BrowserShortcut::CopyUrl => AppEvent::CopyUrl,
+                BrowserShortcut::CopyCleanLink => AppEvent::CopyCleanLink,
+                BrowserShortcut::FocusUrlBar => AppEvent::OpenCommandBar(CommandBarMode::NavigateCurrent),
+                BrowserShortcut::OpenSettings => AppEvent::OpenSettings,
+                BrowserShortcut::ZoomIn => AppEvent::ZoomIn,
+                BrowserShortcut::ZoomOut => AppEvent::ZoomOut,
+                BrowserShortcut::ZoomReset => AppEvent::ZoomReset,
+                BrowserShortcut::PinTab => AppEvent::TogglePinCurrentTab,
+                BrowserShortcut::NextTab => AppEvent::NextTab,
+                BrowserShortcut::PrevTab => AppEvent::PrevTab,
+                BrowserShortcut::SelectTab(idx) => AppEvent::SwitchTab(idx),
+                BrowserShortcut::ReopenClosedTab => AppEvent::ReopenClosedTab,
+                BrowserShortcut::ToggleZapper => AppEvent::ToggleZapper,
+                BrowserShortcut::SplitView => AppEvent::SplitWithNewTab,
+                BrowserShortcut::FocusOtherPane => AppEvent::FocusOtherPane,
+                BrowserShortcut::SwapSplit => AppEvent::SwapSplit,
+                BrowserShortcut::EvenSplit => AppEvent::EvenSplit,
+                BrowserShortcut::SeparateSplit => AppEvent::SeparateSplit,
+                BrowserShortcut::CloseSplit => AppEvent::CloseSplit,
+            };
+            let _ = tx_sc.send(ev);
+            unsafe {
+                let h = HWND(hwnd_val as *mut _);
+                let _ = PostMessageW(Some(h), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        });
+
+        let web_host_hwnd = self
+            .glance_overlay
+            .as_ref()
+            .map(|ov| ov.web_hwnd())
+            .unwrap_or(hwnd);
+        let local_card_rect = RECT {
+            left: 0,
+            top: 0,
+            right: (card_rect.right - card_rect.left).max(10),
+            bottom: (card_rect.bottom - card_rect.top).max(10),
+        };
+
+        let controller = match self.engine.create_controller(
+            web_host_hwnd,
+            local_card_rect,
+            &cleaned,
+            Some(self.shield_state.clone()),
+            None,
+            None,
+            Some(on_title),
+            Some(on_url),
+            Some(on_favicon),
+            Some(on_new_window),
+            Some(on_shortcut),
+            None,
+            None,
+            None,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                info!("Failed to create glance controller: {}", e);
+                return;
+            }
+        };
+
+        controller.set_fullscreen_mode(true); // Sharp corners (no rounded region)
+        let _ = controller.set_bounds(local_card_rect);
+        let _ = controller.set_visible(true);
+        controller.bring_to_top();
+
+        self.glance_tab = Some(Tab {
+            id: tab_id,
+            title: friendly_title_for_url(&cleaned),
+            url: cleaned.clone(),
+            accent: accent_for_url(&cleaned),
+            favicon: None,
+            is_pinned: false,
+            folder_id: None,
+            custom_title: false,
+            custom_letter: None,
+            is_muted: false,
+            controller: Some(controller),
+            last_active: Instant::now(),
+            anim_progress: 1.0,
+            is_closing: false,
+            pending_permissions: Vec::new(),
+        });
+        self.glance_from_tab_id = from_tab_id;
+        self.engine.set_glance_open(true);
+
+        if let Some(ref ov) = self.glance_overlay {
+            ov.show(content_rect, card_rect);
+        }
+        if let Some(ref ctrl) = self.glance_tab.as_ref().and_then(|t| t.controller.as_ref()) {
+            let _ = ctrl.focus();
+        }
+    }
+
+    pub fn close_glance(&mut self) {
+        self.engine.set_glance_open(false);
+        if let Some(ref ov) = self.glance_overlay {
+            ov.hide();
+        }
+        if let Some(mut tab) = self.glance_tab.take() {
+            if let Some(ref ctrl) = tab.controller {
+                let _ = ctrl.set_visible(false);
+            }
+            tab.controller = None;
+        }
+        self.glance_from_tab_id = None;
+        if let Some(ctrl) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+            let _ = ctrl.focus();
+        }
+    }
+
+    pub fn promote_glance_to_tab(&mut self, in_split: bool) {
+        self.engine.set_glance_open(false);
+        if let Some(ref ov) = self.glance_overlay {
+            ov.hide();
+        }
+        let Some(mut tab) = self.glance_tab.take() else {
+            return;
+        };
+        let from_id = self.glance_from_tab_id.take();
+
+        // Adopt source tab's folder if it's a regular tab
+        let from_pos = from_id
+            .as_ref()
+            .and_then(|fid| self.tabs.iter().position(|t| t.id == *fid));
+        if let Some(pos) = from_pos {
+            if !self.tabs[pos].is_pinned {
+                tab.folder_id = self.tabs[pos].folder_id.clone();
+            }
+        }
+
+        let new_tab_id = tab.id.clone();
+        let insert_idx = from_pos
+            .map(|p| (p + 1).min(self.tabs.len()))
+            .unwrap_or_else(|| (self.active_tab_idx + 1).min(self.tabs.len()));
+
+        // Reparent the live WebView2 controller from the Glance popup host into main_hwnd
+        if let Some(ref ctrl) = tab.controller {
+            let _ = ctrl.set_parent_window(self.window.hwnd());
+            ctrl.set_fullscreen_mode(false);
+        }
+
+        self.tabs.insert(insert_idx, tab);
+        self.active_tab_idx = insert_idx;
+
+        if in_split {
+            if let Some(fid) = from_id.filter(|id| {
+                self.tabs
+                    .iter()
+                    .any(|t| t.id == *id && !t.is_pinned)
+            }) {
+                if let Some(existing_idx) = self.splits.iter().position(|s| s.contains(&fid)) {
+                    if !self.splits[existing_idx].is_full() {
+                        let mut ordered = self.splits[existing_idx].tabs.clone();
+                        if let Some(p) = ordered.iter().position(|id| id == &fid) {
+                            ordered.insert(p + 1, new_tab_id.clone());
+                        } else {
+                            ordered.push(new_tab_id.clone());
+                        }
+                        self.handle_split_tabs(ordered);
+                        return;
+                    }
+                }
+                self.handle_split_tabs(vec![fid, new_tab_id]);
+                return;
+            }
+        }
+
+        self.sync_split_bounds();
+        if let Some(ctrl) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+            ctrl.bring_to_top();
+            let _ = ctrl.focus();
+        }
+        self.sync_tabs_ui();
+        self.persist_state();
+    }
+
+    pub fn sync_glance_bounds(&self) {
+        let Some(ref tab) = self.glance_tab else {
+            return;
+        };
+        let (content_rect, _) = self.window.get_layout_rects();
+        let card_rect = ui::GlanceOverlay::compute_card_rect(self.window.hwnd(), content_rect);
+        if let Some(ref ov) = self.glance_overlay {
+            ov.update_layout(content_rect, card_rect);
+        }
+        if let Some(ref ctrl) = tab.controller {
+            let local_rect = RECT {
+                left: 0,
+                top: 0,
+                right: (card_rect.right - card_rect.left).max(10),
+                bottom: (card_rect.bottom - card_rect.top).max(10),
+            };
+            let _ = ctrl.set_bounds(local_rect);
+            ctrl.bring_to_top();
+        }
+    }
+
+    /// Group a split's tabs adjacently in `self.tabs` at the first member's position,
+    /// adopting its `folder_id` (matching `Search`'s `pair` / `pairPickedTabs`) so
+    /// the sidebar renders them cleanly inside one split container.
+    fn group_split_tabs_in_list(&mut self, ordered_ids: &[String]) {
+        if ordered_ids.len() < 2 {
+            return;
+        }
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let first_pos = match self.tabs.iter().position(|t| t.id == ordered_ids[0]) {
+            Some(p) => p,
+            None => return,
+        };
+        let target_folder = self.tabs[first_pos].folder_id.clone();
+
+        let id_set: std::collections::HashSet<&str> = ordered_ids.iter().map(|s| s.as_str()).collect();
+        let insert_at = self.tabs[..first_pos]
+            .iter()
+            .filter(|t| !id_set.contains(t.id.as_str()))
+            .count();
+
+        let mut grouped = Vec::with_capacity(ordered_ids.len());
+        for tid in ordered_ids {
+            if let Some(pos) = self.tabs.iter().position(|t| t.id == *tid) {
+                let mut tab = self.tabs.remove(pos);
+                tab.folder_id = target_folder.clone();
+                tab.is_pinned = false;
+                grouped.push(tab);
+            }
+        }
+
+        let pos = insert_at.min(self.tabs.len());
+        for (offset, tab) in grouped.into_iter().enumerate() {
+            self.tabs.insert(pos + offset, tab);
+        }
+
+        if let Some(aid) = active_id {
+            if let Some(new_idx) = self.tabs.iter().position(|t| t.id == aid) {
+                self.active_tab_idx = new_idx;
+            }
         }
     }
 
@@ -1399,9 +1890,14 @@ impl BrowserApp {
             }
             self.splits.retain(|sp| sp.tabs.len() >= 2);
 
+            let mut grouped_tabs = None;
             if let Some(s) = self.find_split_for_tab_mut(&current_tab_id) {
                 s.insert(partner_id.clone(), None, false);
                 s.focused_tab_id = partner_id.clone();
+                grouped_tabs = Some(s.tabs.clone());
+            }
+            if let Some(ordered) = grouped_tabs {
+                self.group_split_tabs_in_list(&ordered);
             }
 
             if let Some(new_active) = self.tabs.iter().position(|t| t.id == partner_id) {
@@ -1466,11 +1962,13 @@ impl BrowserApp {
 
         let split_id = format!("split-{}", self.next_tab_id);
         self.next_tab_id += 1;
+        let pair_tabs = vec![current_tab_id, partner_id.clone()];
         self.splits.push(TabSplit::new(
             split_id,
-            vec![current_tab_id, partner_id.clone()],
+            pair_tabs.clone(),
             partner_id.clone(),
         ));
+        self.group_split_tabs_in_list(&pair_tabs);
 
         if let Some(new_active) = self.tabs.iter().position(|t| t.id == partner_id) {
             self.ensure_tab_controller(new_active);
@@ -1485,9 +1983,14 @@ impl BrowserApp {
     fn swap_split(&mut self) {
         let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
         let Some(active_id) = active_id else { return };
+        let mut reversed_tabs = None;
         if let Some(s) = self.find_split_for_tab_mut(&active_id) {
             s.tabs.reverse();
             s.sizes.reverse();
+            reversed_tabs = Some(s.tabs.clone());
+        }
+        if let Some(ordered) = reversed_tabs {
+            self.group_split_tabs_in_list(&ordered);
         }
         self.sync_split_bounds();
         self.sync_tabs_ui();
@@ -1583,12 +2086,14 @@ impl BrowserApp {
             return;
         }
 
-        let valid_ids: Vec<String> = tab_ids
-            .into_iter()
-            .filter(|tid| self.tabs.iter().any(|t| &t.id == tid))
-            .collect();
+        let mut valid_ids: Vec<String> = Vec::new();
+        for tid in tab_ids {
+            if self.tabs.iter().any(|t| t.id == tid && !t.is_pinned) && !valid_ids.contains(&tid) {
+                valid_ids.push(tid);
+            }
+        }
 
-        if valid_ids.len() < 2 {
+        if valid_ids.len() < 2 || valid_ids.len() > TabSplit::MOST {
             return;
         }
 
@@ -1602,33 +2107,48 @@ impl BrowserApp {
         }
         self.splits.retain(|s| s.tabs.len() >= 2);
 
+        self.group_split_tabs_in_list(&valid_ids);
+
         let split_id = format!("split-{}", self.next_tab_id);
         self.next_tab_id += 1;
-        let focused_id = valid_ids[0].clone();
+        let active_id = self.tabs.get(self.active_tab_idx).map(|t| t.id.clone());
+        let focused_id = active_id
+            .filter(|aid| valid_ids.contains(aid))
+            .unwrap_or_else(|| valid_ids[0].clone());
         self.splits.push(TabSplit::new(split_id, valid_ids.clone(), focused_id.clone()));
-
-        // Ensure controllers for ALL tabs in the split
-        for tid in &valid_ids {
-            if let Some(pos) = self.tabs.iter().position(|t| t.id == *tid) {
-                self.ensure_tab_controller(pos);
-            }
-        }
 
         if let Some(pos) = self.tabs.iter().position(|t| t.id == focused_id) {
             self.active_tab_idx = pos;
         }
 
+        // sync_split_bounds ensures controllers for all split tabs, hides old non-split tabs,
+        // and positions all 2..=4 panes cleanly.
         self.sync_split_bounds();
+
+        if let Some(ctrl) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+            let _ = ctrl.focus();
+        }
+
         self.sync_tabs_ui();
         self.persist_state();
     }
 
     fn switch_tab(&mut self, idx: usize) {
+        if self.glance_tab.is_some() {
+            self.close_glance();
+        }
         if idx >= self.tabs.len() {
             return;
         }
 
         let old_idx = self.active_tab_idx;
+        if let Some(ref fs_id) = self.fullscreen_tab_id.clone() {
+            if self.tabs[idx].id != *fs_id {
+                self.fullscreen_tab_id = None;
+                let prev_vis = self.sidebar_before_fullscreen.take().unwrap_or(true);
+                self.window.set_sidebar_visible_quiet(prev_vis);
+            }
+        }
         if old_idx == idx && self.tabs[idx].controller.is_some() {
             self.sync_split_bounds();
             self.sync_tabs_ui();
@@ -1705,6 +2225,11 @@ impl BrowserApp {
         }
 
         let closed_tab_id = self.tabs[target_idx].id.clone();
+        if self.fullscreen_tab_id.as_deref() == Some(closed_tab_id.as_str()) {
+            self.fullscreen_tab_id = None;
+            let prev_vis = self.sidebar_before_fullscreen.take().unwrap_or(true);
+            self.window.set_sidebar_visible_quiet(prev_vis);
+        }
         for s in self.splits.iter_mut() {
             if s.contains(&closed_tab_id) {
                 s.remove(&closed_tab_id);
@@ -2812,37 +3337,71 @@ impl BrowserApp {
                     self.switch_tab(prev);
                 }
             }
-            AppEvent::FullScreenChanged(is_full) => {
+            AppEvent::FullScreenChanged { tab_id, is_full } => {
                 let hwnd = self.window.hwnd();
-                let mut client_rect = RECT::default();
-                unsafe {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client_rect);
-                }
-
                 if is_full {
-                    if self.sidebar_before_fullscreen.is_none() {
-                        self.sidebar_before_fullscreen = Some(self.window.is_sidebar_visible());
-                    }
-                    self.window.set_sidebar_visible(false);
-                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref ctrl) = tab.controller {
-                            let _ = ctrl.set_bounds(client_rect);
-                            ctrl.set_fullscreen_mode(true);
+                    if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                        self.fullscreen_tab_id = Some(tab_id.clone());
+                        if self.sidebar_before_fullscreen.is_none() {
+                            self.sidebar_before_fullscreen = Some(self.window.is_sidebar_visible());
                         }
+                        self.window.set_sidebar_visible_quiet(false);
+                        self.active_tab_idx = pos;
+                        if let Some(s) = self.find_split_for_tab_mut(&tab_id) {
+                            s.focused_tab_id = tab_id.clone();
+                        }
+                        self.sync_split_bounds();
+                        self.sync_tabs_ui();
                     }
-                } else {
+                } else if self.fullscreen_tab_id.as_deref() == Some(tab_id.as_str()) || self.fullscreen_tab_id.is_some() {
+                    self.fullscreen_tab_id = None;
                     let prev_vis = self.sidebar_before_fullscreen.take().unwrap_or(true);
-                    self.window.set_sidebar_visible(prev_vis);
-                    let (content_rect, _) = self.window.get_layout_rects();
-                    if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref ctrl) = tab.controller {
-                            let _ = ctrl.set_bounds(content_rect);
-                            ctrl.set_fullscreen_mode(false);
-                        }
-                    }
+                    self.window.set_sidebar_visible_quiet(prev_vis);
+                    self.sync_split_bounds();
+                    self.sync_tabs_ui();
                 }
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+                }
+            }
+            AppEvent::PaneFocused(tab_id) => {
+                if self.fullscreen_tab_id.is_some() {
+                    return;
+                }
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+                    if pos != self.active_tab_idx && pos < self.tabs.len() && self.active_tab_idx < self.tabs.len() {
+                        let cur_id = self.tabs[self.active_tab_idx].id.clone();
+                        let in_same_split = self.find_split_for_tab(&cur_id)
+                            .map_or(false, |s| s.contains(&tab_id));
+                        if in_same_split {
+                            self.active_tab_idx = pos;
+                            if let Some(s) = self.find_split_for_tab_mut(&tab_id) {
+                                s.focused_tab_id = tab_id.clone();
+                            }
+                            if let Some(s) = self.find_split_for_tab(&tab_id).cloned() {
+                                let indices: Option<Vec<usize>> = s.tabs.iter()
+                                    .map(|tid| self.tabs.iter().position(|t| t.id == *tid))
+                                    .collect();
+                                if let Some(indices) = indices {
+                                    self.window.set_split_info(Some(ui::SplitInfo::new(
+                                        s.id.clone(),
+                                        indices,
+                                        s.sizes.clone(),
+                                        pos,
+                                    )));
+                                }
+                            }
+                            if let Some(ref ctrl) = self.tabs[pos].controller {
+                                let zoom = ctrl.get_zoom_factor();
+                                self.window.set_zoom(zoom);
+                            }
+                            if let Some(tab) = self.tabs.get_mut(pos) {
+                                tab.last_active = Instant::now();
+                            }
+                            self.sync_tabs_ui();
+                            self.mark_dirty();
+                        }
+                    }
                 }
             }
             AppEvent::TabAnimTick => {
@@ -3374,7 +3933,11 @@ impl BrowserApp {
                 self.start_split(Some(tab_id));
             }
             AppEvent::SplitWithNewTab => {
-                self.start_split(None);
+                if let Some(tab_ids) = self.window.take_selected_split_tabs() {
+                    self.handle_split_tabs(tab_ids);
+                } else {
+                    self.start_split(None);
+                }
             }
             AppEvent::FocusOtherPane => {
                 self.focus_other_pane();
@@ -3399,6 +3962,66 @@ impl BrowserApp {
             }
             AppEvent::SplitSizesChanged(sizes) => {
                 self.split_sizes_changed(sizes);
+            }
+            AppEvent::OpenGlance { url, from_tab_id } => {
+                self.open_glance(&url, from_tab_id);
+            }
+            AppEvent::GlanceClose => {
+                self.close_glance();
+            }
+            AppEvent::GlanceOpenAsTab => {
+                self.promote_glance_to_tab(false);
+            }
+            AppEvent::GlanceOpenInSplit => {
+                self.promote_glance_to_tab(true);
+            }
+            AppEvent::GlanceTitleChanged { tab_id, title } => {
+                if self.glance_tab.as_ref().map(|t| t.id == tab_id) == Some(true) {
+                    if let Some(ref mut tab) = self.glance_tab {
+                        if !title.is_empty() {
+                            tab.title = title;
+                        }
+                    }
+                } else {
+                    self.handle_event(AppEvent::TitleChanged { tab_id, title });
+                }
+            }
+            AppEvent::GlanceUrlChanged { tab_id, url: new_url } => {
+                if self.glance_tab.as_ref().map(|t| t.id == tab_id) == Some(true) {
+                    if let Some(ref mut tab) = self.glance_tab {
+                        tab.url = new_url.clone();
+                        tab.accent = accent_for_url(&new_url);
+                    }
+                } else {
+                    self.handle_event(AppEvent::UrlChanged { tab_id, url: new_url });
+                }
+            }
+            AppEvent::GlanceFaviconChanged { tab_id, bytes } => {
+                if self.glance_tab.as_ref().map(|t| t.id == tab_id) == Some(true) {
+                    if let Some(ref mut tab) = self.glance_tab {
+                        if let Some(arc_fav) = ui::decode_favicon(&bytes) {
+                            let domain = ui::domain_of(&tab.url);
+                            if !domain.is_empty() {
+                                self.favicon_cache.insert(domain, arc_fav.clone());
+                            }
+                            tab.favicon = Some(arc_fav);
+                        }
+                    }
+                } else {
+                    self.handle_event(AppEvent::FaviconChanged { tab_id, bytes });
+                }
+            }
+            AppEvent::GlanceNavigate { tab_id, url: target_url } => {
+                if self.glance_tab.as_ref().map(|t| t.id == tab_id) == Some(true) {
+                    if let Some(ref tab) = self.glance_tab {
+                        if let Some(ref ctrl) = tab.controller {
+                            let cleaned = engine::clean_link::clean_url(&target_url);
+                            let _ = ctrl.navigate(&cleaned);
+                        }
+                    }
+                } else {
+                    self.handle_event(AppEvent::CreateTab(target_url));
+                }
             }
         }
     }
@@ -3695,7 +4318,28 @@ impl BrowserApp {
                         self.tabs.iter().filter(|t| !t.is_pinned).nth(tab_idx).map(|t| t.id.clone())
                     }
                     ui::DragSource::Pinned(fav_idx) => {
-                        self.pinned_shortcuts.get(fav_idx).map(|sc| sc.id.clone())
+                        self.pinned_shortcuts.get(fav_idx).cloned().map(|sc| {
+                            let tab_id = format!("tab-{}", self.next_tab_id);
+                            self.next_tab_id += 1;
+                            self.tabs.push(Tab {
+                                id: tab_id.clone(),
+                                title: sc.title,
+                                url: sc.url,
+                                accent: sc.accent,
+                                favicon: sc.favicon,
+                                is_pinned: false,
+                                folder_id: None,
+                                custom_title: false,
+                                custom_letter: sc.custom_letter,
+                                is_muted: false,
+                                controller: None,
+                                last_active: Instant::now(),
+                                anim_progress: 1.0,
+                                is_closing: false,
+                                pending_permissions: Vec::new(),
+                            });
+                            tab_id
+                        })
                     }
                 };
                 let Some(dropped_id) = dropped_tab_id else { return };
@@ -3715,20 +4359,27 @@ impl BrowserApp {
                 }
                 self.splits.retain(|s| s.tabs.len() >= 2);
 
+                let mut grouped_tabs = None;
                 if let Some(s) = self.splits.iter_mut().find(|sp| sp.id == split_id) {
                     if !s.is_full() {
                         let last_tab = s.tabs.last().cloned();
                         s.insert(dropped_id.clone(), last_tab.as_deref(), false);
                         s.focused_tab_id = dropped_id.clone();
+                        grouped_tabs = Some(s.tabs.clone());
                     }
+                }
+                if let Some(ordered) = grouped_tabs {
+                    self.group_split_tabs_in_list(&ordered);
                 }
 
                 if let Some(pos) = self.tabs.iter().position(|t| t.id == dropped_id) {
-                    self.ensure_tab_controller(pos);
                     self.active_tab_idx = pos;
                 }
 
                 self.sync_split_bounds();
+                if let Some(ctrl) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+                    let _ = ctrl.focus();
+                }
                 self.sync_tabs_ui();
                 self.persist_state();
             }
@@ -3738,7 +4389,28 @@ impl BrowserApp {
                         self.tabs.iter().filter(|t| !t.is_pinned).nth(tab_idx).map(|t| t.id.clone())
                     }
                     ui::DragSource::Pinned(fav_idx) => {
-                        self.pinned_shortcuts.get(fav_idx).map(|sc| sc.id.clone())
+                        self.pinned_shortcuts.get(fav_idx).cloned().map(|sc| {
+                            let tab_id = format!("tab-{}", self.next_tab_id);
+                            self.next_tab_id += 1;
+                            self.tabs.push(Tab {
+                                id: tab_id.clone(),
+                                title: sc.title,
+                                url: sc.url,
+                                accent: sc.accent,
+                                favicon: sc.favicon,
+                                is_pinned: false,
+                                folder_id: None,
+                                custom_title: false,
+                                custom_letter: sc.custom_letter,
+                                is_muted: false,
+                                controller: None,
+                                last_active: Instant::now(),
+                                anim_progress: 1.0,
+                                is_closing: false,
+                                pending_permissions: Vec::new(),
+                            });
+                            tab_id
+                        })
                     }
                 };
                 let Some(dropped_id) = dropped_tab_id else { return };
@@ -3758,11 +4430,14 @@ impl BrowserApp {
                 }
                 self.splits.retain(|s| s.tabs.len() >= 2);
 
-                if let Some(s) = self.find_split_for_tab_mut(&active_id) {
+                let grouped_tabs = if let Some(s) = self.find_split_for_tab_mut(&active_id) {
                     if !s.is_full() && !s.contains(&dropped_id) {
                         let beside_id = target_tab_id.as_deref().unwrap_or(&active_id);
                         s.insert(dropped_id.clone(), Some(beside_id), on_left);
                         s.focused_tab_id = dropped_id.clone();
+                        Some(s.tabs.clone())
+                    } else {
+                        None
                     }
                 } else {
                     let tabs = if on_left {
@@ -3772,10 +4447,22 @@ impl BrowserApp {
                     };
                     let split_id = format!("split-{}", self.next_tab_id);
                     self.next_tab_id += 1;
-                    self.splits.push(TabSplit::new(split_id, tabs, dropped_id.clone()));
+                    self.splits.push(TabSplit::new(split_id, tabs.clone(), dropped_id.clone()));
+                    Some(tabs)
+                };
+
+                if let Some(ordered) = grouped_tabs {
+                    self.group_split_tabs_in_list(&ordered);
+                }
+
+                if let Some(pos) = self.tabs.iter().position(|t| t.id == dropped_id) {
+                    self.active_tab_idx = pos;
                 }
 
                 self.sync_split_bounds();
+                if let Some(ctrl) = self.tabs.get(self.active_tab_idx).and_then(|t| t.controller.as_ref()) {
+                    let _ = ctrl.focus();
+                }
                 self.sync_tabs_ui();
                 self.persist_state();
             }
@@ -3989,6 +4676,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Hook Window move to keep floating overlays (Glance, CommandBar) aligned
+    let app_for_move = app.clone();
+    let cb_for_move = command_bar_cell.clone();
+    window.set_move_callback(move |content_rect, _sidebar_rect| {
+        if let Ok(app) = app_for_move.try_borrow() {
+            app.sync_glance_bounds();
+        }
+        if let Ok(cb_opt) = cb_for_move.try_borrow() {
+            if let Some(ref cb) = *cb_opt {
+                if cb.is_visible() {
+                    cb.recenter(content_rect);
+                }
+            }
+        }
+    });
+
     // Handle custom WM_APP messages to dispatch events
     let app_for_events = app.clone();
     let rx_cell = Rc::new(RefCell::new(event_rx));
@@ -4023,10 +4726,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let active_idx = app.borrow().active_tab_idx;
         app.borrow_mut().ensure_tab_controller(active_idx);
-        let (content_rect, _) = window.get_layout_rects();
+        app.borrow_mut().sync_split_bounds();
         if let Some(ref active) = app.borrow().tabs.get(active_idx).and_then(|t| t.controller.as_ref()) {
-            let _ = active.set_bounds(content_rect);
-            let _ = active.set_visible(true);
             let _ = active.focus();
         }
         app.borrow().sync_tabs_ui();

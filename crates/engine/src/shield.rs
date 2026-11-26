@@ -455,24 +455,31 @@ pub const YOUTUBE_AD_STRIPPER_SCRIPT: &str = r#"
                 const dialogs = document.querySelectorAll(
                     'ytd-enforcement-message-view-model, tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), #error-screen:has(ytd-enforcement-message-view-model)'
                 );
+                const hadDialogs = dialogs.length > 0;
                 for (let i = 0; i < dialogs.length; i++) {
                     dialogs[i].remove();
                 }
-                const backdrops = document.querySelectorAll('tp-yt-iron-overlay-backdrop');
-                for (let i = 0; i < backdrops.length; i++) {
-                    backdrops[i].remove();
+                if (hadDialogs) {
+                    const backdrops = document.querySelectorAll('tp-yt-iron-overlay-backdrop');
+                    for (let i = 0; i < backdrops.length; i++) {
+                        backdrops[i].remove();
+                    }
                 }
                 const dismissBtn = document.querySelector(
-                    'ytd-enforcement-message-view-model button, tp-yt-paper-dialog #dismiss-button button, button[aria-label="Dismiss"]'
+                    'ytd-enforcement-message-view-model button, tp-yt-paper-dialog:has(ytd-enforcement-message-view-model) #dismiss-button button'
                 );
                 if (dismissBtn) {
                     try { dismissBtn.click(); } catch (e) {}
                 }
-                var v = document.querySelector('video');
-                if (v && v.paused && !document.hidden) {
-                    var player = v.closest('.html5-video-player');
-                    if (player && !player.classList.contains('ad-showing')) {
-                        v.play().catch(() => {});
+                // Only resume playback if an enforcement dialog actually interrupted the player just now;
+                // never override a user-initiated pause.
+                if (hadDialogs || dismissBtn) {
+                    var v = document.querySelector('video');
+                    if (v && v.paused && !document.hidden) {
+                        var player = v.closest('.html5-video-player');
+                        if (player && !player.classList.contains('ad-showing')) {
+                            v.play().catch(() => {});
+                        }
                     }
                 }
             } catch(e) {}

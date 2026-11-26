@@ -443,6 +443,8 @@ pub struct SidebarState {
     pub toast: Option<String>,
     /// Regular-tab indices currently multi-selected (Ctrl+click).
     pub selected: Vec<usize>,
+    /// Anchor regular-tab index for Shift+click range selection.
+    pub selection_anchor: Option<usize>,
     /// Regular-tab indices of the tabs shown together in a split view.
     pub split_group: Option<(usize, usize)>,
     /// All active split groups in the regular tab list.
@@ -473,6 +475,7 @@ impl Default for SidebarState {
             zoom: 1.0,
             toast: None,
             selected: Vec::new(),
+            selection_anchor: None,
             split_group: None,
             splits: Vec::new(),
             has_closed_tabs: false,
